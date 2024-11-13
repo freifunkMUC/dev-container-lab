@@ -1,0 +1,139 @@
+name: ffmuc
+
+topology:
+  nodes:
+    # Represents the public internet.
+    # Establishes BGP peering with gateways and has static /30s to CPEs.
+    internet:
+      kind: linux
+      network-mode: none
+      image: quay.io/frrouting/frr:10.1.1
+      cmd: /entrypoint.sh
+      binds:
+        - internet/entrypoint.sh:/entrypoint.sh
+        - internet/daemons:/etc/frr/daemons
+        - internet/frr.conf:/etc/frr/frr.conf
+
+    # First AP.
+    # Gets its hostname, SSH access key and Parker config server configured
+    # via Python through its serial console. Connects to the gateways via
+    # its uplink to the CPE.
+    ap-1:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gluon
+      env:
+        SSHKEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: 198.51.100.1
+    ap-1-lan:
+      kind: bridge
+      network-mode: none
+    # Two clients connected to the AP. They just run DHCP.
+    client-1:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+    client-2:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+    # The CPE ("home router") that the AP is connected to.
+    # Has a IPv4-only connection to the internet, and provides the usual
+    # home network connectivity (DHCP server, NAT to public IP) to the AP.
+    cpe-1:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      env:
+        WAN_IP4: 203.0.113.1/30
+        WAN_GW4: 203.0.113.2
+      binds:
+        - cpe/entrypoint.sh:/entrypoint.sh
+
+    # Same as above, for a second home and AP
+    ap-2:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gluon
+      env:
+        SSHKEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: 198.51.100.1
+    ap-2-lan:
+      kind: bridge
+      network-mode: none
+    client-3:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+    client-4:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+    cpe-2:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      env:
+        WAN_IP4: 203.0.113.5/30
+        WAN_GW4: 203.0.113.6
+      binds:
+        - cpe/entrypoint.sh:/entrypoint.sh
+
+    # The four gateways. Announce their public IPv4 and the IPv6 prefix
+    # to the internet, provide config to the APs and terminate WireGuard.
+    # Performs NAT44 for IPv4 access, routes IPv6 directly and offers NAT64.
+    gateway-gw01:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gateway-parker-gw01
+    gateway-gw02:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gateway-parker-gw02
+    gateway-gw03:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gateway-parker-gw03
+    gateway-gw04:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gateway-parker-gw04
+    gateway-vpn:
+      kind: bridge
+      network-mode: none
+
+  links:
+    - endpoints: ["ap-1:eth1", "ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
+    - endpoints: ["ap-1:eth2", "cpe-1:lan"]             # AP-1 WAN interface, goes to CPE-1
+    - endpoints: ["client-1:lan", "ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
+    - endpoints: ["client-2:lan", "ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
+    - endpoints: ["cpe-1:wan", "internet:cpe1"]         # CPE-1 internet uplink
+
+    - endpoints: ["ap-2:eth1", "ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth2", "cpe-2:lan"]             # AP-2 WAN interface, goes to CPE-2
+    - endpoints: ["client-3:lan", "ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
+    - endpoints: ["client-4:lan", "ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
+    - endpoints: ["cpe-2:wan", "internet:cpe2"]         # CPE-2 internet uplink
+
+    - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
+    - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
+    - endpoints: ["gateway-gw03:eth1", "internet:gw03"] # GW-03 internet uplink
+    - endpoints: ["gateway-gw04:eth1", "internet:gw04"] # GW-04 internet uplink
+    - endpoints: ["gateway-gw01:eth2", "gateway-vpn:gw01"] # GW-01 VPN
+    - endpoints: ["gateway-gw02:eth2", "gateway-vpn:gw02"] # GW-02 VPN
+    - endpoints: ["gateway-gw03:eth2", "gateway-vpn:gw03"] # GW-03 VPN
+    - endpoints: ["gateway-gw04:eth2", "gateway-vpn:gw04"] # GW-04 VPN
