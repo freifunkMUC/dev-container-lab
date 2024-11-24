@@ -70,6 +70,7 @@ and the BGP peering would need to be adjusted for the actual peer router.
 
 ## Setup steps
 
+- ensure you have about 96GB of available disk space
 - Install Packer, Ansible, docker, qemu-utils and containerlab
 - Set up bridges (exposed to the host for flexibility):
 ```
@@ -87,6 +88,7 @@ sudo ip link set gateway-vpn up
 - Bring containerlab up: `sudo containerlab deploy`
 - Check the state:
   - For serial on gateway: `docker exec -it clab-ffmuc-gateway-gw02 telnet 127.0.0.1 5000`
+    - the user name and password is ubuntu and ffmuc (see `gateway/packer/gateway.pkr.hcl`)
   - For FRR console on internet: `docker exec -it clab-ffmuc-internet vtysh`
   - For serial on AP (after setup has completed): `docker exec -it clab-ffmuc-ap-1 telnet 127.0.0.1 5000`
   - For shell on client: `docker exec -it clab-ffmuc-client-1 bash`
@@ -100,6 +102,9 @@ sudo ip link set gateway-vpn up
   - Mgmt container (runs the config daemon and etcd)
 - Enable nat46 on the APs, make the WireGuard mesh v6-only and disable NAT44 on Gateways
   - Currently can be enabled on an AP like this (assuming AP-1):
+
+Make sure that the content of `cat gateway/packer/ffbs-ansible/files/node-config.pub` is the same as on the gluon nodes in `/etc/parker/node-config-pub.key` for it to work.
+
 ```
 modprobe nat46
 echo add clat > /proc/net/nat46/control
