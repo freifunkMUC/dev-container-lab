@@ -34,6 +34,7 @@ source "qemu" "parker" {
 
   net_device        = "e1000"  # So that netplan doesn't match on it
   disk_interface    = "virtio"
+  use_default_display = "true"
 }
 
 build {

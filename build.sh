@@ -2,7 +2,7 @@
 
 cd "$(dirname "$0")"
 
-docker build --build-arg IMAGE=gluon-ffmuc-*-x86-64.img gluon -t ffmuc-lab:gluon
+docker build --build-arg IMAGE=gluon-ffmuc-*-x86-64*.img gluon -t ffmuc-lab:gluon
 
 pushd gateway/packer
 ./build.sh
