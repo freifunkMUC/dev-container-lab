@@ -27,7 +27,6 @@ topology:
         CONFIGSERVER: 198.51.100.1
     ap-1-lan:
       kind: bridge
-      network-mode: none
     # Two clients connected to the AP. They just run DHCP.
     client-1:
       kind: linux
@@ -67,7 +66,6 @@ topology:
         CONFIGSERVER: 198.51.100.1
     ap-2-lan:
       kind: bridge
-      network-mode: none
     client-3:
       kind: linux
       network-mode: none
@@ -114,7 +112,6 @@ topology:
       image: ffmuc-lab:gateway-parker-gw04
     gateway-vpn:
       kind: bridge
-      network-mode: none
 
   links:
     - endpoints: ["ap-1:eth1", "ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
