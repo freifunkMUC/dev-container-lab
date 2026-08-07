@@ -48,7 +48,7 @@ class Gluon_vm(vrnetlab.VM):
         self.conn_mode = "tc"
         self.nic_type = "virtio-net-pci"
 
-        self.wait_pattern = ':/# '  # Shell prompt on serial console
+        self.wait_pattern = ':/# '  # Shell prompt on serial console, adjusted after wake-up
 
     def configure(self):
         cmds = f'''\
@@ -78,7 +78,26 @@ class Gluon_vm(vrnetlab.VM):
         if match:  # got a match!
             if ridx == 0:  # login
                 self.logger.info("setup is online")
-                self.wait_write("", wait=None)
+                # The console shell only spawns once Enter is pressed, and a
+                # single newline sent while getty is still starting up gets
+                # swallowed. Poke until the shell actually answers.
+                for attempt in range(60):
+                    self.tn.write(b"\r")
+                    res = self.tn.read_until(b"# ", 5)
+                    if b":/# " in res or b":~# " in res:
+                        break
+                    self.logger.trace(
+                        "no prompt yet (attempt %d): %r", attempt + 1, res
+                    )
+                else:
+                    self.logger.error("serial console never presented a prompt")
+                    return
+                # the shell's cwd (and thus the prompt) differs between
+                # images: FFBS prompts ':/# ', FFMUC ':~# ' -- match what
+                # this image actually presented
+                self.wait_pattern = ':~# ' if b":~# " in res else ':/# '
+                # queue a fresh prompt for configure()'s first wait_write
+                self.tn.write(b"\r")
 
                 self.configure()
 
