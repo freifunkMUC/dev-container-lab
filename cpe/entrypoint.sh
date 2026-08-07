@@ -3,6 +3,8 @@
 until [ -e /sys/class/net/lan ]; do sleep 1; done
 until [ -e /sys/class/net/wan ]; do sleep 1; done
 
+sysctl -w net.ipv4.ip_forward=1
+
 ip addr add $WAN_IP4 dev wan
 ip route add default via $WAN_GW4
 
