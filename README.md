@@ -3,13 +3,14 @@
 This lab setup deploys a full Parker-style network, consisting of:
 - Four gateways, each of which runs:
   - WireGuard tunnel termination
-  - NAT44 from the internal RFC1918 space to a public IPv4
   - Direct routing of the internal IPv6 space to the internet
   - NAT64 translation from 64:ff9b::/96 to a public IPv4
-  - etcd for config/state management
-  - The FFBS config tool which serves configuration files to APs and sets up WireGuard peers
-  - A "VPN" between gateways for etcd traffic (realized as a shared bridge here)
+  - A wgkex worker, which sets up the WireGuard peers of the APs
+  - A "VPN" between gateways for MQTT traffic (realized as a shared bridge here)
   - Basic firewalling to protect the VPN and the gateway itself
+- The first gateway additionally runs:
+  - The wgkex broker, which serves signed configurations to the APs
+  - An MQTT broker (mosquitto) for the two of them to meet on
 - Two homes, each of which has:
   - A CPE (representing a typical home router), which has an IPv4 internet uplink, a LAN with a DHCP server and NAT44 between them
   - An AP running a Parker-enabled Gluon image, whose WAN port is connected to the CPE LAN
@@ -18,7 +19,10 @@ This lab setup deploys a full Parker-style network, consisting of:
 
 ![](overview.svg)
 
-On top of that, there's some scripting in the AP container to automatically configure them by setting hostname, config server, SSH key and rebooting out of config mode.
+(The picture still shows the etcd-era gateways.)
+
+On top of that, there's some scripting in the AP container to automatically configure them by setting hostname, config server, config signing key, SSH key and rebooting out of config mode.
+See [LAB-WGKEX.md](LAB-WGKEX.md) for what the gateways run since the move from etcd-tools to wgkex, and for what to look at when checking whether it works.
 
 The Gateways and APs are set up as VMs, while the other functions (internet, CPE, client) are pure containers.
 Since containerlab is built around containers, those VMs are packaged as a container as well.
@@ -39,15 +43,11 @@ and the BGP peering would need to be adjusted for the actual peer router.
     - `203.0.113.6`: Internet side of the link
   - `203.0.113.42`: The "internet" container itself (useful target for pinging from a client to see if end-to-end connectivity works)
 - `198.51.100.0/24`: Public Freifunk IPv4 range
-  - `198.51.100.1-14`: The public IPs of the four gateways, used for the WireGuard tunnels and for the public end of NAT44
+  - `198.51.100.1-14`: The public IPs of the four gateways, used for the WireGuard tunnels
   - `198.51.100.11-14`: The public IPs of the NAT64 translator on the four NAT64 gateways
 - `10.0.0.0/16`: Private Freifunk IPv4 range
-  - `10.0.0.1-4`: The private IPs of the four gateways
-  - `10.0.4.0/22`: The first AP block, assigned to whichever one asks first
-    - `10.0.4.1`: The first AP
-  - `10.0.8.0/22`: The second AP block, assigned to whichever one asks second
-    - `10.0.8.1`: The second AP
-  - ... (more APs)
+  - `10.0.4.0/22`: The client range, the same one on every AP - with 464XLAT it never leaves the node
+    - `10.0.4.1`: Every AP
 - `172.16.0.0/24`: The gateway VPN
   - `172.16.0.1-4`: The four gateways
 - `192.168.10.0/24`: The home LANs
@@ -59,11 +59,12 @@ and the BGP peering would need to be adjusted for the actual peer router.
   - `2001:db8:ff00::/64`: Freifunk Infrastructure
     - `2001:db8:ff00::1-4`: The four gateways
     - `2001:db8:ff00::1:1-4`: The four NAT64 translators (for e.g. traceroute)
-  - `2001:db8:ff00:1::/64`: The first AP block, assigned to whichever one asks first
-    - `2001:db8:ff00:1::1`: The first AP
-  - `2001:db8:ff00:2::/64`: The second AP block, assigned to whichever one asks second
-    - `2001:db8:ff00:2::1`: The first AP
-  - ... (more APs)
+  - `2001:db8:ff00::/63`: Reserved, never handed to an AP
+  - `2001:db8:ff00:2::/63`: The first AP block, assigned to whichever one asks first
+    - `2001:db8:ff00:2::/64`: Its client network, `2001:db8:ff00:2::1` the AP itself
+    - `2001:db8:ff00:3::/64`: The range its CLAT translates client IPv4 into
+  - `2001:db8:ff00:4::/63`: The second AP block, assigned to whichever one asks second
+  - ... (more APs, one /63 each)
 - `2001:db8:cafe::1`: The "internet" container itself (useful target for pinging from a client to see if end-to-end connectivity works)
 - `64:ff9b::/96`: The NAT64 prefix
   - `64:ff9b::203.0.113.42`: Example of a IPv6-mapped public IPv4 address, should be pingable from clients
@@ -82,7 +83,8 @@ sudo ip link set ap-2-lan up
 sudo ip link set gateway-vpn up
 ```
 - Build containers:
-  - Create `gateway/packer/ffbs-ansible/.vault` containing the Ansible Vault password
+  - Check out the submodules: `git submodule update --init` (the gateway Ansible, and wgkex, which the gateways install from source)
+    - Point `WGKEX_SRC` at a wgkex checkout of your own to build a different revision
   - Download x86-64 Gluon image, extract `gluon-ffmuc-<version>-x86-64.img` into `gluon/`
   - Run `./build.sh`
 - Bring containerlab up: `sudo containerlab deploy`
@@ -96,30 +98,8 @@ sudo ip link set gateway-vpn up
 
 
 ## TODOs
-- Configure hostname on gateways
 - Containerize the gateway?
   - Network container (sets up interfaces, firewall and routing)
-  - Mgmt container (runs the config daemon and etcd)
-- Enable nat46 on the APs, make the WireGuard mesh v6-only and disable NAT44 on Gateways
-  - Currently can be enabled on an AP like this (assuming AP-1):
-
-Make sure that the content of `cat gateway/packer/ffbs-ansible/files/node-config.pub` is the same as on the gluon nodes in `/etc/parker/node-config-pub.key` for it to work.
-
-```
-modprobe nat46
-echo add clat > /proc/net/nat46/control
-echo config clat local.style RFC6052 > /proc/net/nat46/control
-# Cut local prefix out of our /64 so that traffic will be routed back to us.
-# Not very clean, but good enough for now.
-# Long-term this should be handled separately.
-echo config clat local.v6 2001:db8:ff00:1:0:64::/96 > /proc/net/nat46/control
-echo config clat local.v4 0.0.0.0/0 > /proc/net/nat46/control
-echo config clat remote.style RFC6052 > /proc/net/nat46/control
-echo config clat remote.v6 64:ff9b::/96 > /proc/net/nat46/control
-echo config clat remote.v4 0.0.0.0/0 > /proc/net/nat46/control
-ip link set clat up
-ip route add 2001:db8:ff00:1:0:64::/96 dev clat
-# noderoute.sh keeps resetting the default route, so override it with more-specific routes
-ip route add 0.0.0.0/1 dev clat
-ip route add 128.0.0.0/1 dev clat
-```
+  - Mgmt container (runs wgkex and MQTT)
+- Redraw `overview.svg`: wgkex instead of etcd
+- Run a second wgkex broker so the lab survives gw01 going away

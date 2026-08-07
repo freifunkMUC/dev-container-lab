@@ -53,7 +53,6 @@ class Gluon_vm(vrnetlab.VM):
         cmds = [
             "uci set gluon-setup-mode.@setup_mode[0].configured=1",
             f"uci set system.@system[0].hostname={self.hostname}",
-            f"uci set parker.nodeconfig.config_server={os.environ.get('CONFIGSERVER', '')}",
         ]
 
         # SSHKEY may carry several authorized_keys lines; the serial console
@@ -61,6 +60,20 @@ class Gluon_vm(vrnetlab.VM):
         for n, key in enumerate(os.environ.get("SSHKEY", "").splitlines()):
             redirect = ">" if n == 0 else ">>"
             cmds.append(f"echo '{key}' {redirect} /etc/dropbear/authorized_keys")
+
+        # 906-parker-nodeconfig copies the config server and the key its
+        # answers are verified with out of site.conf and into uci every time
+        # the upgrade scripts run, so our overrides have to come after the last
+        # run of them. Nothing runs them again on the boots that follow.
+        cmds += [
+            "uci commit",
+            "gluon-reconfigure",
+            f"uci set parker.nodeconfig.config_server={os.environ.get('CONFIGSERVER', '')}",
+        ]
+
+        config_pubkey = os.environ.get("CONFIGPUBKEY", "")
+        if config_pubkey:
+            cmds.append(f"uci set parker.nodeconfig.config_pubkey={config_pubkey}")
 
         cmds += [
             "uci commit",

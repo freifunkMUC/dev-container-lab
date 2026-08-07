@@ -47,7 +47,6 @@ build {
     playbook_file = "ffbs-ansible/playbook.yml"
     inventory_file = "ffbs-ansible/ffmuc-inventory"
     extra_arguments = [
-      "--vault-password-file=ffbs-ansible/.vault",
       # Hacky, but needed so we can reference the inventory from the Ansible roles
       "--limit", "${var.hostname}",
       "--extra-vars", "ansible_host=${build.Host} ansible_port=${build.Port} ansible_user=${build.User} ansible_ssh_pass=${build.Password}"

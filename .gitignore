@@ -2,6 +2,9 @@
 # The downloaded firmware image, its .gz and any backups next to it
 gluon/*.img*
 
+# Copy of the wgkex checkout that build.sh hands to Ansible
+gateway/packer/wgkex-src/
+
 # Packer's work directory (left behind when a build fails) and image cache
 gateway/packer/output-*/
 gateway/packer/packer_cache/

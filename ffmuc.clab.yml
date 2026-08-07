@@ -15,9 +15,9 @@ topology:
         - internet/frr.conf:/etc/frr/frr.conf
 
     # First AP.
-    # Gets its hostname, SSH access key and Parker config server configured
-    # via Python through its serial console. Connects to the gateways via
-    # its uplink to the CPE.
+    # Gets its hostname, SSH access key, Parker config server and the key it
+    # verifies its configuration with set via Python through its serial
+    # console. Connects to the gateways via its uplink to the CPE.
     ap-1:
       kind: generic_vm
       network-mode: none
@@ -27,6 +27,9 @@ topology:
           ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
           ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
+        # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
+        # replacing the production key the image was built with.
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
     ap-1-lan:
       kind: bridge
     # Two clients connected to the AP. They just run DHCP.
@@ -68,6 +71,7 @@ topology:
           ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
           ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
     ap-2-lan:
       kind: bridge
     client-3:
@@ -95,9 +99,9 @@ topology:
       binds:
         - cpe/entrypoint.sh:/entrypoint.sh
 
-    # The four gateways. Announce their public IPv4 and the IPv6 prefix
-    # to the internet, provide config to the APs and terminate WireGuard.
-    # Performs NAT44 for IPv4 access, routes IPv6 directly and offers NAT64.
+    # The four gateways. Announce their public IPv4 and the IPv6 prefix to the
+    # internet and terminate WireGuard. Route IPv6 directly and offer NAT64 for
+    # the client IPv4 the APs translate. The first one also serves the config.
     gateway-gw01:
       kind: generic_vm
       network-mode: none
