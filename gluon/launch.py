@@ -61,6 +61,15 @@ class Gluon_vm(vrnetlab.VM):
             redirect = ">" if n == 0 else ">>"
             cmds.append(f"echo '{key}' {redirect} /etc/dropbear/authorized_keys")
 
+        if os.environ.get("MESHONWAN", "") == "1":
+            # Mesh with the other APs on the LAN our WAN port hangs off. The
+            # role only turns into a network configuration once the upgrade
+            # scripts below have run.
+            cmds += [
+                "uci -q del_list gluon.iface_wan.role='mesh'",
+                "uci add_list gluon.iface_wan.role='mesh'",
+            ]
+
         # 906-parker-nodeconfig copies the config server and the key its
         # answers are verified with out of site.conf and into uci every time
         # the upgrade scripts run, so our overrides have to come after the last

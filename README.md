@@ -11,17 +11,17 @@ This lab setup deploys a full Parker-style network, consisting of:
 - The first gateway additionally runs:
   - The wgkex broker, which serves signed configurations to the APs
   - An MQTT broker (mosquitto) for the two of them to meet on
-- Two homes, each of which has:
+- One home, which has:
   - A CPE (representing a typical home router), which has an IPv4 internet uplink, a LAN with a DHCP server and NAT44 between them
-  - An AP running a Parker-enabled Gluon image, whose WAN port is connected to the CPE LAN
-  - Two clients, which are connected to the AP's LAN port and run a DHCP client
-- An "internet" container which runs BGP peering with the gateways and has static links to the CPEs
+  - Two APs running a Parker-enabled Gluon image, whose WAN ports are on that same CPE LAN and which mesh with each other over it
+  - Two clients per AP, which are connected to its LAN port and run a DHCP client
+- An "internet" container which runs BGP peering with the gateways and has a static link to the CPE
 
 ![](overview.svg)
 
-(The picture still shows the etcd-era gateways.)
+(The picture still shows the two separate homes and the etcd-era gateways.)
 
-On top of that, there's some scripting in the AP container to automatically configure them by setting hostname, config server, config signing key, SSH key and rebooting out of config mode.
+On top of that, there's some scripting in the AP container to automatically configure them by setting hostname, config server, config signing key, mesh role, SSH key and rebooting out of config mode.
 See [LAB-WGKEX.md](LAB-WGKEX.md) for what the gateways run since the move from etcd-tools to wgkex, and for what to look at when checking whether it works.
 
 The Gateways and APs are set up as VMs, while the other functions (internet, CPE, client) are pure containers.
@@ -35,24 +35,22 @@ and the BGP peering would need to be adjusted for the actual peer router.
 ## Relevant IPs
 ### IPv4
 - `203.0.113.0/24`: Sample ISP
-  - `203.0.113.0/30`: First home
+  - `203.0.113.0/30`: The home
     - `203.0.113.1`: CPE side of the link
     - `203.0.113.2`: Internet side of the link
-  - `203.0.113.4/30`: Second home
-    - `203.0.113.5`: CPE side of the link
-    - `203.0.113.6`: Internet side of the link
   - `203.0.113.42`: The "internet" container itself (useful target for pinging from a client to see if end-to-end connectivity works)
 - `198.51.100.0/24`: Public Freifunk IPv4 range
   - `198.51.100.1-14`: The public IPs of the four gateways, used for the WireGuard tunnels
   - `198.51.100.11-14`: The public IPs of the NAT64 translator on the four NAT64 gateways
 - `10.0.0.0/16`: Private Freifunk IPv4 range
   - `10.0.4.0/22`: The client range, the same one on every AP - with 464XLAT it never leaves the node
-    - `10.0.4.1`: Every AP
+    - `10.0.4.1`: Every AP, unless it finds another one already using the address
+    - `10.0.4.2-15`: Where an AP moves to when it does
 - `172.16.0.0/24`: The gateway VPN
   - `172.16.0.1-4`: The four gateways
-- `192.168.10.0/24`: The home LANs
+- `192.168.10.0/24`: The home LAN
   - `192.168.10.1`: The CPE
-  - `192.168.10.100-199`: The clients (e.g. the AP's WAN port)
+  - `192.168.10.100-199`: The clients (e.g. the WAN ports of the two APs)
 
 ### IPv6
 - `2001:db8:ff00::/48`: Public Freifunk IPv6 range
@@ -77,14 +75,15 @@ and the BGP peering would need to be adjusted for the actual peer router.
 ```
 sudo ip link add ap-1-lan type bridge
 sudo ip link add ap-2-lan type bridge
+sudo ip link add home-lan type bridge
 sudo ip link add gateway-vpn type bridge
 sudo ip link set ap-1-lan up
 sudo ip link set ap-2-lan up
+sudo ip link set home-lan up
 sudo ip link set gateway-vpn up
 ```
 - Build containers:
-  - Check out the submodules: `git submodule update --init` (the gateway Ansible, and wgkex, which the gateways install from source)
-    - Point `WGKEX_SRC` at a wgkex checkout of your own to build a different revision
+  - Check out wgkex next to this repository, or point `WGKEX_SRC` at your checkout
   - Download x86-64 Gluon image, extract `gluon-ffmuc-<version>-x86-64.img` into `gluon/`
   - Run `./build.sh`
 - Bring containerlab up: `sudo containerlab deploy`
@@ -101,5 +100,5 @@ sudo ip link set gateway-vpn up
 - Containerize the gateway?
   - Network container (sets up interfaces, firewall and routing)
   - Mgmt container (runs wgkex and MQTT)
-- Redraw `overview.svg`: wgkex instead of etcd
+- Redraw `overview.svg`: one home with two meshing APs, and wgkex instead of etcd
 - Run a second wgkex broker so the lab survives gw01 going away

@@ -20,10 +20,10 @@ lab network (FRR, nftables, systemd-networkd), nginx, and Jool.
 
 The broker and the worker are two systemd units, `wgkex-broker.service` and
 `wgkex-worker.service`, running out of a virtualenv in `/opt/wgkex`. They share
-`/etc/wgkex.yaml`. `build.sh` copies the `gateway/packer/wgkex` submodule to
+`/etc/wgkex.yaml`. `build.sh` copies your wgkex checkout to
 `gateway/packer/wgkex-src` and Ansible installs it from there, so a change in
 wgkex reaches the lab by rebuilding the gateway images. Point `WGKEX_SRC` at a
-checkout of your own to build a revision the submodule is not pinned to.
+different checkout to build a different revision.
 
 The two of them meet on a mosquitto instance on gw01, reachable over the
 gateway VPN with no authentication - the firewall only lets the gateways onto
@@ -48,7 +48,11 @@ survive a broker restart, but not a rebuild of the image.
 
 Every node is given the same `range4`, `10.0.4.0/22`, and the same `address4`,
 `10.0.4.1`. That is what Parker does: with 464XLAT the client IPv4 never leaves
-the node, so all of them can use the same range.
+the node, so all of them can use the same range. Two APs that mesh with each
+other and both claim `10.0.4.1` is therefore a case the lab now covers for
+real - the second one to notice moves to one of the first 16 addresses of
+`range4`, picked from its own MAC, and keeps that block out of its DHCP pool
+(see `parker.client.address4` on the node).
 
 ## Concentrator selection
 
@@ -74,17 +78,18 @@ the serial console with the key in
 `ffmuc.clab.yml`). The broker signs with the matching `.sec`.
 
 `906-parker-nodeconfig` rewrites both `config_server` and `config_pubkey` from
-site.conf on every run of the upgrade scripts, so `launch.py` runs
-`gluon-reconfigure` itself and only then writes the two overrides. Running
-`gluon-reconfigure` on a node by hand puts the production values back and the
-node stops accepting configurations until they are set again.
+site.conf on every run of the upgrade scripts, so `launch.py` sets the mesh
+role first, runs `gluon-reconfigure`, and only then writes the two overrides.
+Running `gluon-reconfigure` on a node by hand puts the production values back
+and the node stops accepting configurations until they are set again.
 
 ## Bringing it up
 
-Same as before, apart from a second submodule.
+Same as before, with two additions - a third bridge, `home-lan`, and a second
+submodule.
 
-No `.vault` file is needed anymore. `./build.sh` installs wgkex from the
-`gateway/packer/wgkex` submodule unless `WGKEX_SRC` says otherwise.
+No `.vault` file is needed anymore. `./build.sh` expects a wgkex checkout at
+`../wgkex` unless `WGKEX_SRC` says otherwise.
 
 ## Checking it
 
@@ -117,6 +122,11 @@ means:
   clamp on IPv4 is 28 bytes lower than on IPv6 (see the MTU table in
   `ffbs-mesh-vpn-parker/README.md`).
 - `ip link show clat` exists and carries the client traffic.
+
+Both APs are on the same home LAN, with `mesh` added to the roles of their WAN
+port, so they also mesh with each other: `batctl if` lists `vx_mesh_uplink`,
+and `batctl n` should show the other AP. The duplicate `10.0.4.1` above is
+resolved over that mesh.
 
 The gateways no longer NAT44: the nftables `ip nat` rule for `wg-nodes` cannot
 match anymore, because `wg-nodes` has no IPv4 address (see below) and no IPv4

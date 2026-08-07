@@ -3,7 +3,7 @@ name: ffmuc
 topology:
   nodes:
     # Represents the public internet.
-    # Establishes BGP peering with gateways and has static /30s to CPEs.
+    # Establishes BGP peering with gateways and has a static /30 to the CPE.
     internet:
       kind: linux
       network-mode: none
@@ -17,7 +17,8 @@ topology:
     # First AP.
     # Gets its hostname, SSH access key, Parker config server and the key it
     # verifies its configuration with set via Python through its serial
-    # console. Connects to the gateways via its uplink to the CPE.
+    # console. Reaches the gateways through the CPE and meshes with AP-2 over
+    # the home LAN the two of them share.
     ap-1:
       kind: generic_vm
       network-mode: none
@@ -30,6 +31,7 @@ topology:
         # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
         # replacing the production key the image was built with.
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+        MESHONWAN: "1"
     ap-1-lan:
       kind: bridge
     # Two clients connected to the AP. They just run DHCP.
@@ -47,9 +49,9 @@ topology:
       cmd: /entrypoint.sh
       binds:
         - client/entrypoint.sh:/entrypoint.sh
-    # The CPE ("home router") that the AP is connected to.
+    # The CPE ("home router") both APs are connected to.
     # Has a IPv4-only connection to the internet, and provides the usual
-    # home network connectivity (DHCP server, NAT to public IP) to the AP.
+    # home network connectivity (DHCP server, NAT to public IP) to the APs.
     cpe-1:
       kind: linux
       network-mode: none
@@ -60,8 +62,12 @@ topology:
         WAN_GW4: 203.0.113.2
       binds:
         - cpe/entrypoint.sh:/entrypoint.sh
+    # The LAN of the home. Both APs hang off it with their WAN port, which is
+    # what lets them mesh with each other over it.
+    home-lan:
+      kind: bridge
 
-    # Same as above, for a second home and AP
+    # The second AP, in the same home as the first one and with its own clients
     ap-2:
       kind: generic_vm
       network-mode: none
@@ -72,6 +78,7 @@ topology:
           ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+        MESHONWAN: "1"
     ap-2-lan:
       kind: bridge
     client-3:
@@ -88,16 +95,6 @@ topology:
       cmd: /entrypoint.sh
       binds:
         - client/entrypoint.sh:/entrypoint.sh
-    cpe-2:
-      kind: linux
-      network-mode: none
-      image: ffmuc-lab:toolbox
-      cmd: /entrypoint.sh
-      env:
-        WAN_IP4: 203.0.113.5/30
-        WAN_GW4: 203.0.113.6
-      binds:
-        - cpe/entrypoint.sh:/entrypoint.sh
 
     # The four gateways. Announce their public IPv4 and the IPv6 prefix to the
     # internet and terminate WireGuard. Route IPv6 directly and offer NAT64 for
@@ -123,16 +120,16 @@ topology:
 
   links:
     - endpoints: ["ap-1:eth1", "ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
-    - endpoints: ["ap-1:eth2", "cpe-1:lan"]             # AP-1 WAN interface, goes to CPE-1
+    - endpoints: ["ap-1:eth2", "home-lan:ap-1-wan"]     # AP-1 WAN interface, goes to the home LAN
     - endpoints: ["client-1:lan", "ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
     - endpoints: ["client-2:lan", "ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
+    - endpoints: ["cpe-1:lan", "home-lan:cpe-1-lan"]    # CPE-1 LAN interface, goes to the home LAN
     - endpoints: ["cpe-1:wan", "internet:cpe1"]         # CPE-1 internet uplink
 
     - endpoints: ["ap-2:eth1", "ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
-    - endpoints: ["ap-2:eth2", "cpe-2:lan"]             # AP-2 WAN interface, goes to CPE-2
+    - endpoints: ["ap-2:eth2", "home-lan:ap-2-wan"]     # AP-2 WAN interface, goes to the same home LAN
     - endpoints: ["client-3:lan", "ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
     - endpoints: ["client-4:lan", "ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
-    - endpoints: ["cpe-2:wan", "internet:cpe2"]         # CPE-2 internet uplink
 
     - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
     - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
