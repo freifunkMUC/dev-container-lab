@@ -92,6 +92,9 @@ and the BGP peering would need to be adjusted for the actual peer router.
   - For FRR console on internet: `docker exec -it clab-ffmuc-internet vtysh`
   - For serial on AP (after setup has completed): `docker exec -it clab-ffmuc-ap-1 telnet 127.0.0.1 5000`
   - For shell on client: `docker exec -it clab-ffmuc-client-1 bash`
+  - Non-interactively, `./node-cmd.sh ap-1 'wg show all'` runs one command
+    on a VM's serial console and prints its output (it logs into the
+    gateways by itself)
 - Bring containerlab down: `sudo containerlab destroy`
 
 
