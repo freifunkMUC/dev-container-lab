@@ -23,7 +23,9 @@ topology:
       network-mode: none
       image: ffmuc-lab:gluon
       env:
-        SSHKEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
     ap-1-lan:
       kind: bridge
@@ -62,7 +64,9 @@ topology:
       network-mode: none
       image: ffmuc-lab:gluon
       env:
-        SSHKEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
     ap-2-lan:
       kind: bridge

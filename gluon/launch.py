@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 import time
-import textwrap
 
 import vrnetlab
 
@@ -51,15 +50,24 @@ class Gluon_vm(vrnetlab.VM):
         self.wait_pattern = ':/# '  # Shell prompt on serial console, adjusted after wake-up
 
     def configure(self):
-        cmds = f'''\
-            uci set gluon-setup-mode.@setup_mode[0].configured=1
-            uci set system.@system[0].hostname={self.hostname}
-            uci set parker.nodeconfig.config_server={os.environ.get('CONFIGSERVER', '')}
-            echo '{os.environ.get('SSHKEY', '')}' > /etc/dropbear/authorized_keys
-            uci commit
-            sync
-        '''
-        for line in textwrap.dedent(cmds).splitlines():
+        cmds = [
+            "uci set gluon-setup-mode.@setup_mode[0].configured=1",
+            f"uci set system.@system[0].hostname={self.hostname}",
+            f"uci set parker.nodeconfig.config_server={os.environ.get('CONFIGSERVER', '')}",
+        ]
+
+        # SSHKEY may carry several authorized_keys lines; the serial console
+        # takes one command per line, so write them one echo at a time.
+        for n, key in enumerate(os.environ.get("SSHKEY", "").splitlines()):
+            redirect = ">" if n == 0 else ">>"
+            cmds.append(f"echo '{key}' {redirect} /etc/dropbear/authorized_keys")
+
+        cmds += [
+            "uci commit",
+            "sync",
+        ]
+
+        for line in cmds:
             self.wait_write(line)
         time.sleep(1)
         self.wait_write("reboot")
