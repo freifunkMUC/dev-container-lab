@@ -1,2 +1,2 @@
 FROM wbitt/network-multitool:extra
-RUN apk add dnsmasq dhcpcd
+RUN apk add dnsmasq dhcpcd nftables
