@@ -71,17 +71,15 @@ and the BGP peering would need to be adjusted for the actual peer router.
 
 - ensure you have about 96GB of available disk space
 - Install Packer, Ansible, docker, qemu-utils and containerlab
-- Set up bridges (exposed to the host for flexibility):
-```
-sudo ip link add ap-1-lan type bridge
-sudo ip link add ap-2-lan type bridge
-sudo ip link add home-lan type bridge
-sudo ip link add gateway-vpn type bridge
-sudo ip link set ap-1-lan up
-sudo ip link set ap-2-lan up
-sudo ip link set home-lan up
-sudo ip link set gateway-vpn up
-```
+- Set up the bridges (exposed to the host for flexibility) and let bridged
+  traffic through the host firewall: `sudo ./lab-bridges.sh`
+  - docker enables br_netfilter, so every frame bridged between two lab nodes
+    also traverses the host's iptables chains, where docker's FORWARD policy
+    is DROP -- and a firewall doing strict reverse-path filtering drops it as
+    well, since the host has no routes to the lab subnets. ARP is not IP and
+    passes both, so the lab deploys and resolves addresses while nothing gets
+    through. The script exempts the lab bridges from both; re-run it after a
+    reboot.
 - Build containers:
   - Check out wgkex next to this repository, or point `WGKEX_SRC` at your checkout
   - Download x86-64 Gluon image, extract `gluon-ffmuc-<version>-x86-64.img` into `gluon/`
