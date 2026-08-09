@@ -44,7 +44,8 @@ therefore end up with:
 | `address6` | `2001:db8:ff00:2::1` | `2001:db8:ff00:4::1` |
 
 The allocations live in `/var/local/wgkex/broker/ipv6_ranges.json` on gw01 and
-survive a broker restart, but not a rebuild of the image.
+survive a broker restart, but not a rebuild of the image. The same file also
+holds the concentrators the broker last handed to each node, see below.
 
 Every node is given the same `range4`, `10.0.4.0/22`, and the same `address4`,
 `10.0.4.1`. That is what Parker does: with 464XLAT the client IPv4 never leaves
@@ -66,6 +67,18 @@ WireGuard handshake timeout (180s).
 The concentrator IDs are static, from `wgkex_worker_id` in the host_vars: gw01
 is 1 and gw04 is 4. They name the interfaces on the node, so they must not be
 renumbered.
+
+The selection is sticky: the broker stores the concentrators a node was given in
+its IPAM file (`concentrators` in `ipv6_ranges.json`) and hands out the same ones
+again until one goes offline or drifts too far above its share of the peers
+(`sticky_worker_tolerance`). Without that memory it re-picked on every request
+and the nodes rebuilt their tunnels every config retry.
+
+Nodes are given the concentrator endpoints by name, `gw1.lab` to `gw4.lab`
+(`wgkex_endpoint_name` in the host_vars, `endpoint_name` in the broker config).
+The names resolve through the CPE's dnsmasq, which is the resolver the APs get
+handed over DHCP, so the lab exercises the node's DNS path instead of handing it
+a literal address.
 
 ## Trusting the lab broker
 
