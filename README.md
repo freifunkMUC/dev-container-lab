@@ -71,6 +71,7 @@ and the BGP peering would need to be adjusted for the actual peer router.
 
 - ensure you have about 96GB of available disk space
 - Install Packer, Ansible, docker, qemu-utils and containerlab
+  - `setup-debian.sh` walks through these steps for a Debian-based host
 - Set up the bridges (exposed to the host for flexibility) and let bridged
   traffic through the host firewall: `sudo ./lab-bridges.sh`
   - docker enables br_netfilter, so every frame bridged between two lab nodes
