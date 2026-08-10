@@ -86,6 +86,9 @@ and the BGP peering would need to be adjusted for the actual peer router.
   - Download x86-64 Gluon image, extract `gluon-ffmuc-<version>-x86-64.img` into `gluon/`
   - Run `./build.sh`
 - Bring containerlab up: `sudo containerlab deploy`
+  - Without a containerlab install, the containerized release works just
+    as well and only needs the docker socket:
+    `docker run --rm --privileged --network host --pid host -v /var/run/docker.sock:/var/run/docker.sock -v /var/run/netns:/var/run/netns -v $PWD:$PWD -w $PWD ghcr.io/srl-labs/clab:0.71.0 containerlab deploy -t ffmuc.clab.yml`
 - Check the state:
   - For serial on gateway: `docker exec -it clab-ffmuc-gateway-gw02 telnet 127.0.0.1 5000`
     - the user name and password is ubuntu and ffmuc (see `gateway/packer/gateway.pkr.hcl`)
