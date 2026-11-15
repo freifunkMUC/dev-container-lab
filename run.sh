@@ -8,7 +8,7 @@
 # It writes results/summary.json and the raw logs to results/.
 # Exit code 0 only if all setup steps and all tests pass.
 #
-# Needs: nested KVM (/dev/kvm), about 8 vCPU, 32 GB RAM, a 64 GB disk,
+# Needs: nested KVM (/dev/kvm), about 8 vCPU, 16 GB RAM, a 128 GB disk,
 # outbound HTTPS. Gluon image: gluon/*.img, or artifacts/*.img.gz (unpacked
 # here), or GLUON_IMAGE_URL (downloaded over HTTPS).
 
@@ -68,7 +68,7 @@ install_deps() {
 	sudo -E apt-get update -q
 	sudo -E apt-get install -yq ca-certificates curl gnupg lsb-release python3 \
 		qemu-system-x86 qemu-utils wireguard-tools sshpass signify-openbsd \
-		ansible docker.io bridge-utils iptables xorriso
+		ansible docker.io docker-buildx bridge-utils iptables xorriso patch
 	sudo systemctl enable --now docker
 	if ! command -v containerlab >/dev/null; then
 		curl -fsSL https://get.containerlab.dev | sudo -E bash
@@ -87,6 +87,7 @@ install_deps() {
 	xorriso -version 2>&1 | head -1
 	ansible --version | head -1
 	docker --version
+	docker buildx version
 }
 
 gluon_image() {

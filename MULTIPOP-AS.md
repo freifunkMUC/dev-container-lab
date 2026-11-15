@@ -177,8 +177,8 @@ client-2 and client-4 use dhcpcd for IPv6.
 
 ## Run it
 
-On an x86-64 Ubuntu 24.04 host with nested KVM, 8 vCPU, 32 GB RAM and
-a 64 GB disk:
+On an x86-64 Ubuntu 24.04 host with nested KVM, 8 vCPU, 16 GB RAM and a
+128 GB disk (for example Azure Standard_F8s_v2):
 
 ```sh
 mkdir -p artifacts && cp <gluon-ffmuc-...-x86-64.img.gz> artifacts/
