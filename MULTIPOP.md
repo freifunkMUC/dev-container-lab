@@ -34,9 +34,50 @@ flowchart LR
 
 - There is no routing between the sites. iBGP runs only inside a site.
 - PREF64 is 64:ff9b::/96 at both sites.
-- The broker (on gw01) gives each node one /63 from each site. The first /64
-  is the client LAN. The second /64 is the CLAT xlat range.
+- The broker gives each node one /63 from each site. The first /64 is the
+  client LAN. The second /64 is the CLAT xlat range.
 - The test server echoes the source address of each request on TCP port 8080.
+
+## Control plane
+
+The control plane has the same layout as the FFMUC wgkex setup in
+production. No part of it is behind a gateway, and no single part is
+necessary.
+
+```mermaid
+flowchart LR
+  node["ap-1, ap-2"] -- "http://broker.lab<br/>203.0.113.250 (anycast)" --> inet["internet"]
+  subgraph SA["Site A services"]
+    lba["lb-a<br/>haproxy"] --> ba["broker-a1, a2"]
+    ba --> ea["emqx-a1, a2"]
+  end
+  subgraph SB["Site B services"]
+    lbb["lb-b<br/>haproxy"] --> bb["broker-b1, b2"]
+    bb --> eb["emqx-b1, b2"]
+  end
+  inet -- BGP --> lba
+  inet -- BGP --> lbb
+  ea === eb
+  gw["gw01 .. gw04<br/>wgkex worker"] -- "mqtt.lab" --> ea
+  gw -- "mqtt.lab" --> eb
+```
+
+| Part | Site A | Site B | Function |
+|---|---|---|---|
+| haproxy (`lb-a`, `lb-b`) | 203.0.113.130 | 203.0.113.146 | Announces `broker.lab` (203.0.113.250) with BGP while haproxy runs. Sends requests to a healthy broker, own site first. Sets `X-Forwarded-For`. |
+| broker | .131, .132 | .147, .148 | Stateless wgkex broker. Each uses the EMQX node next to it. `/api/health` is 200 only while MQTT is connected. |
+| EMQX 5.8 | .133, .134 | .149, .150 | One cluster of 4 nodes (static seeds). |
+
+- The brokers keep no state. The /63 allocations are retained MQTT
+  messages (`parker/ipam/<site>/<key>`). The allocation is deterministic
+  (hash of the key), so two brokers give the same /63.
+- The gateways use the name `mqtt.lab`. It has the addresses of all EMQX
+  nodes, the own site first. When a node fails, the worker connects to the
+  next one.
+- The switch report goes to any broker. The broker sends the drop-route
+  message retained, so a worker that reconnects still gets it.
+- **Lab limit:** the CPE resolves `broker.lab`. The production name is
+  served by DNS.
 
 ## How the node works
 
@@ -129,7 +170,10 @@ set `FIRMWARE=<path>`.
 | `pmtu.sh` | Per site: a packet of the tunnel MTU arrives, 1 byte more gives "packet too big". The same for IPv4 through the CLAT. |
 | `roam.sh` | client-1 moves from ap-1 to ap-2. It gets the ap-2 prefixes and uses them. An old ap-1 source works or fails fast. |
 | `pgw-failure.sh` | One site B gateway fails. The node changes to the other gateway of site B. Site B stays up and preferred: no client address becomes deprecated. IPv6 (same address) and IPv4 are checked separately. The old gateway removes the node /63 a few seconds after the report. |
-| `broker-down.sh` | The same, with the broker stopped. The old gateway removes the route after the 180 s timeout. |
+| `broker-kill.sh` | One broker fails, then a gateway fails. The report goes through another broker. The old gateway removes the route within 10 s after the report. |
+| `emqx-kill.sh` | The EMQX node of the old gateway's worker fails. The worker connects to another node. Then the same as `broker-kill.sh`. |
+| `haproxy-kill.sh` | The haproxy that the home uses fails. BGP moves `broker.lab` to the other haproxy. Then the same as `broker-kill.sh`. |
+| `broker-down.sh` | The same, with all brokers stopped. The old gateway removes the route after the 180 s timeout. |
 | `site-failure.sh` | Site B fails. The site B address becomes deprecated. Traffic from it is rejected. IPv4 moves to site A. The prefix is withdrawn and expires. |
 | `recovery.sh` | Site B comes back. The prefix is preferred again. IPv6, NAT64 and IPv4 work through site B. |
 | `site-a-failover.sh` | Site A (primary, with IPv4) fails: IPv4 and new IPv6 connections move to site B. Site A comes back: IPv4 moves back. |

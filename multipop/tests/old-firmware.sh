@@ -4,7 +4,7 @@
 # top-level fields, no site, no pgws list and no primary_site.
 . "$(dirname "$0")/common.sh"
 
-ans=$(node ap-1 'k=$(wg genkey | wg pubkey); wget -qO- "http://198.51.100.1/config?pubkey=$(echo $k | sed "s/+/%2B/g; s/\//%2F/g; s/=/%3D/g")&nonce=oldfw$$&v6mtu=1500&version=old" | head -n -1' 60 | tr -d '\r')
+ans=$(node ap-1 'k=$(wg genkey | wg pubkey); wget -qO- "http://broker.lab/config?pubkey=$(echo $k | sed "s/+/%2B/g; s/\//%2F/g; s/=/%3D/g")&nonce=oldfw$$&v6mtu=1500&version=old" | head -n -1' 60 | tr -d '\r')
 echo "${ans}" >> "${LOG}"
 if ! echo "${ans}" | jq -e . >/dev/null 2>&1; then
 	check "the broker answers the old node" fail "not JSON: ${ans:0:300}"

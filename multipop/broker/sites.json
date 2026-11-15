@@ -1,0 +1,15 @@
+{
+  "pop-a": {
+    "site": "muc01",
+    "pool6": "2001:db8:a::/50",
+    "ipam": "mqtt",
+    "dns64": "2001:db8:a::53",
+    "primary": true
+  },
+  "pop-b": {
+    "site": "vie01",
+    "pool6": "2001:db8:b::/50",
+    "ipam": "mqtt",
+    "dns64": "2001:db8:b::53"
+  }
+}

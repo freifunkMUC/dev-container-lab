@@ -9,10 +9,20 @@
 # route of the /63 within a few seconds (without the broker: after 180 s).
 # Metrics: the outage that the clients see (see meas_start in common.sh),
 # the detection time on the node, and the time until the old route is gone.
+#
+# FAIL: a part of the control plane fails first (see the wrappers):
+#   broker       one broker in the site of the haproxy that the home uses
+#   emqx         the EMQX node that the worker of the old pgw uses
+#   haproxy      the haproxy that the home uses (broker.lab is anycast)
+#   all-brokers  all brokers: only the 180 s safety net removes the route
 . "$(dirname "$0")/common.sh"
-# BROKER_DOWN=1: the broker on gw01 is stopped first (see broker-down.sh).
-CASE=pgw_switch
-[ "${BROKER_DOWN:-0}" = 1 ] && CASE=broker_down
+FAIL="${FAIL:-}"
+case "${FAIL}" in
+"") CASE=pgw_switch ;;
+all-brokers) CASE=broker_down ;;
+broker | emqx | haproxy) CASE="${FAIL}_kill" ;;
+*) check "FAIL mode" fail "unknown FAIL=${FAIL}"; finish; exit ;;
+esac
 
 clear_damping
 ifc=$(site_ifc ap-1 vie01)
@@ -25,12 +35,43 @@ check "ap-1 uses a site B pgw" ok "$ifc to $gw"
 declare -A SRC_B
 for c in ${CLIENTS}; do SRC_B[$c]=$(addr_in "$c" "${PREFIX_B}"); done
 
-if [ "${BROKER_DOWN:-0}" = 1 ]; then
-	node gateway-gw01 "echo ffmuc | sudo -S systemctl stop wgkex-broker" 60 >> "${LOG}" 2>&1
-	st=$(node gateway-gw01 "systemctl is-active wgkex-broker" 30 | tr -d '\r' | tail -n 1)
-	[ "$st" != active ] && check "broker on gw01 is stopped" ok "$st" ||
-		check "broker on gw01 is stopped" fail "$st"
+KILLED=""
+case "${FAIL}" in
+all-brokers) KILLED="${BROKERS}" ;;
+broker) lb=$(lb_of_home); KILLED="broker-${lb#lb-}1" ;;
+emqx) KILLED=$(emqx_of "$gw") ;;
+haproxy) KILLED=$(lb_of_home) ;;
+esac
+if [ -n "${FAIL}" ] && [ -z "${KILLED}" ]; then
+	check "find the part to kill (${FAIL})" fail "nothing found"
 fi
+for k in ${KILLED}; do svc_kill "$k" >> "${LOG}" 2>&1; done
+case "${FAIL}" in
+all-brokers | broker)
+	down=""
+	for k in ${KILLED}; do broker_ok "$k" && down="${down} $k:up" || down="${down} $k:down"; done
+	[[ "${down}" != *:up* ]] && check "killed:${down}" ok || check "killed:${down}" fail
+	;;
+emqx)
+	# The worker must find another node of the cluster under mqtt.lab.
+	new_emqx() { local e; e=$(emqx_of "$gw"); [ -n "$e" ] && [ "$e" != "${KILLED}" ]; }
+	if wait_for 30 new_emqx; then
+		check "killed ${KILLED}; the worker on $gw uses another EMQX node" ok "$(emqx_of "$gw")"
+	else
+		check "killed ${KILLED}; the worker on $gw uses another EMQX node" fail "'$(emqx_of "$gw")'"
+	fi
+	;;
+haproxy)
+	# The watchdog removes the anycast address, BGP withdraws the route.
+	moved() { local l; l=$(lb_of_home); [ -n "$l" ] && [ "$l" != "${KILLED}" ]; }
+	if wait_for 10 moved; then
+		check "killed ${KILLED}; the home now reaches broker.lab through $(lb_of_home)" ok
+	else
+		check "killed ${KILLED}; the home now reaches broker.lab through another haproxy" fail \
+			"$(dx internet ip route show 203.0.113.250 | tr '\n' ';')"
+	fi
+	;;
+esac
 
 # Watch the site B addresses of the clients during the change. The serial
 # console allows one client only, so the nodes are checked after the change
@@ -63,6 +104,7 @@ fi
 meas_start "${CASE}" client-1 "${SRC_B[client-1]}"
 log "cutting $gw"
 meas_event "${CASE}"
+cut_at=$(date +%s)
 dx internet ip link set "$gw" down
 t0=${SECONDS}
 watch &
@@ -149,10 +191,19 @@ if [ -n "${route_gone}" ]; then
 else
 	gone_s=""
 fi
-if [ "${BROKER_DOWN:-0}" = 1 ]; then
+if [ "${FAIL}" = all-brokers ]; then
 	# The 180 s handshake timeout of the worker is the safety net.
 	[ -n "${gone_s}" ] && check "$gw removes ${net63} without the broker" ok "${gone_s} s after the cut" ||
 		check "$gw removes ${net63} without the broker" fail "the route is still there"
+else
+	# The switch report went through a healthy broker.
+	by=$(reports_since "${cut_at}" | tr '\n' ';')
+	[ -n "${rep}" ] && [ -n "${by}" ] && check "ap-1 reports the switch through broker.lab" ok "${by}" ||
+		check "ap-1 reports the switch through broker.lab" fail "report at '${rep}' s, broker logs: '${by}'"
+	metric ".${CASE}.control_plane" "$(jq -n --arg k "${KILLED}" --arg b "${by}" '{killed: $k, report: $b}')"
+fi
+if [ "${FAIL}" = all-brokers ]; then
+	:
 elif [ -n "${gone_s}" ] && [ -n "${rep}" ] && [ "$((gone_s - rep))" -le 10 ]; then
 	check "$gw removes ${net63} a few seconds after the report" ok "${gone_s} s after the cut, report at ${rep} s"
 else
@@ -161,8 +212,13 @@ fi
 
 log "restoring $gw"
 dx internet ip link set "$gw" up
-if [ "${BROKER_DOWN:-0}" = 1 ]; then
-	node gateway-gw01 "echo ffmuc | sudo -S systemctl start wgkex-broker" 60 >> "${LOG}" 2>&1
+for k in ${KILLED}; do svc_restore "$k" >> "${LOG}" 2>&1; done
+if [ -n "${KILLED}" ]; then
+	if wait_for 120 control_plane_ok; then
+		check "the control plane is complete again" ok "$(control_plane_state)"
+	else
+		check "the control plane is complete again" fail "$(control_plane_state)"
+	fi
 fi
 clear_damping
 wait_stable 600

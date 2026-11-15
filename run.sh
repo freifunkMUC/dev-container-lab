@@ -15,7 +15,7 @@ cd "$(dirname "$0")" || exit 1
 ROOT=$PWD
 export LAB=ffmuc-mp-aa
 export RESULTS="${ROOT}/results"
-TESTS="${TESTS:-normal ra-single source-prefix rule8-tie pmtu roam pgw-failure broker-down site-failure recovery site-a-failover flapping long-outage old-firmware}"
+TESTS="${TESTS:-normal ra-single source-prefix rule8-tie pmtu roam pgw-failure broker-kill emqx-kill haproxy-kill broker-down site-failure recovery site-a-failover flapping long-outage old-firmware}"
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 export PATH="${HOME}/.local/bin:${PATH}"
 mkdir -p "${RESULTS}"
@@ -111,8 +111,8 @@ stage firmware pass "$(ls gluon/gluon-ffmuc-*-x86-64*.img), $(stat -c %s gluon/g
 start=${SECONDS}
 TERM=dumb ./build.sh < /dev/null > "${RESULTS}/build.log" 2>&1
 images=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -c '^ffmuc-lab:')
-[ "${images}" -ge 6 ] || fail_early build "build failed (${images} of 6 images), see build.log"
-stage build pass "6 images in $((SECONDS - start)) s"
+[ "${images}" -ge 9 ] || fail_early build "build failed (${images} of 9 images), see build.log"
+stage build pass "9 images in $((SECONDS - start)) s"
 
 # 4. Deploy and wait until both APs have both sites up.
 cleanup() {

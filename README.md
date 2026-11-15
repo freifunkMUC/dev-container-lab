@@ -1,4 +1,4 @@
-> **Multi-PoP (active/active):** this branch splits the gateways into two sites. See [MULTIPOP.md](MULTIPOP.md).
+> **Multi-PoP (active/active):** this branch splits the gateways into two sites. The broker and MQTT run as separate redundant services, as in production. See [MULTIPOP.md](MULTIPOP.md).
 
 ## Overview
 

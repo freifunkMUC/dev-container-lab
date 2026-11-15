@@ -32,6 +32,49 @@ log() { echo "[$(date +%T)] $*" | tee -a "${LOG}" >&2; }
 dx() { local n="$1"; shift; sudo docker exec "clab-${LAB}-${n}" "$@"; }
 node() { LAB="${LAB}" "${ROOT}/node-cmd.sh" "$@"; }
 
+# The control plane (multipop/svc/service.sh). svc_kill stops a service (a
+# broker, an EMQX node or a haproxy) and keeps it down; svc_restore lets
+# service.sh start it again. The containers and their links stay.
+BROKERS="broker-a1 broker-a2 broker-b1 broker-b2"
+svc_kill() { dx "$1" sh -c 'touch /tmp/down; kill -9 -"$(cat /tmp/service.pid)"'; }
+svc_restore() { dx "$1" rm -f /tmp/down; }
+# broker_ok <broker>: the broker is healthy (MQTT connected and synced).
+broker_ok() { [ "$(dx "$1" curl -s -o /dev/null -w '%{http_code}' -m 2 http://127.0.0.1:5000/api/health)" = 200 ]; }
+# The haproxy that the internet router sends the requests of the home to.
+lb_of_home() {
+	case "$(dx internet ip -4 route get 203.0.113.250 from 203.0.113.1 iif cpe1)" in
+	*" via 203.0.113.130 "*) echo lb-a ;; *" via 203.0.113.146 "*) echo lb-b ;;
+	esac
+}
+# emqx_of <gateway>: the EMQX node that the wgkex worker of the gateway uses.
+emqx_of() {
+	node "gateway-$1" "ss -Htn state established '( dport = :1883 )'" 30 | tr -d '\r' |
+		awk '$NF ~ /^203[.]0[.]113[.][0-9]+:1883$/ {split($NF, a, ":"); print a[1]; exit}' |
+		sed 's/^203\.0\.113\.133$/emqx-a1/; s/^203\.0\.113\.134$/emqx-a2/; s/^203\.0\.113\.149$/emqx-b1/; s/^203\.0\.113\.150$/emqx-b2/'
+}
+# The state of the control plane: the healthy brokers, the haproxies that
+# announce broker.lab, and the running nodes of the EMQX cluster.
+control_plane_state() {
+	local b ok="" lbs emqx
+	for b in ${BROKERS}; do broker_ok "$b" && ok="${ok} $b"; done
+	lbs=$(dx internet vtysh -c 'show ip bgp 203.0.113.250/32 json' 2>/dev/null | jq -r '[.paths[]?.peer.peerId] | join(" ")')
+	emqx=$(dx emqx-a1 runuser -u emqx -- emqx ctl cluster status 2>/dev/null | grep -o "emqx@[0-9.]*" | sort -u | tr '\n' ' ')
+	echo "brokers:${ok}; lb paths: ${lbs}; emqx: ${emqx}"
+}
+control_plane_ok() {
+	local st
+	st=$(control_plane_state)
+	[ "$(echo "${st}" | grep -o 'broker-[ab][12]' | wc -l)" = 4 ] &&
+		[ "$(echo "${st}" | grep -oE '203[.]0[.]113[.](130|146)' | wc -l)" = 2 ] &&
+		[ "$(echo "${st}" | grep -o 'emqx@' | wc -l)" = 4 ]
+}
+# reports_since <time>: "broker: line" for each switch report since the time.
+reports_since() {
+	for b in ${BROKERS}; do
+		sudo docker logs --since "$1" "clab-${LAB}-${b}" 2>&1 | grep 'pgw switch of' | sed "s/^/$b: /"
+	done
+}
+
 # check <description> <ok|fail> [detail]: record one check.
 check() {
 	local what="$1" res="$2" detail="${3:-}"

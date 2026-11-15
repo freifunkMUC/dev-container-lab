@@ -1,5 +1,8 @@
 # The lab on wgkex
 
+> **Multi-PoP branch:** the broker and MQTT do not run on gw01. See
+> [MULTIPOP.md](MULTIPOP.md#control-plane).
+
 The gateways used to run [etcd-tools](https://github.com/freifunkMUC/etcd-tools)
 (`etcdconfigweb` and `concentratorconfig`) on top of an etcd cluster. They now
 run [wgkex](https://github.com/freifunkMUC/wgkex), which is what FFMUC runs in

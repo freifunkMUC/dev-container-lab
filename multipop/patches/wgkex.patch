@@ -1,5 +1,5 @@
 diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
-index 86a22d1..cb2c57e 100644
+index 86a22d1..336b3dd 100644
 --- a/wgkex/broker/app.py
 +++ b/wgkex/broker/app.py
 @@ -2,6 +2,7 @@
@@ -10,24 +10,34 @@ index 86a22d1..cb2c57e 100644
  import json
  import random
  import signal
-@@ -21,6 +22,7 @@ from waitress import serve
+@@ -21,6 +22,8 @@ from waitress import serve
  from wgkex.broker.ipam import ParkerIPAM
  from wgkex.broker.ipam_netbox import NetboxIPAM
  from wgkex.broker.ipam_json import JSONFileIPAM
++from wgkex.broker.ipam_mqtt import key_id
 +from wgkex.broker import multisite
  from wgkex.broker.metrics import WorkerMetricsCollection, WorkerResult
  from wgkex.broker.parker import ParkerQuery, ParkerResponse
  from wgkex.broker.signer import sign_response
-@@ -119,6 +121,8 @@ parker_worker_metrics = WorkerMetricsCollection()
+@@ -119,6 +122,17 @@ parker_worker_metrics = WorkerMetricsCollection()
  worker_data: Dict[Tuple[str, str], Dict] = {}
  parker_worker_data: Dict[str, Dict] = {}
  ipam: Optional[ParkerIPAM] = _load_parker_ipam()
 +# LAB PROTOTYPE: per-site prefixes, see multisite.py.
 +sites = multisite.load_sites()
++# LAB PROTOTYPE: with "ipam": "mqtt", the brokers share their allocations as
++# retained MQTT messages and keep no state of their own. The top-level answer
++# then comes from the IPAM of the primary site.
++if sites and multisite.mqtt_ipams(sites).get(multisite.primary_pop(sites)):
++    ipam = multisite.mqtt_ipams(sites)[multisite.primary_pop(sites)]
++# Time of the last MQTT connect, or None while not connected (see /api/health).
++mqtt_connected_at: Optional[float] = None
++# The time after a connect that the retained messages need to arrive.
++MQTT_SYNC_SECONDS = 2.0
  # Track active brokers announced over MQTT
  active_brokers: set[str] = set()
  parker_active_brokers: set[str] = set()
-@@ -365,27 +369,44 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -365,27 +379,44 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
              f"Chose worker {worker.name} with {worker.peers} connected clients ({worker.diff})"
          )
  
@@ -90,7 +100,7 @@ index 86a22d1..cb2c57e 100644
  
      # Provision the peer only on the workers this node was assigned to. A
      # broadcast here would (re-)install the peer and its prefix routes on
-@@ -396,10 +417,10 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -396,10 +427,10 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          "Range6": str(full_range6),
          "Keepalive": None,  # TODO make configurable
      }
@@ -104,7 +114,7 @@ index 86a22d1..cb2c57e 100644
          )
  
      # A de-selected worker would keep the node's peer and prefix route until
-@@ -407,13 +428,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -407,13 +438,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      # drop the peer right away instead. A worker that predates the Remove
      # flag reads this as the re-provisioning it always received - no worse
      # than before.
@@ -125,7 +135,7 @@ index 86a22d1..cb2c57e 100644
          )
  
      ipam.update_prefix(
-@@ -434,7 +459,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -434,7 +469,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          concentrators=concentrators,
      )
  
@@ -136,10 +146,23 @@ index 86a22d1..cb2c57e 100644
          "utf-8"
      )
      if config.get_config().broker_signing_key is None:
-@@ -458,6 +485,35 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -458,6 +495,60 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      )
  
  
++@app.route("/api/health", methods=["GET"])
++def health() -> Tuple[Response | Dict, int]:
++    """LAB PROTOTYPE: the health check of the load balancer. Healthy only
++    while MQTT is connected and the retained state had time to arrive, so a
++    broker that cannot reach MQTT gets no requests."""
++    connected_at = mqtt_connected_at
++    if connected_at is None:
++        return {"status": "mqtt down"}, 503
++    if time.time() - connected_at < MQTT_SYNC_SECONDS:
++        return {"status": "syncing"}, 503
++    return {"status": "ok"}, 200
++
++
 +@app.route("/api/v3/switch", methods=["POST"])
 +def wg_api_v3_switch() -> Tuple[Response | Dict, int]:
 +    """LAB PROTOTYPE: a node moved to another pgw of the same site and has a
@@ -161,18 +184,62 @@ index 86a22d1..cb2c57e 100644
 +    )
 +    if old_name is None:
 +        return {"error": {"message": "Not a pgw switch inside one site."}}, 400
-+    mqtt.publish(
-+        f"parker/drop-route/{old_name}",
-+        json.dumps({"PublicKey": pubkey}).encode("utf-8"),
++    # Retained, one topic per node: the old pgw gets it also when it was
++    # away from MQTT for a moment (for example, after an MQTT node failed).
++    # The time lets the worker ignore it if the node came back since then.
++    info = mqtt.client.publish(
++        f"parker/drop-route/{old_name}/{key_id(pubkey)}",
++        json.dumps({"PublicKey": pubkey, "Time": time.time()}).encode("utf-8"),
++        qos=1,
++        retain=True,
 +    )
++    try:
++        info.wait_for_publish(2.0)
++    except Exception as error:
++        logger.warning("pgw switch of %s: publish failed: %s", pubkey, error)
++    if not info.is_published():
++        # The load balancer gives the request to another broker.
++        return {"error": {"message": "MQTT is not available."}}, 503
 +    logger.info("pgw switch of %s: dropping route on %s", pubkey, old_name)
-+    return {"dropped": old_name}, 200
++    return {"dropped": old_name, "broker": _HOSTNAME}, 200
 +
 +
  @mqtt.on_connect()
  def handle_mqtt_connect(
      client: mqtt_client.Client, userdata: bytes, flags: Any, rc: Any
-@@ -740,6 +796,26 @@ def handle_mqtt_message(
+@@ -481,6 +572,10 @@ def handle_mqtt_connect(
+             )
+             return
+ 
++    global mqtt_connected_at
++    mqtt_connected_at = time.time()
++    if multisite.mqtt_ipams(sites):
++        mqtt.subscribe(f"{multisite.IPAM_TOPIC}/#", qos=1)
+     mqtt.subscribe(MQTTTopics.TOPIC_CONNECTED_PEERS.format(worker="+", domain="+"))
+     mqtt.subscribe(MQTTTopics.TOPIC_WORKER_STATUS.format(worker="+"))
+     mqtt.subscribe(MQTTTopics.TOPIC_WORKER_WG_DATA.format(worker="+", domain="+"))
+@@ -518,6 +613,20 @@ def handle_mqtt_connect(
+         )
+ 
+ 
++@mqtt.on_disconnect()
++def handle_mqtt_disconnect(*_: Any) -> None:
++    global mqtt_connected_at
++    mqtt_connected_at = None
++    logger.warning("MQTT connection lost")
++
++
++@mqtt.on_topic(f"{multisite.IPAM_TOPIC}/#")
++def handle_mqtt_message_ipam(
++    client: mqtt_client.Client, userdata: bytes, message: mqtt_client.MQTTMessage
++) -> None:
++    multisite.ipam_message(sites, message.topic, message.payload)
++
++
+ @mqtt.on_topic("wireguard-metrics/#")
+ def handle_mqtt_message_metrics(
+     client: mqtt_client.Client, userdata: bytes, message: mqtt_client.MQTTMessage
+@@ -740,6 +849,26 @@ def handle_mqtt_message(
      )
  
  
@@ -199,8 +266,19 @@ index 86a22d1..cb2c57e 100644
  def join_host_port(host: str, port: str) -> str:
      """Concatenate a port string with a host string using a colon.
      The host may be either a hostname, IPv4 or IPv6 address.
+@@ -783,6 +912,10 @@ def _publish_offline_and_exit(signum, frame) -> None:
+ 
+ 
+ # Manually re-init the mqtt client due to https://github.com/stlehmann/Flask-MQTT/issues/190
++for _ipam in multisite.mqtt_ipams(sites).values():
++    _ipam.publish = lambda topic, payload: mqtt.publish(
++        topic, payload, qos=1, retain=True
++    )
+ mqtt.init_app(app)
+ 
+ # Mark broker as offline on shutdown
 diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
-index ec49134..b4f05a7 100644
+index ec49134..41d411b 100644
 --- a/wgkex/broker/app_test.py
 +++ b/wgkex/broker/app_test.py
 @@ -1,7 +1,9 @@
@@ -213,7 +291,25 @@ index ec49134..b4f05a7 100644
  import unittest
  
  import flask_mqtt
-@@ -593,6 +595,160 @@ class TestBrokerApp(unittest.TestCase):
+@@ -9,6 +11,7 @@ import mock
+ import paho.mqtt.client
+ import paho.mqtt.enums
+ 
++from wgkex.broker.ipam_mqtt import key_id
+ from wgkex.config import config
+ 
+ _DOMAIN = "_test_domain"
+@@ -31,6 +34,9 @@ class MqttStub:
+     def on_message(self):
+         return lambda func: func
+ 
++    def on_disconnect(self):
++        return lambda func: func
++
+     def subscribe(self, *args, **kwargs):
+         return None
+ 
+@@ -593,6 +599,192 @@ class TestBrokerApp(unittest.TestCase):
              self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
              self.assertEqual(payload["Range6"], "2001:db8:42::/63")
  
@@ -350,7 +446,9 @@ index ec49134..b4f05a7 100644
 +            mock.patch.object(self.broker_app.config, "get_config", return_value=cfg),
 +            mock.patch.object(self.broker_app, "sites", sites),
 +            mock.patch.object(self.broker_app, "mqtt") as mqtt,
++            mock.patch.object(self.broker_app.time, "time", return_value=100.0),
 +        ):
++            mqtt.client.publish.return_value.is_published.return_value = True
 +            client = self.broker_app.app.test_client()
 +            ok = client.post(
 +                "/api/v3/switch", data={"pubkey": _PUBLIC_KEY, "old": 1, "new": 2}
@@ -363,23 +461,282 @@ index ec49134..b4f05a7 100644
 +            )
 +
 +        self.assertEqual(ok.status_code, 200)
-+        self.assertEqual(ok.json, {"dropped": "worker1"})
++        self.assertEqual(ok.json["dropped"], "worker1")
 +        self.assertEqual(cross_site.status_code, 400)
 +        self.assertEqual(bad_key.status_code, 400)
-+        mqtt.publish.assert_called_once_with(
-+            "parker/drop-route/worker1",
-+            json.dumps({"PublicKey": _PUBLIC_KEY}).encode("utf-8"),
++        mqtt.client.publish.assert_called_once_with(
++            f"parker/drop-route/worker1/{key_id(_PUBLIC_KEY)}",
++            json.dumps({"PublicKey": _PUBLIC_KEY, "Time": 100.0}).encode("utf-8"),
++            qos=1,
++            retain=True,
 +        )
++
++    def test_pgw_switch_fails_without_mqtt_ack(self):
++        cfg = _parker_config()
++        cfg.workers = config.Workers.from_dict(
++            {"worker1": {"id": 1, "pop": "pop-a"}, "worker2": {"id": 2, "pop": "pop-a"}},
++            10,
++        )
++        with (
++            mock.patch.object(self.broker_app.config, "get_config", return_value=cfg),
++            mock.patch.object(self.broker_app, "sites", {"pop-a": {"site": "muc01"}}),
++            mock.patch.object(self.broker_app, "mqtt") as mqtt,
++        ):
++            mqtt.client.publish.return_value.is_published.return_value = False
++            answer = self.broker_app.app.test_client().post(
++                "/api/v3/switch", data={"pubkey": _PUBLIC_KEY, "old": 1, "new": 2}
++            )
++        # 503 makes the load balancer and the node try again.
++        self.assertEqual(answer.status_code, 503)
++
++    def test_health_needs_mqtt_and_sync_time(self):
++        client = self.broker_app.app.test_client()
++        with mock.patch.object(self.broker_app, "mqtt_connected_at", None):
++            self.assertEqual(client.get("/api/health").status_code, 503)
++        with mock.patch.object(self.broker_app.time, "time", return_value=101.0):
++            with mock.patch.object(self.broker_app, "mqtt_connected_at", 100.0):
++                self.assertEqual(client.get("/api/health").status_code, 503)
++            with mock.patch.object(self.broker_app, "mqtt_connected_at", 90.0):
++                self.assertEqual(client.get("/api/health").status_code, 200)
 +
      def test_parker_exchange_removes_peer_from_deselected_workers(self):
          cfg = _parker_config()
          cfg.workers = config.Workers.from_dict(
+diff --git a/wgkex/broker/ipam_mqtt.py b/wgkex/broker/ipam_mqtt.py
+new file mode 100644
+index 0000000..beb2087
+--- /dev/null
++++ b/wgkex/broker/ipam_mqtt.py
+@@ -0,0 +1,139 @@
++"""LAB PROTOTYPE: an IPAM that keeps its state in MQTT, so the brokers keep
++no state of their own (like the worker status they read from MQTT).
++
++Each allocation is a retained message on parker/ipam/<pool>/<key id>:
++{"PublicKey": ..., "Range6": ..., "Concentrators": [...]}. All brokers
++subscribe to parker/ipam/#, so each broker has the full table, also after
++a restart (the MQTT cluster keeps the retained messages).
++
++Two brokers can allocate at the same time. So the search for a free prefix
++starts at a position that comes from the hash of the public key: two
++brokers give the same node the same prefix, also before they see the
++message of the other broker. Two different nodes collide only if their
++hashes point to the same free prefix in the same moment.
++"""
++
++import base64
++import hashlib
++import ipaddress
++import json
++import threading
++from typing import Callable, Dict, List, Optional, Tuple
++
++from wgkex.broker.ipam import ParkerIPAM
++from wgkex.common import logger
++
++TOPIC = "parker/ipam"
++
++Publisher = Callable[[str, bytes], None]
++
++
++def key_id(pubkey: str) -> str:
++    """A topic-safe form of a WireGuard key (no '+', '/' or '=')."""
++    return base64.urlsafe_b64encode(base64.b64decode(pubkey)).decode().rstrip("=")
++
++
++class MQTTIPAM(ParkerIPAM):
++    def __init__(self, pool: str, parent_prefix: str) -> None:
++        self.pool = pool
++        self.parent_prefix = ipaddress.IPv6Network(parent_prefix)
++        self.ranges: Dict[str, str] = {}
++        self.concentrators: Dict[str, List[str]] = {}
++        self.lock = threading.RLock()
++        self.publish: Optional[Publisher] = None
++
++    def topic(self, pubkey: str) -> str:
++        return f"{TOPIC}/{self.pool}/{key_id(pubkey)}"
++
++    def _store(self, pubkey: str) -> None:
++        if self.publish is None:
++            logger.error("IPAM %s: no MQTT publisher, allocation not shared", self.pool)
++            return
++        self.publish(
++            self.topic(pubkey),
++            json.dumps(
++                {
++                    "PublicKey": pubkey,
++                    "Range6": self.ranges[pubkey],
++                    "Concentrators": self.concentrators.get(pubkey, []),
++                }
++            ).encode("utf-8"),
++        )
++
++    def on_message(self, payload: bytes) -> None:
++        """Takes an allocation that a broker (maybe this one) published."""
++        if not payload:
++            return
++        try:
++            data = json.loads(payload.decode("utf-8"))
++            pubkey = data["PublicKey"]
++            range6 = str(ipaddress.IPv6Network(data["Range6"]))
++            workers = [str(w) for w in data.get("Concentrators", [])]
++        except (ValueError, KeyError, TypeError) as error:
++            logger.warning("IPAM %s: ignoring message: %s", self.pool, error)
++            return
++        with self.lock:
++            self.ranges[pubkey] = range6
++            self.concentrators[pubkey] = workers
++
++    def _allocate(self, pubkey: str, length: int) -> Optional[str]:
++        count = 1 << (length - self.parent_prefix.prefixlen)
++        if count < 2:
++            return None
++        used = set(self.ranges.values())
++        digest = hashlib.sha256(pubkey.encode("utf-8")).digest()
++        # Index 0 is kept for the infrastructure, like in the JSON IPAM.
++        start = int.from_bytes(digest[:8], "big") % (count - 1)
++        base = int(self.parent_prefix.network_address)
++        step = 1 << (128 - length)
++        for n in range(count - 1):
++            index = 1 + (start + n) % (count - 1)
++            candidate = str(ipaddress.IPv6Network((base + index * step, length)))
++            if candidate not in used:
++                return candidate
++        return None
++
++    def get_or_allocate_prefix(
++        self,
++        pubkey: str,
++        ipv4: bool,
++        ipv6: bool,
++        ipv4_prefix_length: int = 22,
++        ipv6_prefix_length: int = 63,
++    ) -> Tuple[
++        Optional[ipaddress.IPv4Network], Optional[ipaddress.IPv6Network], List[str]
++    ]:
++        if ipv4:
++            raise NotImplementedError("Non-464XLAT mode not implemented in MQTTIPAM")
++        if not ipv6:
++            return None, None, []
++        with self.lock:
++            range6 = self.ranges.get(pubkey)
++            if range6 is None:
++                range6 = self._allocate(pubkey, ipv6_prefix_length)
++                if range6 is None:
++                    logger.error("IPAM %s: no free prefix for %s", self.pool, pubkey)
++                    return None, None, []
++                logger.info("IPAM %s: assigning %s to %s", self.pool, range6, pubkey)
++                self.ranges[pubkey] = range6
++                self._store(pubkey)
++            return (
++                None,
++                ipaddress.IPv6Network(range6),
++                list(self.concentrators.get(pubkey, [])),
++            )
++
++    def release_prefix(self, pubkey: str) -> None:
++        raise NotImplementedError
++
++    def update_prefix(
++        self, pubkey: str, ipv4: bool, ipv6: bool, selected_concentrators: List[str]
++    ) -> None:
++        if not ipv6:
++            return
++        with self.lock:
++            new = sorted(selected_concentrators)
++            if pubkey not in self.ranges or self.concentrators.get(pubkey) == new:
++                return
++            self.concentrators[pubkey] = new
++            self._store(pubkey)
+diff --git a/wgkex/broker/ipam_mqtt_test.py b/wgkex/broker/ipam_mqtt_test.py
+new file mode 100644
+index 0000000..3e1fb64
+--- /dev/null
++++ b/wgkex/broker/ipam_mqtt_test.py
+@@ -0,0 +1,78 @@
++import ipaddress
++import json
++import unittest
++
++from wgkex.broker import multisite
++from wgkex.broker.ipam_mqtt import MQTTIPAM, key_id
++
++KEY_A = "wwdmDA0TcphfKPSEJr4Ff2D7msYpvO5ewLZ2wYKyaSo="
++KEY_B = "zMKj6ziPKqwWz2RQjdhxEmGn3FRFOzBUOI+4WgFkCSU="
++
++
++def _pair():
++    """Two brokers that share one (synchronous) MQTT bus."""
++    one = MQTTIPAM("pop-a", "2001:db8:a::/60")
++    two = MQTTIPAM("pop-a", "2001:db8:a::/60")
++    sent = []
++
++    def publish(topic, payload):
++        sent.append((topic, payload))
++        for ipam in (one, two):
++            ipam.on_message(payload)
++
++    one.publish = two.publish = publish
++    return one, two, sent
++
++
++class MQTTIPAMTest(unittest.TestCase):
++    def test_same_key_gets_same_prefix_on_both_brokers_before_sync(self):
++        one = MQTTIPAM("pop-a", "2001:db8:a::/56")
++        two = MQTTIPAM("pop-a", "2001:db8:a::/56")
++        one.publish = two.publish = lambda *_: None
++        self.assertEqual(
++            one.get_or_allocate_prefix(KEY_A, False, True)[1],
++            two.get_or_allocate_prefix(KEY_A, False, True)[1],
++        )
++
++    def test_allocation_is_shared_and_sticky(self):
++        one, two, sent = _pair()
++        _, prefix, _ = one.get_or_allocate_prefix(KEY_A, False, True)
++        self.assertEqual(prefix.prefixlen, 63)
++        self.assertNotEqual(prefix, ipaddress.IPv6Network("2001:db8:a::/63"))
++        self.assertEqual(sent[0][0], f"parker/ipam/pop-a/{key_id(KEY_A)}")
++        self.assertEqual(two.get_or_allocate_prefix(KEY_A, False, True)[1], prefix)
++        self.assertNotEqual(two.get_or_allocate_prefix(KEY_B, False, True)[1], prefix)
++
++        two.update_prefix(KEY_A, False, True, ["worker2", "worker1"])
++        self.assertEqual(
++            one.get_or_allocate_prefix(KEY_A, False, True)[2], ["worker1", "worker2"]
++        )
++        count = len(sent)
++        two.update_prefix(KEY_A, False, True, ["worker1", "worker2"])
++        self.assertEqual(len(sent), count)
++
++    def test_full_pool_and_bad_messages(self):
++        ipam = MQTTIPAM("pop-a", "2001:db8:a::/62")
++        ipam.publish = lambda *_: None
++        self.assertIsNotNone(ipam.get_or_allocate_prefix(KEY_A, False, True)[1])
++        self.assertIsNone(ipam.get_or_allocate_prefix(KEY_B, False, True)[1])
++        ipam.on_message(b"")
++        ipam.on_message(b"not json")
++        ipam.on_message(json.dumps({"PublicKey": KEY_B}).encode())
++        self.assertNotIn(KEY_B, ipam.ranges)
++
++    def test_multisite_routes_messages_by_pool(self):
++        ipam = MQTTIPAM("pop-a", "2001:db8:a::/56")
++        sites = {"pop-a": {"_ipam": ipam}, "pop-b": {"ipam_file": "x"}}
++        payload = json.dumps(
++            {"PublicKey": KEY_A, "Range6": "2001:db8:a:6::/63"}
++        ).encode()
++        multisite.ipam_message(sites, "parker/ipam/pop-b/k", payload)
++        multisite.ipam_message(sites, "parker/other/pop-a/k", payload)
++        self.assertEqual(ipam.ranges, {})
++        multisite.ipam_message(sites, f"parker/ipam/pop-a/{key_id(KEY_A)}", payload)
++        self.assertEqual(ipam.ranges, {KEY_A: "2001:db8:a:6::/63"})
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/wgkex/broker/multisite.py b/wgkex/broker/multisite.py
 new file mode 100644
-index 0000000..e6a920f
+index 0000000..21eb459
 --- /dev/null
 +++ b/wgkex/broker/multisite.py
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,203 @@
 +"""LAB PROTOTYPE: per-site prefixes for the Parker multi-PoP design.
 +
 +Each site (PoP) has its own IPv6 parent prefix. A node gets one /63 from each
@@ -393,18 +750,24 @@ index 0000000..e6a920f
 +/etc/wgkex-sites.json). Without that file, nothing changes:
 +
 +    {
-+      "pop-a": {"site": "muc01", "ipam_file": "/var/local/.../a.json",
++      "pop-a": {"site": "muc01", "pool6": "2001:db8:a::/50", "ipam": "mqtt",
 +                "dns64": "2001:db8:a::53", "primary": true},
 +      "pop-b": {"site": "vie01", "ipam_file": "/var/local/.../b.json",
 +                "dns64": "2001:db8:b::53"}
 +    }
++
++With "ipam": "mqtt", the allocations of the site are retained MQTT messages
++(ipam_mqtt.py), so several brokers share them and keep no state. Otherwise
++the site uses a JSON file (one broker only).
 +"""
 +
 +import json
 +import os
 +from typing import Any, Dict, List, Optional, Tuple
 +
++from wgkex.broker.ipam import ParkerIPAM
 +from wgkex.broker.ipam_json import JSONFileIPAM
++from wgkex.broker.ipam_mqtt import TOPIC as IPAM_TOPIC, MQTTIPAM
 +from wgkex.common import logger
 +
 +SITES_FILE = os.environ.get("WGKEX_SITES_FILE", "/etc/wgkex-sites.json")
@@ -418,7 +781,37 @@ index 0000000..e6a920f
 +    with open(path, encoding="utf-8") as sites_file:
 +        sites = json.load(sites_file)
 +    logger.info("Multi-site mode (lab prototype): %s", sorted(sites))
++    for pop, site in sites.items():
++        if site.get("ipam") == "mqtt":
++            site["_ipam"] = MQTTIPAM(pop, site["pool6"])
++        else:
++            site["_ipam"] = JSONFileIPAM(site["ipam_file"])
 +    return sites
++
++
++def site_ipam(site: Dict[str, Any]) -> ParkerIPAM:
++    ipam = site.get("_ipam")
++    if ipam is None:
++        ipam = site["_ipam"] = JSONFileIPAM(site["ipam_file"])
++    return ipam
++
++
++def mqtt_ipams(sites: Dict[str, Dict[str, Any]]) -> Dict[str, MQTTIPAM]:
++    return {
++        pop: site["_ipam"]
++        for pop, site in sites.items()
++        if isinstance(site.get("_ipam"), MQTTIPAM)
++    }
++
++
++def ipam_message(sites: Dict[str, Dict[str, Any]], topic: str, payload: bytes) -> None:
++    """Gives a retained allocation (parker/ipam/<pop>/<key id>) to its IPAM."""
++    parts = topic.split("/")
++    if len(parts) != 4 or "/".join(parts[:2]) != IPAM_TOPIC:
++        return
++    ipam = mqtt_ipams(sites).get(parts[2])
++    if ipam is not None:
++        ipam.on_message(payload)
 +
 +
 +def site_prefixes(
@@ -427,7 +820,7 @@ index 0000000..e6a920f
 +    """Returns the prefixes of a node per PoP. A PoP without a free prefix is left out."""
 +    result: Dict[str, Dict[str, str]] = {}
 +    for pop, site in sites.items():
-+        _, full, _ = JSONFileIPAM(site["ipam_file"]).get_or_allocate_prefix(
++        _, full, _ = site_ipam(site).get_or_allocate_prefix(
 +            pubkey, False, True, 0, length
 +        )
 +        if full is None:
@@ -575,6 +968,34 @@ index a480752..b4d40d9 100644
  
  
  @dataclasses.dataclass
+diff --git a/wgkex/broker/parker_test.py b/wgkex/broker/parker_test.py
+index 692c4cc..a990337 100644
+--- a/wgkex/broker/parker_test.py
++++ b/wgkex/broker/parker_test.py
+@@ -134,6 +134,9 @@ class TestParker(unittest.TestCase):
+ 
+                 return _decorator
+ 
++            def on_disconnect(self):
++                return lambda func: func
++
+             def on_connect(self):
+                 def _decorator(func):
+                     return func
+diff --git a/wgkex/broker/startup_test.py b/wgkex/broker/startup_test.py
+index 87e0113..1b721c7 100644
+--- a/wgkex/broker/startup_test.py
++++ b/wgkex/broker/startup_test.py
+@@ -21,6 +21,9 @@ class MqttStub:
+     def on_connect(self):
+         return lambda func: func
+ 
++    def on_disconnect(self):
++        return lambda func: func
++
+     def on_message(self):
+         return lambda func: func
+ 
 diff --git a/wgkex/worker/app.py b/wgkex/worker/app.py
 index da74438..203bb52 100644
 --- a/wgkex/worker/app.py
@@ -602,10 +1023,10 @@ index da74438..203bb52 100644
      finally:
 diff --git a/wgkex/worker/handshake_routes.py b/wgkex/worker/handshake_routes.py
 new file mode 100644
-index 0000000..0ea666c
+index 0000000..c34f6d9
 --- /dev/null
 +++ b/wgkex/worker/handshake_routes.py
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,168 @@
 +"""LAB PROTOTYPE: install a node /63 route only while its handshake is fresh.
 +
 +In the multi-PoP design every pgw of a site has the peer of every node of the
@@ -707,17 +1128,46 @@ index 0000000..0ea666c
 +                logger.warning("Handshake route %s failed: %s", prefix, error)
 +
 +
-+def drop_route(
-+    public_key: str, prefix_length: int, clock: Callable[[], float] = time
++def prefixes_to_drop(
++    peers: list, public_key: str, prefix_length: int, at: float
 +) -> list:
-+    """Removes the /63 route of a peer at once and keeps the peer."""
-+    prefixes = netlink.get_parker_prefixes_for_peer(
-+        INTERFACE, public_key, prefix_length
-+    )
++    """The prefixes of the peer, unless it made a handshake after time at."""
++    prefixes = []
++    for peer in peers:
++        try:
++            if netlink._peer_public_key(peer) != public_key:
++                continue
++            prefix = netlink._parker_prefix(peer, prefix_length)
++            handshake = netlink._last_handshake_seconds(peer)
++        except (UnicodeDecodeError, ValueError, AttributeError):
++            continue
++        if handshake and handshake > at:
++            logger.info("Not dropping %s of %s: newer handshake", prefix, public_key)
++            continue
++        prefixes.append(prefix)
++    return prefixes
++
++
++def drop_route(
++    public_key: str,
++    prefix_length: int,
++    clock: Callable[[], float] = time,
++    at: Optional[float] = None,
++) -> list:
++    """Removes the /63 route of a peer at once and keeps the peer.
++
++    at: the time of the switch report. A handshake that is newer than this
++    time means that the node came back to this pgw, so the route stays."""
 +    now = clock()
++    at = now if at is None else min(float(at), now)
++    with pyroute2.WireGuard() as wg:
++        peers = []
++        for msg in netlink._wireguard_info(wg, INTERFACE):
++            peers.extend(msg.get_attr("WGDEVICE_A_PEERS") or [])
++    prefixes = prefixes_to_drop(peers, public_key, prefix_length, at)
 +    with _dropped_lock:
 +        for prefix in prefixes:
-+            _dropped[prefix] = now
++            _dropped[prefix] = max(_dropped.get(prefix, 0), at)
 +    with pyroute2.IPRoute() as ip:
 +        oif = ip.link_lookup(ifname=INTERFACE)[0]
 +        for prefix in prefixes:
@@ -726,7 +1176,7 @@ index 0000000..0ea666c
 +                logger.info("Dropped route %s of %s on request", prefix, public_key)
 +            except pyroute2.netlink.exceptions.NetlinkError as error:
 +                logger.info("Drop route %s: %s", prefix, error)
-+    return list(prefixes)
++    return prefixes
 +
 +
 +def start(exit_event: threading.Event, prefix_length: int) -> Optional[threading.Thread]:
@@ -747,18 +1197,19 @@ index 0000000..0ea666c
 +    return thread
 diff --git a/wgkex/worker/handshake_routes_test.py b/wgkex/worker/handshake_routes_test.py
 new file mode 100644
-index 0000000..afc2fcd
+index 0000000..557bc06
 --- /dev/null
 +++ b/wgkex/worker/handshake_routes_test.py
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,58 @@
 +import unittest
 +
 +from wgkex.worker import handshake_routes
 +
 +
 +class _Peer:
-+    def __init__(self, prefix, handshake):
++    def __init__(self, prefix, handshake, key="key"):
 +        self.attrs = {
++            "WGPEER_A_PUBLIC_KEY": key,
 +            "WGPEER_A_ALLOWEDIPS": [{"addr": prefix}],
 +            "WGPEER_A_LAST_HANDSHAKE_TIME": {"tv_sec": handshake},
 +        }
@@ -796,11 +1247,20 @@ index 0000000..afc2fcd
 +            {"2001:db8:a::/63": True},
 +        )
 +
++    def test_drop_skips_peer_that_came_back(self):
++        peers = [_Peer("2001:db8:a::/63", 1000), _Peer("2001:db8:a:2::/63", 0, "x")]
++        self.assertEqual(
++            handshake_routes.prefixes_to_drop(peers, "key", 63, 1050),
++            ["2001:db8:a::/63"],
++        )
++        # A late (retained) drop must not remove a session that is newer.
++        self.assertEqual(handshake_routes.prefixes_to_drop(peers, "key", 63, 990), [])
++
 +
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/wgkex/worker/mqtt.py b/wgkex/worker/mqtt.py
-index 45b85c0..8bd5708 100644
+index 45b85c0..1f04fe0 100644
 --- a/wgkex/worker/mqtt.py
 +++ b/wgkex/worker/mqtt.py
 @@ -15,6 +15,7 @@ import pyroute2.netlink.exceptions
@@ -811,7 +1271,7 @@ index 45b85c0..8bd5708 100644
  from wgkex.worker.msg_queue import q
  from wgkex.worker.netlink import (
      get_connected_peers_count,
-@@ -62,6 +63,7 @@ def connect(exit_event: threading.Event) -> None:
+@@ -62,11 +63,15 @@ def connect(exit_event: threading.Event) -> None:
  
      if parker_enabled:
          client.message_callback_add("parker/wireguard/#", on_message_parker)
@@ -819,7 +1279,15 @@ index 45b85c0..8bd5708 100644
      else:
          client.message_callback_add("wireguard/#", on_message_wireguard)
      logger.info("connecting to broker %s", broker_address)
-@@ -195,7 +197,11 @@ def on_connect(client: mqtt.Client, userdata: Any, flags, rc) -> None:
+ 
+     client.username_pw_set(broker_username, broker_password)
++    # LAB PROTOTYPE: the name can point to several MQTT cluster nodes. Come
++    # back fast when one of them fails; the next connect tries the others.
++    client.reconnect_delay_set(min_delay=1, max_delay=4)
+     client.connect(broker_address, port=broker_port, keepalive=broker_keepalive)
+ 
+     # Start background threads that should not be restarted on reconnect
+@@ -195,7 +200,12 @@ def on_connect(client: mqtt.Client, userdata: Any, flags, rc) -> None:
          # config; external_name is only the advertised endpoint address.
          # "all" stays subscribed so a broker that still broadcasts keeps
          # working during a rollout.
@@ -828,11 +1296,12 @@ index 45b85c0..8bd5708 100644
 +            f"parker/wireguard/{_HOSTNAME}",
 +            "parker/wireguard/all",
 +            f"parker/drop-route/{_HOSTNAME}",
++            f"parker/drop-route/{_HOSTNAME}/+",
 +        ):
              logger.info(f"Subscribing to topic {topic}")
              client.subscribe(topic)
  
-@@ -317,6 +323,28 @@ def on_message_parker(
+@@ -317,6 +327,40 @@ def on_message_parker(
      q.put(str(message.payload.decode("utf-8")))
  
  
@@ -840,48 +1309,62 @@ index 45b85c0..8bd5708 100644
 +    client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage
 +) -> None:
 +    """LAB PROTOTYPE: the node moved to another pgw of the site. Remove its
-+    route here at once and keep the peer (handshake_routes.drop_route)."""
-+    if message.topic.rpartition("/")[2] != _HOSTNAME:
++    route here at once and keep the peer (handshake_routes.drop_route).
++
++    The broker sends it retained on parker/drop-route/<worker>/<key id>, so
++    the message also arrives after an MQTT reconnect. The worker clears it
++    when it is done."""
++    parts = message.topic.split("/")
++    if len(parts) not in (3, 4) or parts[2] != _HOSTNAME:
++        return
++    if not message.payload:
 +        return
 +    # Only handshake_routes can put the route back later.
 +    if handshake_routes.fresh_seconds() is None:
 +        logger.warning("Ignoring drop-route: WGKEX_ROUTE_ON_HANDSHAKE is not set")
 +        return
 +    try:
-+        public_key = json.loads(message.payload.decode("utf-8"))["PublicKey"]
++        data = json.loads(message.payload.decode("utf-8"))
++        public_key = data["PublicKey"]
 +        if not isinstance(public_key, str) or not public_key:
 +            raise ValueError("no PublicKey")
 +        handshake_routes.drop_route(
-+            public_key, get_config().parker.prefixes.ipv6.length or 63
++            public_key,
++            get_config().parker.prefixes.ipv6.length or 63,
++            at=data.get("Time"),
 +        )
 +    except Exception as error:
 +        logger.warning("Ignoring drop-route message: %s", error)
++    if len(parts) == 4 and client is not None:
++        client.publish(message.topic, b"", qos=1, retain=True)
 +
 +
  def publish_metrics_loop(
      exit_event: threading.Event,
      client: mqtt.Client,
 diff --git a/wgkex/worker/mqtt_test.py b/wgkex/worker/mqtt_test.py
-index 09ac76e..f8c8747 100644
+index 09ac76e..46f8052 100644
 --- a/wgkex/worker/mqtt_test.py
 +++ b/wgkex/worker/mqtt_test.py
-@@ -135,6 +135,7 @@ class MQTTTest(unittest.TestCase):
+@@ -135,6 +135,8 @@ class MQTTTest(unittest.TestCase):
              [
                  mock.call().subscribe(f"parker/wireguard/{hostname}"),
                  mock.call().subscribe("parker/wireguard/all"),
 +                mock.call().subscribe(f"parker/drop-route/{hostname}"),
++                mock.call().subscribe(f"parker/drop-route/{hostname}/+"),
                  mock.call().publish(
                      f"parker/wireguard-worker/{hostname}/data",
                      '{"ExternalAddress": "%s", "Port": 51820, "PublicKey": "456asdf=", "LinkAddress": "fe80::1"}'
-@@ -157,6 +158,7 @@ class MQTTTest(unittest.TestCase):
+@@ -157,6 +159,8 @@ class MQTTTest(unittest.TestCase):
              [
                  mock.call().subscribe(f"parker/wireguard/{hostname}"),
                  mock.call().subscribe("parker/wireguard/all"),
 +                mock.call().subscribe(f"parker/drop-route/{hostname}"),
++                mock.call().subscribe(f"parker/drop-route/{hostname}/+"),
                  mock.call().publish(
                      f"parker/wireguard-worker/{hostname}/status", 0, qos=1, retain=True
                  ),
-@@ -357,8 +359,11 @@ class MQTTTest(unittest.TestCase):
+@@ -357,8 +361,11 @@ class MQTTTest(unittest.TestCase):
              qos=1,
              retain=True,
          )
@@ -895,7 +1378,7 @@ index 09ac76e..f8c8747 100644
          )
          self.assertEqual(thread.call_count, 2)
          client.loop_forever.assert_called_once()
-@@ -420,6 +425,25 @@ class MQTTTest(unittest.TestCase):
+@@ -420,6 +427,41 @@ class MQTTTest(unittest.TestCase):
          mqtt.on_message_parker(None, None, message)
          self.assertEqual(mqtt.q.get_nowait(), '{"PublicKey":"key"}')
  
@@ -911,9 +1394,25 @@ index 09ac76e..f8c8747 100644
 +            drop_mock.assert_not_called()
 +            message.topic = f"parker/drop-route/{socket.gethostname()}".encode()
 +            mqtt.on_message_drop_route(None, None, message)
-+        drop_mock.assert_called_once_with("key", 63)
++        drop_mock.assert_called_once_with("key", 63, at=None)
++
++        # Retained per-node topic: the worker clears it after use.
++        drop_mock.reset_mock()
++        client = mock.MagicMock()
++        message.payload = b'{"PublicKey":"key","Time":12.5}'
++        message.topic = f"parker/drop-route/{socket.gethostname()}/a2V5".encode()
++        with mock.patch.dict("os.environ", {"WGKEX_ROUTE_ON_HANDSHAKE": "180"}):
++            mqtt.on_message_drop_route(client, None, message)
++            # The cleared message comes back empty and is ignored.
++            message.payload = b""
++            mqtt.on_message_drop_route(client, None, message)
++        drop_mock.assert_called_once_with("key", 63, at=12.5)
++        client.publish.assert_called_once_with(
++            f"parker/drop-route/{socket.gethostname()}/a2V5", b"", qos=1, retain=True
++        )
 +
 +        drop_mock.reset_mock()
++        message.payload = b'{"PublicKey":"key"}'
 +        with mock.patch.dict("os.environ", {"WGKEX_ROUTE_ON_HANDSHAKE": ""}):
 +            mqtt.on_message_drop_route(None, None, message)
 +        drop_mock.assert_not_called()

@@ -38,3 +38,9 @@ docker build --build-arg IMAGE=parker-gw03.qcow2 gateway -t ffmuc-lab:gateway-pa
 docker build --build-arg IMAGE=parker-gw04.qcow2 gateway -t ffmuc-lab:gateway-parker-gw04
 
 docker build toolbox -t ffmuc-lab:toolbox
+
+# Multi-PoP: the control plane, as in production (see MULTIPOP.md). The broker
+# image uses the same patched wgkex tree as the gateways.
+docker build --build-context wgkex=gateway/packer/wgkex-src multipop/broker -t ffmuc-lab:broker
+docker build multipop/emqx -t ffmuc-lab:emqx
+docker build multipop/lb -t ffmuc-lab:lb

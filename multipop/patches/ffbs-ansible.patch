@@ -1,5 +1,27 @@
+diff --git a/ffmuc-inventory b/ffmuc-inventory
+index f18b585..eb94e01 100644
+--- a/ffmuc-inventory
++++ b/ffmuc-inventory
+@@ -4,14 +4,12 @@ parker-gw02
+ parker-gw03
+ parker-gw04
+ 
+-# The one gateway that answers /config for the nodes. It is the address the
+-# nodes are configured with, see CONFIGSERVER in ffmuc.clab.yml.
++# Multi-PoP (LAB): no gateway runs a broker or MQTT. As in production, the
++# brokers and the MQTT cluster are separate services in each site (see
++# multipop/broker in the lab). The groups stay empty, so the roles skip them.
+ [Brokers]
+-parker-gw01
+ 
+-# The one MQTT broker the wgkex brokers and workers meet on.
+ [MQTT]
+-parker-gw01
+ 
+ [Concentrators]
+ parker-gw01
 diff --git a/group_vars/all/vars b/group_vars/all/vars
-index b3bca6b..a29f6ac 100644
+index b3bca6b..ab20b32 100644
 --- a/group_vars/all/vars
 +++ b/group_vars/all/vars
 @@ -17,8 +17,31 @@ private_ipv4_range: '10.0.0.0/16'
@@ -35,6 +57,19 @@ index b3bca6b..a29f6ac 100644
  # One /63 per node, allocated from the range above. wgkex splits it into the
  # /64 the node's clients live in and the /64 its CLAT translates into.
  node_ipv6_prefix_length: 63
+@@ -30,5 +53,11 @@ wgkex_dir: /opt/wgkex
+ wgkex_config: /etc/wgkex.yaml
+ wgkex_ipam_file: /var/local/wgkex/broker/ipv6_ranges.json
+ 
+-mqtt_host: "{{ hostvars[groups['MQTT'][0]]['vpn_ip4'] }}"
++# Multi-PoP (LAB): one name for the whole MQTT cluster, like
++# broker.ov.ffmuc.net in production. /etc/hosts gives it all cluster nodes,
++# the nodes of the own site first. The worker tries them in this order.
++mqtt_host: mqtt.lab
++mqtt_cluster:
++  pop-a: ['203.0.113.133', '203.0.113.134']
++  pop-b: ['203.0.113.149', '203.0.113.150']
+ mqtt_port: 1883
 diff --git a/host_vars/parker-gw03/vars b/host_vars/parker-gw03/vars
 index 3d6b656..4f26104 100644
 --- a/host_vars/parker-gw03/vars
@@ -216,10 +251,33 @@ index bee3e2f..2db67c0 100644
          iif uplink tcp dport 179 counter accept
  
 diff --git a/roles/wgkex/tasks/main.yml b/roles/wgkex/tasks/main.yml
-index 3a7f8a9..158f7ce 100644
+index 3a7f8a9..ccdddd4 100644
 --- a/roles/wgkex/tasks/main.yml
 +++ b/roles/wgkex/tasks/main.yml
-@@ -66,13 +66,25 @@
+@@ -41,6 +41,22 @@
+     - Restart wgkex broker
+     - Restart wgkex worker
+ 
++# Multi-PoP (LAB): all MQTT cluster nodes under one name, own site first.
++- name: Let the resolver return all addresses of a name in /etc/hosts
++  ansible.builtin.lineinfile:
++    path: /etc/host.conf
++    line: multi on
++    create: true
++    mode: '0644'
++
++- name: Resolve the MQTT cluster name
++  ansible.builtin.blockinfile:
++    path: /etc/hosts
++    marker: "# {mark} MQTT cluster (multi-PoP lab)"
++    block: "{{ mqtt_ips | map('regex_replace', '$', ' ' ~ mqtt_host) | join('\n') }}"
++  vars:
++    mqtt_ips: "{{ mqtt_cluster[wgkex_pop] + (mqtt_cluster | dict2items | rejectattr('key', 'eq', wgkex_pop) | map(attribute='value') | flatten) }}"
++
+ - name: Install wgkex worker unit
+   ansible.builtin.template:
+     src: wgkex-worker.service.j2
+@@ -66,13 +82,25 @@
  # The JSON IPAM only allocates from the prefix it finds in this file, so it has
  # to exist before the broker answers its first request. It also keeps the
  # concentrators picked per node in here, which is what makes the selection stick.
