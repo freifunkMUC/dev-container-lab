@@ -67,3 +67,46 @@ wait_for() {
 }
 
 site_state() { node "$1" "cat /tmp/multipop/status" | awk -v s="$2" '$2 == s {print $3 " " $5}'; }
+
+# The status line of a site on an AP matches a regular expression.
+ap_has() { node "$1" "cat /tmp/multipop/status" | grep "^wg_c[0-9]* $2 " | grep -Eq -- "$3"; }
+
+# Remove the change history and the penalty on all APs, so that the state
+# changes of one test do not set the flapping penalty in the next test.
+clear_damping() {
+	local ap
+	for ap in ${APS}; do node "$ap" 'rm -f /tmp/multipop/*.changes /tmp/multipop/*.penalty'; done
+}
+
+# The /64 of an address.
+p64() { echo "$1" | cut -d: -f1-4; }
+
+# Both sites up and preferred on all APs, and a preferred address of each
+# site on all clients.
+stable() {
+	local ap c a
+	for ap in ${APS}; do
+		ap_has "$ap" muc01 'up .* preferred=300' && ap_has "$ap" vie01 'up .* preferred=300' || return 1
+	done
+	for c in ${CLIENTS}; do
+		a=$(dx "$c" ip -6 -o addr show dev lan scope global | grep -v deprecated)
+		echo "$a" | grep -q " ${PREFIX_A}" && echo "$a" | grep -q " ${PREFIX_B}" || return 1
+	done
+}
+
+# wait_stable <seconds>: wait until stable, and record the result.
+wait_stable() {
+	local t0=${SECONDS}
+	if wait_for "$1" stable; then
+		check "lab is stable again" ok "after $((SECONDS - t0)) s"
+	else
+		check "lab is stable again" fail "$(for ap in ${APS}; do node "$ap" 'cat /tmp/multipop/status'; done | tr '\n' ';')"
+	fi
+}
+
+# The gateway that a tunnel of an AP uses now, from the WireGuard endpoint.
+# The lab CPE answers gwN.lab with 198.51.100.N (site A) or 192.0.2.N (site B).
+pgw_gw() { node "$1" "wg show $2 endpoints" | awk '{split($2, a, "[.:]"); print "gw0" a[4]}'; }
+
+# The wg_cX tunnel of a site on an AP.
+site_ifc() { node "$1" "cat /tmp/multipop/status" | awk -v s="$2" '$2 == s {print $1}'; }

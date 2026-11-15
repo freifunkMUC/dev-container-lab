@@ -3,21 +3,24 @@
 # clients must use it again.
 . "$(dirname "$0")/common.sh"
 
+clear_damping
+
 log "restoring site B"
 dx internet ip link set gw03 up
 dx internet ip link set gw04 up
 t0=${SECONDS}
 
 for ap in ${APS}; do
-	if wait_for 900 sh -c "LAB=${LAB} '${ROOT}/node-cmd.sh' $ap 'cat /tmp/multipop/status' | grep -q 'vie01 up .* preferred=120'"; then
+	if wait_for 900 ap_has "$ap" vie01 'up .* preferred=300'; then
 		check "$ap sees site B up" ok "after $((SECONDS - t0)) s: $(site_state "$ap" vie01)"
 	else
 		check "$ap sees site B up" fail "$(node "$ap" 'cat /tmp/multipop/status' | tr '\n' ';')"
 	fi
 done
 
+pref_b() { dx "$1" ip -6 -o addr show dev lan scope global | grep "${PREFIX_B}" | grep -vq deprecated; }
 for c in ${CLIENTS}; do
-	if ! wait_for 120 sh -c "sudo docker exec clab-${LAB}-$c ip -6 -o addr show dev lan scope global | grep '${PREFIX_B}' | grep -vq deprecated"; then
+	if ! wait_for 300 pref_b "$c"; then
 		check "$c gets a preferred site B address" fail "$(dx "$c" ip -6 -o addr show dev lan)"
 		continue
 	fi

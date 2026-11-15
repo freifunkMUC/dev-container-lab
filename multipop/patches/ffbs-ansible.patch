@@ -1,8 +1,8 @@
 diff --git a/group_vars/all/vars b/group_vars/all/vars
-index b3bca6b..b7da945 100644
+index b3bca6b..a29f6ac 100644
 --- a/group_vars/all/vars
 +++ b/group_vars/all/vars
-@@ -17,8 +17,29 @@ private_ipv4_range: '10.0.0.0/16'
+@@ -17,8 +17,31 @@ private_ipv4_range: '10.0.0.0/16'
  # locally, so all of them use the same one.
  client_ipv4_range: '10.0.4.0/22'
  
@@ -19,6 +19,8 @@ index b3bca6b..b7da945 100644
 +    pool6: '2001:db8:a::/50'
 +    dns64: '2001:db8:a::53'
 +    ipam_file: "{{ wgkex_ipam_file }}"
++    # The site that a node without caps=multiprefix (old firmware) gets.
++    primary: true
 +  pop-b:
 +    site: vie01
 +    range6_without_prefix: '2001:db8:b'
@@ -258,3 +260,16 @@ index 543e54c..c00d77b 100644
  Environment=PYTHONUNBUFFERED=1
  WorkingDirectory={{ wgkex_dir }}/src
  ExecStart={{ wgkex_dir }}/venv/bin/python -m wgkex.broker.app
+diff --git a/roles/wgkex/templates/wgkex-worker.service.j2 b/roles/wgkex/templates/wgkex-worker.service.j2
+index 8a536f9..9159d01 100644
+--- a/roles/wgkex/templates/wgkex-worker.service.j2
++++ b/roles/wgkex/templates/wgkex-worker.service.j2
+@@ -10,6 +10,8 @@ Wants=network-online.target
+ Type=simple
+ Environment=WGKEX_CONFIG_FILE={{ wgkex_config }}
+ Environment=PYTHONUNBUFFERED=1
++# Multi-PoP (LAB): add the node /63 route only while its handshake is fresh.
++Environment=WGKEX_ROUTE_ON_HANDSHAKE=180
+ WorkingDirectory={{ wgkex_dir }}/src
+ ExecStart={{ wgkex_dir }}/venv/bin/python -m wgkex.worker.app
+ Restart=always

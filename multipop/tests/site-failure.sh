@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Site B fails: the internet loses the links to gw03 and gw04. The nodes must
 # deprecate the site B prefix, reject it with ICMPv6 code 5, keep IPv6 on
-# site A, move IPv4 to site A, and stop announcing site B after 120 s.
+# site A, move IPv4 to site A, and stop announcing site B after 120 s. The
+# client addresses of site B expire after the valid lifetime (600 s).
 . "$(dirname "$0")/common.sh"
+
+clear_damping
 
 declare -A SRC_B
 for c in ${CLIENTS}; do SRC_B[$c]=$(addr_in "$c" "${PREFIX_B}"); done
@@ -13,7 +16,7 @@ dx internet ip link set gw04 down
 t0=${SECONDS}
 
 for ap in ${APS}; do
-	if wait_for 90 sh -c "LAB=${LAB} '${ROOT}/node-cmd.sh' $ap 'cat /tmp/multipop/status' | grep -q 'vie01 down'"; then
+	if wait_for 180 ap_has "$ap" vie01 "down "; then
 		check "$ap sees site B down" ok "after $((SECONDS - t0)) s: $(site_state "$ap" vie01)"
 	else
 		check "$ap sees site B down" fail "$(node "$ap" 'cat /tmp/multipop/status' | tr '\n' ';')"
@@ -22,7 +25,7 @@ done
 
 for c in ${CLIENTS}; do
 	b=${SRC_B[$c]}
-	if wait_for 90 deprecated "$c" "$b"; then
+	if wait_for 180 deprecated "$c" "$b"; then
 		check "$c site B address is deprecated" ok "$b after $((SECONDS - t0)) s"
 	else
 		check "$c site B address is deprecated" fail "$(dx "$c" ip -6 addr show dev lan | grep "$b")"
@@ -53,7 +56,7 @@ for c in ${CLIENTS}; do
 done
 
 for ap in ${APS}; do
-	if wait_for 240 sh -c "LAB=${LAB} '${ROOT}/node-cmd.sh' $ap 'cat /tmp/multipop/status' | grep 'vie01' | grep -q withdrawn"; then
+	if wait_for 300 ap_has "$ap" vie01 withdrawn; then
 		check "$ap stops announcing site B" ok "after $((SECONDS - t0)) s"
 	else
 		check "$ap stops announcing site B" fail "$(site_state "$ap" vie01)"
@@ -61,9 +64,10 @@ for ap in ${APS}; do
 	node "$ap" 'logread -e mp-node | tail -n 20' >> "${LOG}" 2>&1
 done
 
+gone() { ! dx "$1" ip -6 addr show dev lan | grep -q "$2/"; }
 for c in ${CLIENTS}; do
 	b=${SRC_B[$c]}
-	if wait_for 240 sh -c "! sudo docker exec clab-${LAB}-$c ip -6 addr show dev lan | grep -q '$b/'"; then
+	if wait_for 780 gone "$c" "$b"; then
 		check "$c site B address expires" ok "after $((SECONDS - t0)) s"
 	else
 		check "$c site B address expires" fail "$(dx "$c" ip -6 addr show dev lan | grep "$b")"

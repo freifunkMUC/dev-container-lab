@@ -1,8 +1,16 @@
 diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
-index 86a22d1..5e44649 100644
+index 86a22d1..c003b5f 100644
 --- a/wgkex/broker/app.py
 +++ b/wgkex/broker/app.py
-@@ -21,6 +21,7 @@ from waitress import serve
+@@ -2,6 +2,7 @@
+ """wgkex broker"""
+ 
+ import dataclasses
++import ipaddress
+ import json
+ import random
+ import signal
+@@ -21,6 +22,7 @@ from waitress import serve
  from wgkex.broker.ipam import ParkerIPAM
  from wgkex.broker.ipam_netbox import NetboxIPAM
  from wgkex.broker.ipam_json import JSONFileIPAM
@@ -10,7 +18,7 @@ index 86a22d1..5e44649 100644
  from wgkex.broker.metrics import WorkerMetricsCollection, WorkerResult
  from wgkex.broker.parker import ParkerQuery, ParkerResponse
  from wgkex.broker.signer import sign_response
-@@ -119,6 +120,8 @@ parker_worker_metrics = WorkerMetricsCollection()
+@@ -119,6 +121,8 @@ parker_worker_metrics = WorkerMetricsCollection()
  worker_data: Dict[Tuple[str, str], Dict] = {}
  parker_worker_data: Dict[str, Dict] = {}
  ipam: Optional[ParkerIPAM] = _load_parker_ipam()
@@ -19,64 +27,144 @@ index 86a22d1..5e44649 100644
  # Track active brokers announced over MQTT
  active_brokers: set[str] = set()
  parker_active_brokers: set[str] = set()
-@@ -348,6 +351,13 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
-             }, 400
+@@ -365,27 +369,44 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+             f"Chose worker {worker.name} with {worker.peers} connected clients ({worker.diff})"
+         )
  
-     concentrators = []
+-        w_data = parker_worker_data.get(worker.name, None)
+-        if w_data is None:
++        entry = concentrator_entry(worker.name, worker.id)
++        if entry is None:
+             logger.error(f"Couldn't get worker endpoint data for {worker.name}")
+             return {"error": {"message": "could not get gateway data"}}, 500
+-
+-        # An endpoint_name in the config replaces the address the worker announced,
+-        # leaving it to the nodes to resolve the concentrator's name.
+-        worker_cfg = config.get_config().workers.get(worker.name)
+-        endpoint_host = str(w_data.get("ExternalAddress"))
+-        if worker_cfg is not None and worker_cfg.endpoint_name:
+-            endpoint_host = worker_cfg.endpoint_name
+-
+-        concentrators.append(
+-            {
+-                "address4": "10.0.0.1",  # TODO fetch real concentrator address4 from worker status
+-                "address6": w_data.get("LinkAddress"),
+-                "endpoint": join_host_port(endpoint_host, str(w_data.get("Port"))),
+-                "pubkey": w_data.get("PublicKey"),  # type: ignore
+-                "id": worker.id,
+-            }
++        concentrators.append(entry)
++
++    # LAB PROTOTYPE: with sites configured, the answer has one concentrator per
++    # site with all pgws of the site, and every pgw of the site gets the peer.
++    # A node without caps=multiprefix gets one site only (old firmware).
++    provisioned = {worker.name: str(full_range6) for worker in selected_workers}
++    extra: Dict[str, Any] = {}
 +    site_prefixes = multisite.site_prefixes(
 +        sites, req_data.pubkey, config.get_config().parker.prefixes.ipv6.length
 +    )
-+
-+    def worker_site(name: str) -> Optional[Dict[str, str]]:
-+        worker_cfg = config.get_config().workers.get(name)
-+        return site_prefixes.get(worker_cfg.pop) if worker_cfg else None
- 
-     for worker in selected_workers:
-         # Update number of peers locally to interpolate data between MQTT updates from the worker.
-@@ -386,6 +396,11 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
-                 "id": worker.id,
-             }
++    if site_prefixes:
++        pgws: Dict[str, list] = {}
++        for name in sorted(parker_worker_data):
++            worker_cfg = config.get_config().workers.get(name)
++            entry = concentrator_entry(name, worker_cfg.id) if worker_cfg else None
++            if entry is not None and parker_worker_metrics.get(name).online:
++                pgws.setdefault(worker_cfg.pop, []).append((name, entry))
++        preferred = {
++            config.get_config().workers.get(worker.name).pop: worker.name
++            for worker in selected_workers
++        }
++        built = multisite.build_answer(
++            sites,
++            site_prefixes,
++            pgws,
++            preferred,
++            "multiprefix" in req_data.caps.split(","),
          )
-+        site = worker_site(worker.name)
-+        if site is not None:
-+            concentrators[-1].update(
-+                {k: v for k, v in site.items() if k != "full_range6"}
-+            )
++        if built is not None:
++            concentrators, provisioned, top, primary_site = built
++            range6 = ipaddress.IPv6Network(top["range6"])
++            xlat_range6 = ipaddress.IPv6Network(top["xlat_range6"])
++            if "multiprefix" in req_data.caps.split(","):
++                extra["primary_site"] = primary_site
  
      # Provision the peer only on the workers this node was assigned to. A
      # broadcast here would (re-)install the peer and its prefix routes on
-@@ -396,10 +411,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -396,10 +417,10 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          "Range6": str(full_range6),
          "Keepalive": None,  # TODO make configurable
      }
-+
-+    def worker_mqtt_data(name: str) -> Dict[str, Any]:
-+        site = worker_site(name)
-+        if site is None:
-+            return mqtt_data
-+        return {**mqtt_data, "Range6": site["full_range6"]}
-+
-     for worker in selected_workers:
+-    for worker in selected_workers:
++    for name, worker_range6 in provisioned.items():
          mqtt.publish(
-             f"parker/wireguard/{worker.name}",
+-            f"parker/wireguard/{worker.name}",
 -            json.dumps(mqtt_data).encode("utf-8"),
-+            json.dumps(worker_mqtt_data(worker.name)).encode("utf-8"),
++            f"parker/wireguard/{name}",
++            json.dumps({**mqtt_data, "Range6": worker_range6}).encode("utf-8"),
          )
  
      # A de-selected worker would keep the node's peer and prefix route until
-@@ -413,7 +435,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -407,13 +428,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+     # drop the peer right away instead. A worker that predates the Remove
+     # flag reads this as the re-provisioning it always received - no worse
+     # than before.
+-    selected_names = {worker.name for worker in selected_workers}
+     for previous_name in old_selected_concentrators:
+-        if previous_name in selected_names:
++        if previous_name in provisioned:
              continue
++        previous_range6 = multisite.worker_range6(
++            site_prefixes, config.get_config().workers.get(previous_name)
++        )
          mqtt.publish(
              f"parker/wireguard/{previous_name}",
 -            json.dumps({**mqtt_data, "Remove": True}).encode("utf-8"),
-+            json.dumps({**worker_mqtt_data(previous_name), "Remove": True}).encode(
-+                "utf-8"
-+            ),
++            json.dumps(
++                {**mqtt_data, "Range6": previous_range6 or mqtt_data["Range6"], "Remove": True}
++            ).encode("utf-8"),
          )
  
      ipam.update_prefix(
+@@ -434,7 +459,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+         concentrators=concentrators,
+     )
+ 
+-    data = json.dumps(dataclasses.asdict(response)).encode("utf-8") + "\n".encode(
++    data = json.dumps({**dataclasses.asdict(response), **extra}).encode(
++        "utf-8"
++    ) + "\n".encode(
+         "utf-8"
+     )
+     if config.get_config().broker_signing_key is None:
+@@ -740,6 +767,26 @@ def handle_mqtt_message(
+     )
+ 
+ 
++def concentrator_entry(name: str, worker_id: int) -> Optional[Dict[str, Any]]:
++    """Returns the concentrator data of a worker for the node, or None."""
++    w_data = parker_worker_data.get(name, None)
++    if w_data is None:
++        return None
++    # An endpoint_name in the config replaces the address the worker announced,
++    # leaving it to the nodes to resolve the concentrator's name.
++    worker_cfg = config.get_config().workers.get(name)
++    endpoint_host = str(w_data.get("ExternalAddress"))
++    if worker_cfg is not None and worker_cfg.endpoint_name:
++        endpoint_host = worker_cfg.endpoint_name
++    return {
++        "address4": "10.0.0.1",  # TODO fetch real concentrator address4 from worker status
++        "address6": w_data.get("LinkAddress"),
++        "endpoint": join_host_port(endpoint_host, str(w_data.get("Port"))),
++        "pubkey": w_data.get("PublicKey"),
++        "id": worker_id,
++    }
++
++
+ def join_host_port(host: str, port: str) -> str:
+     """Concatenate a port string with a host string using a colon.
+     The host may be either a hostname, IPv4 or IPv6 address.
 diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
-index ec49134..d33e39d 100644
+index ec49134..f374d19 100644
 --- a/wgkex/broker/app_test.py
 +++ b/wgkex/broker/app_test.py
 @@ -1,7 +1,9 @@
@@ -89,16 +177,18 @@ index ec49134..d33e39d 100644
  import unittest
  
  import flask_mqtt
-@@ -593,6 +595,90 @@ class TestBrokerApp(unittest.TestCase):
+@@ -593,6 +595,124 @@ class TestBrokerApp(unittest.TestCase):
              self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
              self.assertEqual(payload["Range6"], "2001:db8:42::/63")
  
-+    def test_parker_exchange_hands_out_one_prefix_per_site(self):
++    def _multisite_exchange(self, caps):
 +        cfg = _parker_config()
 +        cfg.workers = config.Workers.from_dict(
 +            {
 +                "worker1": {"id": 1, "pop": "pop-a"},
-+                "worker2": {"id": 2, "pop": "pop-b"},
++                "worker2": {"id": 2, "pop": "pop-a"},
++                "worker3": {"id": 3, "pop": "pop-b"},
++                "worker4": {"id": 4, "pop": "pop-b"},
 +            },
 +            10,
 +        )
@@ -108,20 +198,22 @@ index ec49134..d33e39d 100644
 +            ipaddress.IPv6Network("2001:db8:a:2::/63"),
 +            [],
 +        )
-+        query = {"pubkey": _PUBLIC_KEY, "nonce": "nonce"}
-+        for name in ("worker1", "worker2"):
++        query = {"pubkey": _PUBLIC_KEY, "nonce": "nonce", "caps": caps}
++        for name in ("worker1", "worker2", "worker3", "worker4"):
 +            self.broker_app.parker_worker_data[name] = {
-+                "LinkAddress": "fe80::1",
++                "LinkAddress": f"fe80::{name[-1]}",
 +                "ExternalAddress": f"{name}.example",
 +                "Port": 10000,
 +                "PublicKey": f"{name}-key",
 +            }
++            self.broker_app.parker_worker_metrics.set_online(name)
++        # get_best_workers picks worker2 in pop-a and worker3 in pop-b.
 +        workers = [
 +            self.broker_app.WorkerResult(
-+                name="worker1", id=1, diff=0, peers=0, target=0
++                name="worker2", id=2, diff=0, peers=0, target=0
 +            ),
 +            self.broker_app.WorkerResult(
-+                name="worker2", id=2, diff=0, peers=0, target=0
++                name="worker3", id=3, diff=0, peers=0, target=0
 +            ),
 +        ]
 +        with tempfile.TemporaryDirectory() as tmp:
@@ -157,24 +249,54 @@ index ec49134..d33e39d 100644
 +
 +        self.assertEqual(response.status_code, 200)
 +        answer = json.loads(response.data.decode().splitlines()[0])
-+        self.assertEqual(answer["range6"], "2001:db8:a:2::/64")
-+        by_id = {c["id"]: c for c in answer["concentrators"]}
-+        self.assertEqual(by_id[1]["site"], "muc01")
-+        self.assertEqual(by_id[1]["range6"], "2001:db8:a:2::/64")
-+        self.assertEqual(by_id[2]["site"], "vie01")
-+        self.assertEqual(by_id[2]["range6"], "2001:db8:b:2::/64")
-+        self.assertEqual(by_id[2]["xlat_range6"], "2001:db8:b:3::/64")
-+        self.assertEqual(by_id[2]["node_address6"], "2001:db8:b:2::1")
 +        published = {
 +            call.args[0]: json.loads(call.args[1])["Range6"]
 +            for call in mqtt.publish.call_args_list
 +        }
++        return answer, published
++
++    def test_parker_exchange_hands_out_one_prefix_per_site(self):
++        answer, published = self._multisite_exchange("multiprefix")
++
++        self.assertEqual(answer["range6"], "2001:db8:a:2::/64")
++        self.assertEqual(answer["primary_site"], "muc01")
++        by_id = {c["id"]: c for c in answer["concentrators"]}
++        self.assertEqual(sorted(by_id), [1, 2])
++        self.assertEqual(by_id[1]["site"], "muc01")
++        self.assertEqual(by_id[1]["range6"], "2001:db8:a:2::/64")
++        self.assertEqual(by_id[1]["pubkey"], "worker2-key")
++        self.assertEqual(by_id[2]["site"], "vie01")
++        self.assertEqual(by_id[2]["range6"], "2001:db8:b:2::/64")
++        self.assertEqual(by_id[2]["xlat_range6"], "2001:db8:b:3::/64")
++        self.assertEqual(by_id[2]["node_address6"], "2001:db8:b:2::1")
++        self.assertEqual(
++            [(p["pubkey"], p["address6"], p["preferred"]) for p in by_id[2]["pgws"]],
++            [("worker3-key", "fe80::3", True), ("worker4-key", "fe80::4", False)],
++        )
++        # Every pgw of a site gets the /63 of its site.
 +        self.assertEqual(
 +            published,
 +            {
 +                "parker/wireguard/worker1": "2001:db8:a:2::/63",
-+                "parker/wireguard/worker2": "2001:db8:b:2::/63",
++                "parker/wireguard/worker2": "2001:db8:a:2::/63",
++                "parker/wireguard/worker3": "2001:db8:b:2::/63",
++                "parker/wireguard/worker4": "2001:db8:b:2::/63",
 +            },
++        )
++
++    def test_parker_exchange_gives_old_firmware_one_site(self):
++        answer, published = self._multisite_exchange("")
++
++        self.assertNotIn("primary_site", answer)
++        self.assertEqual(answer["range6"], "2001:db8:a:2::/64")
++        self.assertEqual(answer["xlat_range6"], "2001:db8:a:3::/64")
++        self.assertEqual(len(answer["concentrators"]), 1)
++        concentrator = answer["concentrators"][0]
++        self.assertEqual(concentrator["pubkey"], "worker2-key")
++        self.assertNotIn("site", concentrator)
++        self.assertNotIn("pgws", concentrator)
++        self.assertEqual(
++            published, {"parker/wireguard/worker2": "2001:db8:a:2::/63"}
 +        )
 +
      def test_parker_exchange_removes_peer_from_deselected_workers(self):
@@ -182,22 +304,25 @@ index ec49134..d33e39d 100644
          cfg.workers = config.Workers.from_dict(
 diff --git a/wgkex/broker/multisite.py b/wgkex/broker/multisite.py
 new file mode 100644
-index 0000000..a54effd
+index 0000000..c871756
 --- /dev/null
 +++ b/wgkex/broker/multisite.py
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,153 @@
 +"""LAB PROTOTYPE: per-site prefixes for the Parker multi-PoP design.
 +
 +Each site (PoP) has its own IPv6 parent prefix. A node gets one /63 from each
-+site. Every concentrator in the answer carries the prefixes of its own site,
-+and every worker gets only the /63 of its own site.
++site. The answer has one concentrator per site. It carries the prefixes of the
++site, the preferred pgw of the site, and a "pgws" list with all online pgws of
++the site. Every pgw of a site gets the /63 of that site. A node that does not
++send caps=multiprefix (old firmware) gets one site only, with the top-level
++fields only.
 +
 +The sites come from a JSON file (WGKEX_SITES_FILE, default
 +/etc/wgkex-sites.json). Without that file, nothing changes:
 +
 +    {
 +      "pop-a": {"site": "muc01", "ipam_file": "/var/local/.../a.json",
-+                "dns64": "2001:db8:a::53"},
++                "dns64": "2001:db8:a::53", "primary": true},
 +      "pop-b": {"site": "vie01", "ipam_file": "/var/local/.../b.json",
 +                "dns64": "2001:db8:b::53"}
 +    }
@@ -205,12 +330,14 @@ index 0000000..a54effd
 +
 +import json
 +import os
-+from typing import Any, Dict
++from typing import Any, Dict, List, Optional, Tuple
 +
 +from wgkex.broker.ipam_json import JSONFileIPAM
 +from wgkex.common import logger
 +
 +SITES_FILE = os.environ.get("WGKEX_SITES_FILE", "/etc/wgkex-sites.json")
++
++Answer = Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str], str]
 +
 +
 +def load_sites(path: str = SITES_FILE) -> Dict[str, Dict[str, Any]]:
@@ -245,3 +372,311 @@ index 0000000..a54effd
 +            "dns64": site.get("dns64", ""),
 +        }
 +    return result
++
++
++def primary_pop(sites: Dict[str, Dict[str, Any]]) -> str:
++    for pop in sorted(sites):
++        if sites[pop].get("primary"):
++            return pop
++    return sorted(sites)[0]
++
++
++def worker_range6(prefixes: Dict[str, Dict[str, str]], worker_cfg: Any) -> Optional[str]:
++    if worker_cfg is None or worker_cfg.pop not in prefixes:
++        return None
++    return prefixes[worker_cfg.pop]["full_range6"]
++
++
++def build_answer(
++    sites: Dict[str, Dict[str, Any]],
++    prefixes: Dict[str, Dict[str, str]],
++    pgws: Dict[str, List[Tuple[str, Dict[str, Any]]]],
++    preferred: Dict[str, str],
++    multiprefix: bool,
++) -> Optional[Answer]:
++    """Builds the concentrators of the answer.
++
++    Arguments:
++        prefixes: the node prefixes per PoP, from site_prefixes().
++        pgws: the online pgws per PoP as (worker name, concentrator entry).
++        preferred: the worker that get_best_workers() selected per PoP.
++        multiprefix: True if the node can use more than one site.
++
++    Returns:
++        (concentrators, {worker name: /63 to provision}, top-level prefixes,
++        primary site name), or None if no site has an online pgw.
++    """
++    live = [pop for pop in sorted(prefixes) if pgws.get(pop)]
++    if not live:
++        return None
++    primary = primary_pop(sites)
++    top_pop = primary if primary in live else live[0]
++    if not multiprefix:
++        live = [top_pop]
++    site_ids = {pop: index + 1 for index, pop in enumerate(sorted(sites))}
++
++    concentrators: List[Dict[str, Any]] = []
++    provisioned: Dict[str, str] = {}
++    for pop in live:
++        entries = dict(pgws[pop])
++        best = preferred.get(pop)
++        if best not in entries:
++            best = pgws[pop][0][0]
++        full_range6 = prefixes[pop]["full_range6"]
++        if not multiprefix:
++            concentrators.append(dict(entries[best]))
++            provisioned[best] = full_range6
++            continue
++        site = {k: v for k, v in prefixes[pop].items() if k != "full_range6"}
++        concentrators.append(
++            {
++                **entries[best],
++                **site,
++                # The id names the tunnel on the node (wg_c<id>). It is fixed
++                # per site, so a pgw switch keeps the tunnel.
++                "id": site_ids[pop],
++                "pgws": [
++                    {
++                        "id": entry["id"],
++                        "endpoint": entry["endpoint"],
++                        "pubkey": entry["pubkey"],
++                        "address6": entry["address6"],
++                        "preferred": name == best,
++                    }
++                    for name, entry in pgws[pop]
++                ],
++            }
++        )
++        for name, _ in pgws[pop]:
++            provisioned[name] = full_range6
++
++    top = prefixes[top_pop]
++    return (
++        concentrators,
++        provisioned,
++        {
++            "range6": top["range6"],
++            "xlat_range6": top["xlat_range6"],
++            "address6": top["node_address6"],
++        },
++        sites[primary].get("site", primary),
++    )
+diff --git a/wgkex/broker/parker.py b/wgkex/broker/parker.py
+index a480752..b4d40d9 100644
+--- a/wgkex/broker/parker.py
++++ b/wgkex/broker/parker.py
+@@ -14,11 +14,13 @@ class ParkerQuery:
+         v6mtu (int): The maximum transmission unit (MTU) size the client can handle.
+         pubkey (str): The client's WireGuard public key, base64 encoded.
+         nonce (str): A unique nonce value to prevent replay attacks.
++        caps (str): Comma-separated node capabilities, e.g. "multiprefix" (LAB PROTOTYPE).
+     """
+ 
+     v6mtu: int
+     pubkey: str
+     nonce: str
++    caps: str = ""
+ 
+     def __post_init__(self) -> None:
+         self.pubkey = is_valid_wg_pubkey(self.pubkey)
+@@ -29,7 +31,8 @@ class ParkerQuery:
+         v6mtu: int = int(data.get("v6mtu", 1280))
+         pubkey: str = is_valid_wg_pubkey(data.get("pubkey", ""))
+         nonce: str = data.get("nonce", "")
+-        return cls(v6mtu=v6mtu, pubkey=pubkey, nonce=nonce)
++        caps: str = data.get("caps", "")
++        return cls(v6mtu=v6mtu, pubkey=pubkey, nonce=nonce, caps=caps)
+ 
+ 
+ @dataclasses.dataclass
+diff --git a/wgkex/worker/app.py b/wgkex/worker/app.py
+index da74438..203bb52 100644
+--- a/wgkex/worker/app.py
++++ b/wgkex/worker/app.py
+@@ -10,6 +10,7 @@ from wgkex.common.utils import is_valid_domain
+ from wgkex.config import config
+ from wgkex.worker import mqtt
+ from wgkex.worker.msg_queue import watch_queue
++from wgkex.worker import handshake_routes
+ from wgkex.worker.netlink import wg_flush_stale_peers
+ from wgkex.worker.peer_state import PeerMutationCoordinator, peer_mutations
+ 
+@@ -208,6 +209,12 @@ def main():
+         parker_prefix_length=worker_config.parker.prefixes.ipv6.length,
+         initial_handshake_grace=worker_config.cleanup.initial_handshake_grace,
+     )
++    if parker_enabled:
++        route_thread = handshake_routes.start(
++            exit_event, worker_config.parker.prefixes.ipv6.length
++        )
++        if route_thread is not None:
++            cleanup_threads.append(route_thread)
+     try:
+         mqtt.connect(exit_event)
+     finally:
+diff --git a/wgkex/worker/handshake_routes.py b/wgkex/worker/handshake_routes.py
+new file mode 100644
+index 0000000..e8e2407
+--- /dev/null
++++ b/wgkex/worker/handshake_routes.py
+@@ -0,0 +1,91 @@
++"""LAB PROTOTYPE: install a node /63 route only while its handshake is fresh.
++
++In the multi-PoP design every pgw of a site has the peer of every node of the
++site. Only the pgw with a live session may announce the /63 of the node. So
++the route follows the handshake, and the peer stays.
++
++Set WGKEX_ROUTE_ON_HANDSHAKE=<seconds> (for example 180) to enable it.
++"""
++
++import os
++import socket
++import threading
++from time import time
++from typing import Callable, Dict, Optional
++
++import pyroute2
++import pyroute2.netlink.exceptions
++
++from wgkex.common import logger
++from wgkex.worker import netlink
++
++INTERFACE = "wg-nodes"
++SYNC_INTERVAL = 5.0
++
++
++def fresh_seconds() -> Optional[float]:
++    value = os.environ.get("WGKEX_ROUTE_ON_HANDSHAKE", "")
++    return float(value) if value else None
++
++
++def wanted_routes(
++    peers: list, prefix_length: int, fresh: float, now: float
++) -> Dict[str, bool]:
++    """Maps the /63 of each peer to True if its handshake is fresh."""
++    wanted: Dict[str, bool] = {}
++    for peer in peers:
++        try:
++            prefix = netlink._parker_prefix(peer, prefix_length)
++            handshake = netlink._last_handshake_seconds(peer)
++        except (ValueError, AttributeError):
++            continue
++        is_fresh = bool(handshake) and now - handshake < fresh
++        wanted[prefix] = wanted.get(prefix, False) or is_fresh
++    return wanted
++
++
++def sync_routes(
++    prefix_length: int, fresh: float, clock: Callable[[], float] = time
++) -> None:
++    with pyroute2.WireGuard() as wg:
++        peers = []
++        for msg in netlink._wireguard_info(wg, INTERFACE):
++            peers.extend(msg.get_attr("WGDEVICE_A_PEERS") or [])
++    wanted = wanted_routes(peers, prefix_length, fresh, clock())
++    with pyroute2.IPRoute() as ip:
++        oif = ip.link_lookup(ifname=INTERFACE)[0]
++        present = {
++            f"{route.get_attr('RTA_DST')}/{route['dst_len']}"
++            for route in ip.get_routes(family=socket.AF_INET6, oif=oif)
++            if route["dst_len"] == prefix_length
++        }
++        for prefix, is_fresh in wanted.items():
++            if is_fresh == (prefix in present):
++                continue
++            try:
++                ip.route("replace" if is_fresh else "del", dst=prefix, oif=oif)
++                logger.info(
++                    "Handshake route %s %s",
++                    "installed" if is_fresh else "removed",
++                    prefix,
++                )
++            except pyroute2.netlink.exceptions.NetlinkError as error:
++                logger.warning("Handshake route %s failed: %s", prefix, error)
++
++
++def start(exit_event: threading.Event, prefix_length: int) -> Optional[threading.Thread]:
++    fresh = fresh_seconds()
++    if fresh is None:
++        return None
++    logger.info("Routes follow handshakes (lab prototype), fresh=%ss", fresh)
++
++    def loop() -> None:
++        while not exit_event.wait(SYNC_INTERVAL):
++            try:
++                sync_routes(prefix_length, fresh)
++            except Exception as error:
++                logger.error("Handshake route sync failed", exc_info=error)
++
++    thread = threading.Thread(target=loop, name="handshake-routes")
++    thread.start()
++    return thread
+diff --git a/wgkex/worker/handshake_routes_test.py b/wgkex/worker/handshake_routes_test.py
+new file mode 100644
+index 0000000..7684a58
+--- /dev/null
++++ b/wgkex/worker/handshake_routes_test.py
+@@ -0,0 +1,35 @@
++import unittest
++
++from wgkex.worker import handshake_routes
++
++
++class _Peer:
++    def __init__(self, prefix, handshake):
++        self.attrs = {
++            "WGPEER_A_ALLOWEDIPS": [{"addr": prefix}],
++            "WGPEER_A_LAST_HANDSHAKE_TIME": {"tv_sec": handshake},
++        }
++
++    def get_attr(self, name):
++        return self.attrs.get(name)
++
++
++class HandshakeRoutesTest(unittest.TestCase):
++    def test_route_follows_fresh_handshake(self):
++        peers = [
++            _Peer("2001:db8:a::/63", 1000),
++            _Peer("2001:db8:a:2::/63", 700),
++            _Peer("2001:db8:a:4::/63", 0),
++        ]
++        self.assertEqual(
++            handshake_routes.wanted_routes(peers, 63, 180, 1100),
++            {
++                "2001:db8:a::/63": True,
++                "2001:db8:a:2::/63": False,
++                "2001:db8:a:4::/63": False,
++            },
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/wgkex/worker/netlink.py b/wgkex/worker/netlink.py
+index 378558d..8ae8ad5 100644
+--- a/wgkex/worker/netlink.py
++++ b/wgkex/worker/netlink.py
+@@ -2,6 +2,7 @@
+ 
+ # See https://docs.pyroute2.org/iproute.html for a documentation of the layout of netlink responses
+ import errno
++import os
+ import hashlib
+ import ipaddress
+ import re
+@@ -371,7 +372,14 @@ def link_handler(
+         _run_operation("wireguard", client, update_wireguard_peer, operations)
+     else:
+         _run_operation("wireguard", client, update_wireguard_peer, operations)
+-        _run_operation("route", client, route_handler, operations)
++        # LAB PROTOTYPE: with WGKEX_ROUTE_ON_HANDSHAKE, handshake_routes adds
++        # the route after the first fresh handshake.
++        if isinstance(client, ParkerWireGuardClient) and os.environ.get(
++            "WGKEX_ROUTE_ON_HANDSHAKE"
++        ):
++            operations["route"] = OperationOutcome(status="wait_handshake")
++        else:
++            _run_operation("route", client, route_handler, operations)
+         if isinstance(client, ParkerWireGuardClient):
+             for previous_range6 in client.previous_ranges6:
+                 if previous_range6 == client.range6:

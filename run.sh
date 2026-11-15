@@ -15,7 +15,7 @@ cd "$(dirname "$0")" || exit 1
 ROOT=$PWD
 export LAB=ffmuc-mp-aa
 export RESULTS="${ROOT}/results"
-TESTS="normal ra-single source-prefix site-failure recovery"
+TESTS="${TESTS:-normal ra-single source-prefix rule8-tie pmtu roam pgw-failure broker-down site-failure recovery flapping long-outage old-firmware}"
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 export PATH="${HOME}/.local/bin:${PATH}"
 mkdir -p "${RESULTS}"

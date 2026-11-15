@@ -42,6 +42,8 @@ logging.Logger.trace = trace
 MULTIPOP_DIR = "/multipop"
 MULTIPOP_FILES = {
     "/usr/sbin/mp-node.sh": "mp-node.sh",
+    "/usr/sbin/mp-fw.sh": "mp-fw.sh",
+    "/usr/share/lua/mp-override.lua": "mp-override.lua",
     "/etc/init.d/mp-node": "mp-node.init",
     "/etc/init.d/gluon-radvd": "gluon-radvd.init",
     "/etc/init.d/ebpf-clat": "ebpf-clat.init",
@@ -54,6 +56,20 @@ NODECONFIG_SED = (
     " -e 's/\"inet6 \"\\.\\.o\\.address6\\.\\./\"inet6 \"..(a.node_address6 or o.address6)../'"
     " -e 's/\"ip -6 addr replace \"\\.\\.o\\.address6\\.\\./\"ip -6 addr replace \"..(a.node_address6 or o.address6)../'"
     " /usr/share/lua/nodeconfig.lua"
+)
+# nodeconfig gives the parsed broker answer to mp-override.lua, which
+# selects the pgw of each site (see there).
+NODECONFIG_HOOK = (
+    "sed -i '/^local t=m.parse(e.read_file(r))$/a"
+    " local mpo=loadfile(\"/usr/share/lua/mp-override.lua\") if mpo then t=mpo()(t,r) end'"
+    " /usr/share/lua/nodeconfig.lua"
+)
+# The node tells the broker that it can use one prefix per site.
+NODECONFIG_CAPS = "sed -i 's/&version=/\\&caps=multiprefix&/' /usr/sbin/nodeconfig.sh"
+# fw3 adds the jumps to the reject chain again after each reload.
+FW3_INCLUDE = (
+    "uci set firewall.multipop=include && uci set firewall.multipop.path=/usr/sbin/mp-fw.sh"
+    " && uci set firewall.multipop.reload=1 && uci commit firewall"
 )
 
 
@@ -71,7 +87,7 @@ def multipop_cmds():
             cmds.append(f"printf '%s\\n' '{quoted}' >> {path}")
         cmds.append(f"chmod 755 {path}")
     cmds += uradvd_cmds()
-    cmds += [NODECONFIG_SED, "/etc/init.d/mp-node enable"]
+    cmds += [NODECONFIG_SED, NODECONFIG_HOOK, NODECONFIG_CAPS, FW3_INCLUDE, "/etc/init.d/mp-node enable"]
     return cmds
 
 
