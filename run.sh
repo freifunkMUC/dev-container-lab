@@ -66,7 +66,8 @@ install_tools() {
 	export DEBIAN_FRONTEND=noninteractive
 	sudo -E apt-get update -q
 	sudo -E apt-get install -y -q docker.io jq curl gpg lsb-release patch \
-		qemu-system-x86 qemu-utils sshpass pipx signify-openbsd wireguard-tools
+		qemu-system-x86 qemu-utils sshpass pipx signify-openbsd wireguard-tools \
+		xorriso openssh-client ncurses-bin
 	sudo chmod 666 /dev/kvm /var/run/docker.sock
 	command -v containerlab >/dev/null ||
 		bash -c "$(curl -sL https://get.containerlab.dev)"
@@ -90,9 +91,17 @@ stage install pass "$(docker --version); $(containerlab version 2>/dev/null | aw
 if ! ls gluon/gluon-ffmuc-*-x86-64*.img >/dev/null 2>&1; then
 	fw="${FIRMWARE:-$(ls multipop/firmware/*.img.gz 2>/dev/null | head -1)}"
 	[ -n "${fw}" ] || fail_early firmware "no Gluon firmware: put an x86-64 factory *.img.gz in multipop/firmware/"
-	gunzip -c "${fw}" > "gluon/$(basename "${fw}" .gz)" || true
+	img="gluon/$(basename "${fw}" .gz)"
+	# Gluon/OpenWrt images have fwtool metadata and a signature after the
+	# gzip data. gunzip then says "trailing garbage ignored" and exits with 2.
+	rc=0
+	gunzip -c "${fw}" > "${img}" 2> "${RESULTS}/firmware.log" || rc=$?
+	if [ "${rc}" -gt 2 ] || [ ! -s "${img}" ]; then
+		rm -f "${img}"
+		fail_early firmware "cannot unpack ${fw} (gunzip exit ${rc}), see firmware.log"
+	fi
 fi
-stage firmware pass "$(ls gluon/gluon-ffmuc-*-x86-64*.img)"
+stage firmware pass "$(ls gluon/gluon-ffmuc-*-x86-64*.img), $(stat -c %s gluon/gluon-ffmuc-*-x86-64*.img) bytes"
 
 start=${SECONDS}
 TERM=dumb ./build.sh < /dev/null > "${RESULTS}/build.log" 2>&1

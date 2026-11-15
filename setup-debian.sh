@@ -33,7 +33,7 @@ sudo apt update && sudo apt install packer
 # between lab nodes through the host firewall (the script says why)
 sudo ./lab-bridges.sh
 
-sudo apt install qemu-system qemu-utils wireguard sshpass pipx signify-openbsd
+sudo apt install qemu-system qemu-utils wireguard sshpass pipx signify-openbsd xorriso
 
 pipx install --include-deps ansible
 ansible-galaxy collection install ansible.posix
