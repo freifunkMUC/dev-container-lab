@@ -70,7 +70,7 @@ stage kvm pass "/dev/kvm present; $(nproc) CPUs, $(free -g | awk '/Mem:/ {print 
 install_tools() {
 	export DEBIAN_FRONTEND=noninteractive
 	sudo -E apt-get update -q
-	sudo -E apt-get install -y -q docker.io jq curl gpg lsb-release patch \
+	sudo -E apt-get install -y -q docker.io docker-buildx jq curl gpg lsb-release patch \
 		qemu-system-x86 qemu-utils sshpass pipx signify-openbsd wireguard-tools \
 		xorriso openssh-client ncurses-bin
 	sudo chmod 666 /dev/kvm /var/run/docker.sock
