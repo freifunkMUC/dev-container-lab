@@ -30,14 +30,17 @@ if idx == 0:
     if idx2 != 0:
         sys.stderr.write("serial login failed: %r\n" % res)
         sys.exit(1)
-# The sentinel is split in the input so only its *output* matches.
-tn.write(cmd.encode() + b"; echo @@DO''NE@@\r")
+# The markers are split in the input so only their *output* matches. The
+# console wraps a long command over several lines, so take only the text
+# between the start and the end marker.
+tn.write(b"echo @@ST''ART@@; " + cmd.encode() + b"; echo @@DO''NE@@\r")
 out = tn.read_until(b"@@DONE@@", timeout)
 text = out.decode(errors="replace")
-# Strip the echoed command line and the sentinel line.
-lines = text.splitlines()
-if len(lines) < 2:
+if "@@DONE@@" not in text or "@@START@@" not in text:
     sys.stderr.write("command produced no output before the timeout: %r\n" % text)
     sys.exit(1)
-sys.stdout.write("\n".join(lines[1:-1]) + "\n")
+body = text.rsplit("@@START@@", 1)[1].rsplit("@@DONE@@", 1)[0]
+lines = body.splitlines()[1:]
+# The end marker is at the start of its own line.
+sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
 EOF

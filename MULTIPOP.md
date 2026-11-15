@@ -130,7 +130,11 @@ the serial console. They are not production code.
    a tunnel is up. On a change, the node sends SIGHUP 3 times, 3 s apart.
    The patch is `multipop/patches/uradvd.patch`.
 10. dnsmasq gets the DNS64 server of the live sites, the active site first,
-   on each change.
+   on each change. The node resolves the `.lab` names (gateways and broker)
+   through the WAN resolver (`gluon-wan-dnsmasq`, port 54), because the DNS64
+   does not know them. Before a gateway change, the node resolves the name to
+   an address and gives the address to `wg`. If no answer comes, the node
+   uses the last good address.
 
 Set other times in `/etc/multipop.conf` on the node (see `mp-node.sh`).
 The node writes its events (site up or down, gateway change, report,

@@ -50,6 +50,11 @@ PENALTY=${MP_PENALTY:-30}
 PENALTY_MAX=${MP_PENALTY_MAX:-600}
 # The design example is 10 minutes. The lab uses less to keep the tests short.
 WITHDRAW_AFTER=${MP_WITHDRAW_AFTER:-120}
+# The names that the node resolves through the WAN (gluon-wan-dnsmasq on
+# port 54), not through the DNS64 of a site: the pgw endpoints and the
+# broker. The lab DNS64 does not know them, and the node must resolve them
+# also when no tunnel is up.
+WAN_DOMAINS=${MP_WAN_DOMAINS:-lab}
 PREFERRED=${MP_PREFERRED:-300}
 VALID=${MP_VALID:-600}
 # shellcheck disable=SC1091
@@ -61,6 +66,26 @@ conc() { jsonfilter -i "$CONF" -e "@.concentrators[$1].$2" 2>/dev/null; }
 pgw() { jsonfilter -i "$CONF" -e "@.concentrators[$1].pgws[$2].$3" 2>/dev/null; }
 get() { cat "$ST/$1" 2>/dev/null || echo "${2-0}"; }
 put() { echo "$2" > "$ST/$1"; }
+wan_dns() { for d in $WAN_DOMAINS; do echo "server=/$d/127.0.0.1#54"; done; }
+# resolve_ep <host:port>: prints <address:port>. The pgw switch gives wg an
+# address, never a name: if wg cannot resolve a name, it tries again for
+# minutes and blocks the loop. The last good answer stays in a cache.
+resolve_ep() {
+	host=${1%:*} port=${1##*:}
+	# An IPv4 or [IPv6] address needs no lookup.
+	case "$host" in
+	\[*) echo "$1"; return ;;
+	*[!0-9.]*) ;;
+	*) echo "$1"; return ;;
+	esac
+	ea=$(nslookup "$host" 127.0.0.1 2>/dev/null |
+		awk '/^Name:/ {n = 1} n && /^Address/ {sub(/^Address( [0-9]+)?:[ \t]*/, ""); print; exit}')
+	case "$ea" in
+	*:*) echo "[$ea]:$port" > "$ST/ep.$host" ;;
+	?*) echo "$ea:$port" > "$ST/ep.$host" ;;
+	esac
+	cat "$ST/ep.$host" 2>/dev/null
+}
 # One ip rule per pref. busybox prints "<pref>:<TAB>from all ...".
 set_rule() {
 	pref=$1
@@ -73,8 +98,8 @@ set_rule() {
 mkdir -p "$ST" /var/run
 
 # dnsmasq reads the DNS64 servers from a file that this script writes.
+[ -s "$ST/dns-servers" ] || wan_dns > "$ST/dns-servers"
 if [ "$(uci -q get dhcp.@dnsmasq[0].serversfile)" != "$ST/dns-servers" ]; then
-	touch "$ST/dns-servers"
 	uci -q delete dhcp.@dnsmasq[0].server
 	uci set dhcp.@dnsmasq[0].serversfile="$ST/dns-servers"
 	uci set dhcp.@dnsmasq[0].noresolv=1
@@ -93,9 +118,11 @@ switch_pgw() {
 	ips=$(wg show "$ifc" allowed-ips | awk '{for (i = 2; i <= NF; i++) printf "%s%s", (i > 2 ? "," : ""), $i; exit}')
 	[ "$ka" = off ] && ka=0
 	[ -n "$key" ] || return
+	ep=$(resolve_ep "$(pgw "$i" $next endpoint)")
+	[ -n "$ep" ] || { log "$ifc ($site): cannot resolve $(pgw "$i" $next endpoint)"; return; }
 	log "$ifc ($site): pgw $(pgw "$i" "$pj" id) does not answer, using pgw $(pgw "$i" $next id)"
 	wg set "$ifc" peer "$cur" remove
-	wg set "$ifc" peer "$key" endpoint "$(pgw "$i" $next endpoint)" \
+	wg set "$ifc" peer "$key" endpoint "$ep" \
 		persistent-keepalive "${ka:-25}" allowed-ips "${ips:-::/0}"
 	echo "$key" > "$ST/pgw.$id"
 	put "$ifc.switch_ts" "$now"
@@ -353,6 +380,7 @@ write_dns() {
 	} > "$ST/dns-servers.next"
 	# No live site: try all resolvers.
 	[ -s "$ST/dns-servers.next" ] || awk '{print "server=" $2}' "$ST/dns.all" > "$ST/dns-servers.next"
+	wan_dns >> "$ST/dns-servers.next"
 	cmp -s "$ST/dns-servers.next" "$ST/dns-servers" && return
 	mv "$ST/dns-servers.next" "$ST/dns-servers"
 	log "dnsmasq servers: $(tr '\n' ' ' < "$ST/dns-servers")"

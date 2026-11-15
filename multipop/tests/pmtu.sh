@@ -29,14 +29,19 @@ for c in ${CLIENTS}; do
 			check "$c site $1: $m byte packets arrive" ok "$(echo "$out" | grep received)" ||
 			check "$c site $1: $m byte packets arrive" fail "$(echo "$out" | tail -n 2 | tr '\n' ';')"
 		out=$(dx "$c" ping -6 -c 3 -i 0.5 -W 2 -M "do" -s $((m - 47)) -I "$src" "${SERVER6}" 2>&1)
-		if echo "$out" | grep -qiE 'too long|too big|mtu'; then
-			check "$c site $1: $((m + 1)) byte packets get packet too big" ok "$(echo "$out" | grep -iE 'too long|too big|mtu' | head -n 1)"
+		# iputils prints "Message too large" (sendmsg) once the client knows
+		# the smaller path MTU, or "Packet too big" for the ICMPv6 error.
+		if echo "$out" | grep -qiE 'too large|too long|too big|mtu'; then
+			check "$c site $1: $((m + 1)) byte packets get packet too big" ok "$(echo "$out" | grep -iE 'too large|too long|too big|mtu' | head -n 1)"
 		else
 			check "$c site $1: $((m + 1)) byte packets get packet too big" fail "$(echo "$out" | tail -n 2 | tr '\n' ';')"
 		fi
 	done
 
-	m4=${MTU4[$ap]:-$((${MTU[${ap}_muc01]} - 20))}
+	# The client knows the IPv4 MTU from DHCP (the route MTU). Else the
+	# CLAT MTU is the tunnel MTU less 20 bytes.
+	m4=$(dx "$c" ip -4 route show default | grep -oE 'mtu [0-9]+' | cut -d' ' -f2)
+	m4=${m4:-${MTU4[$ap]:-$((${MTU[${ap}_muc01]} - 20))}}
 	# 28 bytes: the IPv4 header and the ICMP echo header.
 	out=$(dx "$c" ping -4 -c 3 -i 0.5 -W 2 -M "do" -s $((m4 - 28)) "${SERVER4}" 2>&1)
 	echo "$out" | grep -qE ' [123] received' &&

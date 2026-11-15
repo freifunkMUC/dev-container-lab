@@ -138,9 +138,13 @@ while [ $((SECONDS - start)) -lt "${READY_TIMEOUT}" ]; do
 	clients=0
 	for c in client-1 client-2 client-3 client-4; do
 		a=$(sudo docker exec "clab-${LAB}-${c}" ip -6 -o addr show dev lan scope global 2>/dev/null)
-		echo "${a}" | grep -q '2001:db8:a:' && echo "${a}" | grep -q '2001:db8:b:' && clients=$((clients + 1))
+		# The IPv4 tests need a DHCPv4 lease from the node (10.0.4.0/22), not
+		# the IPv4LL address that dhcpcd uses until then.
+		a4=$(sudo docker exec "clab-${LAB}-${c}" ip -4 -o addr show dev lan scope global 2>/dev/null)
+		echo "${a}" | grep -q '2001:db8:a:' && echo "${a}" | grep -q '2001:db8:b:' &&
+			echo "${a4}" | grep -q ' 10\.0\.' && clients=$((clients + 1))
 	done
-	echo "[$(date +%T)] waiting: ${ok}/2 APs with both sites up, ${clients}/4 clients with both prefixes"
+	echo "[$(date +%T)] waiting: ${ok}/2 APs with both sites up, ${clients}/4 clients with both prefixes and a DHCPv4 lease"
 	if [ "${ok}" = 2 ] && [ "${clients}" = 4 ]; then
 		ready=1
 		break
@@ -148,7 +152,7 @@ while [ $((SECONDS - start)) -lt "${READY_TIMEOUT}" ]; do
 	sleep 30
 done
 [ "${ready}" = 1 ] || fail_early ready "lab not ready after ${READY_TIMEOUT} s"
-stage ready pass "both APs have both sites up after $((SECONDS - start)) s"
+stage ready pass "both APs have both sites up and all clients have both prefixes and a DHCPv4 lease after $((SECONDS - start)) s"
 
 # 5. Tests, in this order: failure needs normal, recovery needs failure.
 for t in ${TESTS}; do
