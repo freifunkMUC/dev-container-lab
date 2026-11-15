@@ -13,7 +13,7 @@
 
 set -eu
 
-bridges="as-ap1-lan as-ap2-lan as-home1 as-home2 as-gw-vpn"
+bridges="as-ap1-lan as-ap2-lan as-ap3-lan as-ap4-lan as-home1 as-home2 as-gw-vpn"
 
 if [ "$(id -u)" != 0 ]; then
 	echo "needs root: sudo $0" >&2

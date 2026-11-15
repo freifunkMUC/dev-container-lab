@@ -82,6 +82,18 @@ def uradvd_cmds(path="/uradvd.gz"):
     return cmds
 
 
+# LAB PROTOTYPE: nodeconfig.sh tells the broker that the node can take
+# more than one site (caps=multiprefix), and puts the pgw in use back into
+# each fetched config before nodeconfig.lua applies it (parker-as.lua pin).
+NODECONFIG_HOOKS = [
+    "sed -i 's|version=${version}|version=${version}\\&caps=multiprefix|'"
+    " /usr/sbin/nodeconfig.sh",
+    "sed -i 's|^\\([[:space:]]*\\)if outp=$(lua /usr/share/lua/nodeconfig.lua|"
+    "\\1lua /usr/share/lua/parker-as.lua pin \"${tmpdir}config.json\"\\n&|'"
+    " /usr/sbin/nodeconfig.sh",
+]
+
+
 class Gluon_vm(vrnetlab.VM):
     def __init__(self, hostname):
         super().__init__('', '', disk_image='/gluon.qcow2', ram=512)
@@ -106,10 +118,22 @@ class Gluon_vm(vrnetlab.VM):
             redirect = ">" if n == 0 else ">>"
             cmds.append(f"echo '{key}' {redirect} /etc/dropbear/authorized_keys")
 
+        if os.environ.get("MESHONWAN", "") == "1":
+            # Mesh with the other APs on the LAN our WAN port hangs off. The
+            # role only turns into a network configuration once the upgrade
+            # scripts below have run.
+            cmds += [
+                "uci -q del_list gluon.iface_wan.role='mesh'",
+                "uci add_list gluon.iface_wan.role='mesh'",
+            ]
+
         # LAB PROTOTYPE: multi-PoP active/standby node code, see
         # /lab-prototype. Written over the serial console one line at a time.
-        cmds += uradvd_cmds()
-        cmds += prototype_cmds("/lab-prototype")
+        # LAB_FIRMWARE=old keeps the stock firmware: one site, no prototype.
+        if os.environ.get("LAB_FIRMWARE", "") != "old":
+            cmds += uradvd_cmds()
+            cmds += prototype_cmds("/lab-prototype")
+            cmds += NODECONFIG_HOOKS
 
         # 906-parker-nodeconfig copies the config server and the key its
         # answers are verified with out of site.conf and into uci every time

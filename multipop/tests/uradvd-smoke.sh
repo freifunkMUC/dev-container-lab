@@ -11,7 +11,8 @@
 #   3. SIGHUP with preferred 0 for B: B deprecated at once, A not,
 #   4. B left out: A stays preferred,
 #   5. B back: B preferred again,
-#   6. a bad state file: uradvd keeps the old state.
+#   6. a bad state file: uradvd keeps the old state,
+#   7. SIGHUP sends three RAs, at least 3 s apart.
 # Exit 0 only if all steps pass.
 
 set -eu
@@ -26,7 +27,7 @@ fails=0
 ok() { echo "PASS: $*"; }
 nok() { echo "FAIL: $*"; fails=$((fails + 1)); }
 
-apk add -q build-base linux-headers curl patch dhcpcd ndisc6 iproute2 >/dev/null
+apk add -q build-base linux-headers curl patch dhcpcd ndisc6 iproute2 tcpdump >/dev/null
 mkdir /src && cd /src
 curl -sfL "https://codeload.github.com/freifunkMUC/uradvd/tar.gz/${COMMIT}" | tar xz --strip-components 1
 gcc -Os -DVERSION='"orig"' -o /uradvd-orig uradvd.c
@@ -140,6 +141,24 @@ sleep 2
 [ "$(ra | wc -l)" = 2 ] && grep -q "ignoring state file" /uradvd.err &&
 	ok "bad file ignored, old state kept" || nok "RA: $(ra | tr '\n' ';')"
 
+kill "$u"
+
+echo "--- 7. SIGHUP sends three RAs, at least 3 s apart"
+client_down
+printf '%s\n' "${A}/64,120,180" "${B}/64,120,180" > /state
+/uradvd -i r --state-file /state --max-router-adv-interval 200 --min-router-adv-interval 150 2>/dev/null &
+u=$!
+sleep 8
+ip netns exec cl timeout 13 tcpdump -l -n -tt -i c icmp6 2>/dev/null |
+	awk '/router advertisement/ { print int($1) }' > /burst &
+sleep 1
+kill -HUP "$u"
+sleep 14
+times=$(tr '\n' ' ' < /burst)
+n=$(wc -l < /burst)
+gaps=$(awk 'NR > 1 && $1 - p < 3 { bad++ } { p = $1 } END { print bad + 0 }' /burst)
+[ "$n" = 3 ] && [ "$gaps" = 0 ] && ok "three RAs after SIGHUP at ${times}" ||
+	nok "RAs after SIGHUP at: ${times}"
 kill "$u"
 echo "--- ${fails} failure(s)"
 [ "${fails}" = 0 ]

@@ -105,7 +105,7 @@
           {"parent_prefix": "{{ lab_sites[lab_default_primary].parker_prefix }}", "ranges": {}, "concentrators": {}}
       when: inventory_hostname in groups['Brokers']
 
-    - name: Add the lab_multipop block to the broker config
+    - name: Add the lab_multipop block to the wgkex config (broker and workers)
       ansible.builtin.blockinfile:
         path: "{{ wgkex_config }}"
         marker: "# {mark} LAB PROTOTYPE multi-PoP active/standby"
@@ -122,5 +122,16 @@
               {{ name }}:
                 parker_prefix: {{ site.parker_prefix }}
                 dns64: {{ site.dns64 }}
+                tunnel_id: {{ site.tunnel_id }}
           {% endfor %}
-      when: inventory_hostname in groups['Brokers']
+            gate:
+              handshake_max_age: 180
+              interval: 10
+
+    # The broker adds a node to all pgws of a site. A pgw keeps the peer and
+    # the lab gate announces the /63 only while the handshake is fresh.
+    - name: Keep node peers on the worker
+      ansible.builtin.replace:
+        path: "{{ wgkex_config }}"
+        regexp: '^(\s+parker_stale_timeout:) \d+$'
+        replace: '\1 864000'

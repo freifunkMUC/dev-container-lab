@@ -8,7 +8,7 @@
 # It writes results/summary.json and the raw logs to results/.
 # Exit code 0 only if all setup steps and all tests pass.
 #
-# Needs: nested KVM (/dev/kvm), about 8 vCPU, 32 GB RAM, 40 GB free disk,
+# Needs: nested KVM (/dev/kvm), about 8 vCPU, 32 GB RAM, a 64 GB disk,
 # outbound HTTPS. Gluon image: gluon/*.img, or artifacts/*.img.gz (unpacked
 # here), or GLUON_IMAGE_URL (downloaded over HTTPS).
 
@@ -68,7 +68,7 @@ install_deps() {
 	sudo -E apt-get update -q
 	sudo -E apt-get install -yq ca-certificates curl gnupg lsb-release python3 \
 		qemu-system-x86 qemu-utils wireguard-tools sshpass signify-openbsd \
-		ansible docker.io bridge-utils iptables
+		ansible docker.io bridge-utils iptables xorriso
 	sudo systemctl enable --now docker
 	if ! command -v containerlab >/dev/null; then
 		curl -fsSL https://get.containerlab.dev | sudo -E bash
@@ -84,6 +84,7 @@ install_deps() {
 	sudo ansible-galaxy collection install ansible.posix
 	containerlab version
 	packer version
+	xorriso -version 2>&1 | head -1
 	ansible --version | head -1
 	docker --version
 }
@@ -101,8 +102,9 @@ gluon_image() {
 		curl -fsSL -o "${gz}" "${GLUON_IMAGE_URL}"
 	fi
 	[ -n "${gz}" ] || { echo "no Gluon image: put one in artifacts/ or set GLUON_IMAGE_URL"; return 1; }
-	# gunzip returns 2 on "trailing garbage" from the Gluon signature.
-	gunzip -c "${gz}" > "gluon/$(basename "${gz%.gz}")" || [ $? = 2 ]
+	# Gluon images have data after the gzip stream. gzip warns about
+	# "trailing garbage" and returns 2. -q drops the warning; the image is good.
+	gzip -dcq "${gz}" > "gluon/$(basename "${gz%.gz}")" || [ $? = 2 ]
 	ls -l gluon/*.img
 }
 
@@ -135,8 +137,8 @@ collect_logs() {
 	for c in $(sudo docker ps -a --format '{{.Names}}' | grep "^clab-${LAB}-"); do
 		sudo docker logs "${c}" > "${d}/${c#clab-"${LAB}"-}.docker.log" 2>&1
 	done
-	for ap in ap-1 ap-2; do
-		timeout 120 ./node-cmd.sh "${ap}" 'cat /tmp/parker-as/status; for f in /tmp/parker-as/ra-args /tmp/parker-as/ra-state; do echo "$f: $(cat $f)"; done; ip -6 rule; ip -6 route show table all | grep -v "^local\|^multicast\|fe80"; ip route; ip6tables -S parker_as; ip6tables -S FORWARD | head -5; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; ps w | grep -E "uradvd|clat|parker"; logread | tail -300' 60 \
+	for ap in ap-1 ap-2 ap-3 ap-4; do
+		timeout 120 ./node-cmd.sh "${ap}" 'cat /tmp/parker-as/status; for f in /tmp/parker-as/ra-args /tmp/parker-as/ra-state; do echo "$f: $(cat $f)"; done; ip -6 rule; ip -6 route show table all | grep -v "^local\|^multicast\|fe80"; ip route; ip6tables -S parker_src; ip6tables -S FORWARD | head -5; ip6tables -S OUTPUT | head -5; cat /tmp/parker-as/dns-servers; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; ps w | grep -E "uradvd|clat|parker"; logread | tail -300' 60 \
 			> "${d}/${ap}.state.txt" 2>&1
 	done
 	for gw in gw01 gw02 gw03 gw04; do

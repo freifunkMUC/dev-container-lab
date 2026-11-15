@@ -24,8 +24,8 @@ topology:
     # First AP.
     # Gets its hostname, SSH access key, Parker config server and the key it
     # verifies its configuration with set via Python through its serial
-    # console. Reaches the gateways through the CPE and meshes with AP-2 over
-    # the home LAN the two of them share.
+    # console. Reaches the gateways through the CPE of home 1 and meshes with
+    # AP-3 over the home 1 LAN. Primary site MUC.
     ap-1:
       kind: generic_vm
       network-mode: none
@@ -35,6 +35,7 @@ topology:
           ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
           ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
+        MESHONWAN: "1"   # meshes with AP-3 over the home 1 LAN
         # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
         # replacing the production key the image was built with.
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
@@ -118,6 +119,57 @@ topology:
       binds:
         - client/entrypoint.sh:/entrypoint.sh
 
+    # AP-3: new firmware in home 1. Meshes with AP-1 over the home 1 LAN, so a
+    # client can roam between the two nodes. Primary site MUC.
+    ap-3:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gluon
+      env:
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: 198.51.100.1
+        MESHONWAN: "1"   # meshes with AP-1 over the home 1 LAN
+        # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
+        # replacing the production key the image was built with.
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+    as-ap3-lan:
+      kind: bridge
+    client-5:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+
+    # AP-4: old firmware in home 2. No lab prototype and no caps=multiprefix,
+    # so the broker gives it one site (VIE) and a stock config.
+    ap-4:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gluon
+      env:
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: 198.51.100.1
+        LAB_FIRMWARE: old
+        # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
+        # replacing the production key the image was built with.
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+    as-ap4-lan:
+      kind: bridge
+    client-6:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+
+
     # The four gateways in two sites: gw01/gw02 = MUC (2001:db8:100::/48),
     # gw03/gw04 = VIE (2001:db8:200::/48). Each announces its site /48, its
     # public IPv4 and its NAT64 IPv4 to the internet and terminates WireGuard.
@@ -155,6 +207,14 @@ topology:
     - endpoints: ["client-4:lan", "as-ap2-lan:client4"]
     - endpoints: ["cpe-2:lan", "as-home2:cpe-2-lan"]
     - endpoints: ["cpe-2:wan", "internet:cpe2"]         # CPE-2 internet uplink
+
+    - endpoints: ["ap-3:eth1", "as-ap3-lan:ap-3"]       # AP-3 LAN interface
+    - endpoints: ["ap-3:eth2", "as-home1:ap-3-wan"]     # AP-3 WAN interface, home 1
+    - endpoints: ["client-5:lan", "as-ap3-lan:client5"]
+
+    - endpoints: ["ap-4:eth1", "as-ap4-lan:ap-4"]       # AP-4 LAN interface
+    - endpoints: ["ap-4:eth2", "as-home2:ap-4-wan"]     # AP-4 WAN interface, home 2
+    - endpoints: ["client-6:lan", "as-ap4-lan:client6"]
 
     - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
     - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
