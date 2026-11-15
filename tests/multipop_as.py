@@ -198,7 +198,8 @@ def seen_source(client, dst):
 
 
 def route4_dev(ap):
-    _, out = vm(ap, "ip -4 route show default proto 23")
+    # busybox ip ignores "proto" in show, so pick the default via a tunnel.
+    _, out = vm(ap, "ip -4 route show | grep '^default via'")
     m = re.search(r"dev (\S+)", out)
     return m.group(1) if m else None
 
@@ -349,8 +350,9 @@ def t_failover(c, site):
                  f"{cl} ping from dead {dead_addr} gets ICMPv6 type 1 code 5 (policy fail)")
         c.log(f"ping: {' | '.join(pout.strip().splitlines()[-3:])}")
         c.log(f"tcpdump: {' | '.join(out.strip().splitlines())}")
-    _, out = vm(ap, "nft list table inet parker_as")
-    c.log(f"{ap} nft: {' '.join(out.split())}")
+    _, out = vm(ap, "ip6tables -S parker_as")
+    c.expect(f"-s {st['sites'].get(site, {}).get('range6')} -j REJECT" in out,
+             f"{ap} rejects the dead {site} prefix: {' | '.join(out.strip().splitlines())}")
 
     ost = ap_status(other_home["ap"])
     c.expect(ost.get("effective") == other_home["primary"],
@@ -380,8 +382,8 @@ def t_recovery(c, site):
                               for a in map(client_addrs, home["clients"])), 180, step=5)
     c.expect(ok, f"clients of {ap} prefer {site} and have {OTHER[site]} as standby after {int(time.time() - t0)} s")
     check_source(c, home, site)
-    _, out = vm(ap, "nft list table inet parker_as")
-    c.expect("reject" not in out, f"{ap} no reject rule left: {' '.join(out.split())}")
+    _, out = vm(ap, "ip6tables -S parker_as")
+    c.expect("REJECT" not in out, f"{ap} no reject rule left: {' | '.join(out.strip().splitlines())}")
     ok, out = ping(home["clients"][0], TARGET4)
     c.expect(ok, f"{home['clients'][0]} IPv4 after recovery: {last(out)}")
 

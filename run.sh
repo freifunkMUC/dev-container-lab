@@ -134,7 +134,7 @@ collect_logs() {
 		sudo docker logs "${c}" > "${d}/${c#clab-${LAB}-}.docker.log" 2>&1
 	done
 	for ap in ap-1 ap-2; do
-		timeout 120 ./node-cmd.sh "${ap}" 'cat /tmp/parker-as/status; for f in /tmp/parker-as/radvd.*; do echo "$f: $(cat $f)"; done; ip -6 rule; ip -6 route show table all | grep -v "^local\|^multicast\|fe80"; ip route; nft list table inet parker_as; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; ps w | grep -E "uradvd|clat|parker"; logread | tail -300' 60 \
+		timeout 120 ./node-cmd.sh "${ap}" 'cat /tmp/parker-as/status; for f in /tmp/parker-as/radvd.*; do echo "$f: $(cat $f)"; done; ip -6 rule; ip -6 route show table all | grep -v "^local\|^multicast\|fe80"; ip route; ip6tables -S parker_as; ip6tables -S FORWARD | head -5; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; ps w | grep -E "uradvd|clat|parker"; logread | tail -300' 60 \
 			> "${d}/${ap}.state.txt" 2>&1
 	done
 	for gw in gw01 gw02 gw03 gw04; do

@@ -172,18 +172,23 @@ local function main()
   for _, name in ipairs(names) do
     if not live[name] then table.insert(dead, conf.sites[name].range6) end
   end
-  local nft_rule = ""
-  if #dead > 0 then
-    nft_rule = "ip6 saddr { " .. table.concat(dead, ", ") .. " } counter reject with icmpv6 type policy-fail"
+  -- Gluon uses firewall3 (iptables), so the rules go in an ip6tables chain.
+  -- Compare with the kernel each time: a firewall reload removes the chain.
+  local want = "-N parker_as\n"
+  for _, src in ipairs(dead) do
+    want = want .. "-A parker_as -s " .. src .. " -j REJECT --reject-with icmp6-policy-fail\n"
   end
-  local nft_conf = "table inet parker_as\ndelete table inet parker_as\n"
-    .. "table inet parker_as {\n chain forward {\n  type filter hook forward priority -10; policy accept;\n  "
-    .. nft_rule .. "\n }\n}\n"
-  if update_file(STATE .. "/nft.conf", nft_conf) or not sh("nft list table inet parker_as") then
-    if not sh("nft -f " .. STATE .. "/nft.conf") then
-      log("nft failed: " .. nft_rule)
-      os.remove(STATE .. "/nft.conf")
+  if output("ip6tables -S parker_as") ~= want then
+    sh("ip6tables -N parker_as")
+    sh("ip6tables -F parker_as")
+    for _, src in ipairs(dead) do
+      if not sh("ip6tables -A parker_as -s " .. src .. " -j REJECT --reject-with icmp6-policy-fail") then
+        log("ip6tables reject failed for " .. src)
+      end
     end
+  end
+  if not sh("ip6tables -C FORWARD -j parker_as") then
+    sh("ip6tables -I FORWARD 1 -j parker_as")
   end
 
   -- RA: one file per site with the uradvd arguments.
