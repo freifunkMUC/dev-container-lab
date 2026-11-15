@@ -34,6 +34,7 @@ RUN apt-get update -qy \
 
 COPY --from=img-convert /gluon.qcow2 .
 COPY *.py /
+COPY multipop /multipop
 
 EXPOSE 22 5000 10000-10099
 HEALTHCHECK CMD ["/healthcheck.py"]

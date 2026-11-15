@@ -1,4 +1,12 @@
-name: ffmuc
+# Multi-PoP lab, active/active variant. Both sites are in use at the same
+# time and the clients choose the source prefix. See MULTIPOP.md.
+name: ffmuc-mp-aa
+
+# A separate management network, so this lab can run next to another one.
+mgmt:
+  network: ffmuc-mp-aa
+  ipv4-subnet: 172.31.20.0/24
+  ipv6-subnet: 3fff:172:31:20::/64
 
 topology:
   nodes:
@@ -13,6 +21,16 @@ topology:
         - internet/entrypoint.sh:/entrypoint.sh
         - internet/daemons:/etc/frr/daemons
         - internet/frr.conf:/etc/frr/frr.conf
+
+    # Multi-PoP: the test server "on the internet". It has IPv4 and IPv6, and
+    # echoes the source address of each TCP connection on port 8080.
+    server:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - server/entrypoint.sh:/entrypoint.sh
 
     # First AP.
     # Gets its hostname, SSH access key, Parker config server and the key it
@@ -32,7 +50,7 @@ topology:
         # replacing the production key the image was built with.
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
         MESHONWAN: "1"
-    ap-1-lan:
+    aa-ap-1-lan:
       kind: bridge
     # Two clients connected to the AP. They just run DHCP.
     client-1:
@@ -64,7 +82,7 @@ topology:
         - cpe/entrypoint.sh:/entrypoint.sh
     # The LAN of the home. Both APs hang off it with their WAN port, which is
     # what lets them mesh with each other over it.
-    home-lan:
+    aa-home-lan:
       kind: bridge
 
     # The second AP, in the same home as the first one and with its own clients
@@ -79,7 +97,7 @@ topology:
         CONFIGSERVER: 198.51.100.1
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
         MESHONWAN: "1"
-    ap-2-lan:
+    aa-ap-2-lan:
       kind: bridge
     client-3:
       kind: linux
@@ -96,9 +114,12 @@ topology:
       binds:
         - client/entrypoint.sh:/entrypoint.sh
 
-    # The four gateways. Announce their public IPv4 and the IPv6 prefix to the
-    # internet and terminate WireGuard. Route IPv6 directly and offer NAT64 for
-    # the client IPv4 the APs translate. The first one also serves the config.
+    # The four gateways in two sites. Site A (muc01) is gw01 and gw02, with
+    # 2001:db8:a::/48 and 198.51.100.0/24. Site B (vie01) is gw03 and gw04,
+    # with 2001:db8:b::/48 and 192.0.2.0/24. Each gateway announces only the
+    # addresses of its site, terminates WireGuard, runs NAT64 with an IPv4
+    # address of its site and DNS64 on the anycast address of its site. gw01
+    # also serves the config for both sites.
     gateway-gw01:
       kind: generic_vm
       network-mode: none
@@ -115,27 +136,28 @@ topology:
       kind: generic_vm
       network-mode: none
       image: ffmuc-lab:gateway-parker-gw04
-    gateway-vpn:
+    aa-gateway-vpn:
       kind: bridge
 
   links:
-    - endpoints: ["ap-1:eth1", "ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
-    - endpoints: ["ap-1:eth2", "home-lan:ap-1-wan"]     # AP-1 WAN interface, goes to the home LAN
-    - endpoints: ["client-1:lan", "ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
-    - endpoints: ["client-2:lan", "ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
-    - endpoints: ["cpe-1:lan", "home-lan:cpe-1-lan"]    # CPE-1 LAN interface, goes to the home LAN
+    - endpoints: ["ap-1:eth1", "aa-ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
+    - endpoints: ["ap-1:eth2", "aa-home-lan:ap-1-wan"]     # AP-1 WAN interface, goes to the home LAN
+    - endpoints: ["client-1:lan", "aa-ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
+    - endpoints: ["client-2:lan", "aa-ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
+    - endpoints: ["cpe-1:lan", "aa-home-lan:cpe-1-lan"]    # CPE-1 LAN interface, goes to the home LAN
     - endpoints: ["cpe-1:wan", "internet:cpe1"]         # CPE-1 internet uplink
+    - endpoints: ["server:eth1", "internet:server"]     # Test server
 
-    - endpoints: ["ap-2:eth1", "ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
-    - endpoints: ["ap-2:eth2", "home-lan:ap-2-wan"]     # AP-2 WAN interface, goes to the same home LAN
-    - endpoints: ["client-3:lan", "ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
-    - endpoints: ["client-4:lan", "ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth1", "aa-ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth2", "aa-home-lan:ap-2-wan"]     # AP-2 WAN interface, goes to the same home LAN
+    - endpoints: ["client-3:lan", "aa-ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
+    - endpoints: ["client-4:lan", "aa-ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
 
     - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
     - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
     - endpoints: ["gateway-gw03:eth1", "internet:gw03"] # GW-03 internet uplink
     - endpoints: ["gateway-gw04:eth1", "internet:gw04"] # GW-04 internet uplink
-    - endpoints: ["gateway-gw01:eth2", "gateway-vpn:gw01"] # GW-01 VPN
-    - endpoints: ["gateway-gw02:eth2", "gateway-vpn:gw02"] # GW-02 VPN
-    - endpoints: ["gateway-gw03:eth2", "gateway-vpn:gw03"] # GW-03 VPN
-    - endpoints: ["gateway-gw04:eth2", "gateway-vpn:gw04"] # GW-04 VPN
+    - endpoints: ["gateway-gw01:eth2", "aa-gateway-vpn:gw01"] # GW-01 VPN
+    - endpoints: ["gateway-gw02:eth2", "aa-gateway-vpn:gw02"] # GW-02 VPN
+    - endpoints: ["gateway-gw03:eth2", "aa-gateway-vpn:gw03"] # GW-03 VPN
+    - endpoints: ["gateway-gw04:eth2", "aa-gateway-vpn:gw04"] # GW-04 VPN

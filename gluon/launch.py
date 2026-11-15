@@ -37,6 +37,43 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
+# LAB PROTOTYPE of the multi-PoP node side, see multipop/mp-node.sh. The
+# files go onto the node through the serial console.
+MULTIPOP_DIR = "/multipop"
+MULTIPOP_FILES = {
+    "/usr/sbin/mp-node.sh": "mp-node.sh",
+    "/etc/init.d/mp-node": "mp-node.init",
+    "/etc/init.d/gluon-radvd": "gluon-radvd.init",
+    "/etc/init.d/ebpf-clat": "ebpf-clat.init",
+}
+# nodeconfig puts the address of the first site on every tunnel. With these
+# edits each tunnel gets the node address of its own site, if the broker
+# sends one.
+NODECONFIG_SED = (
+    "sed -i"
+    " -e 's/\"inet6 \"\\.\\.o\\.address6\\.\\./\"inet6 \"..(a.node_address6 or o.address6)../'"
+    " -e 's/\"ip -6 addr replace \"\\.\\.o\\.address6\\.\\./\"ip -6 addr replace \"..(a.node_address6 or o.address6)../'"
+    " /usr/share/lua/nodeconfig.lua"
+)
+
+
+def multipop_cmds():
+    if not os.path.isdir(MULTIPOP_DIR):
+        return []
+    cmds = []
+    for path, name in MULTIPOP_FILES.items():
+        with open(os.path.join(MULTIPOP_DIR, name)) as f:
+            # A tab on the serial console would start completion in ash.
+            lines = f.read().expandtabs(4).splitlines()
+        cmds.append(f": > {path}")
+        for line in lines:
+            quoted = line.replace("'", "'\\''")
+            cmds.append(f"printf '%s\\n' '{quoted}' >> {path}")
+        cmds.append(f"chmod 755 {path}")
+    cmds += [NODECONFIG_SED, "/etc/init.d/mp-node enable"]
+    return cmds
+
+
 class Gluon_vm(vrnetlab.VM):
     def __init__(self, hostname):
         super().__init__('', '', disk_image='/gluon.qcow2', ram=512)
@@ -84,6 +121,7 @@ class Gluon_vm(vrnetlab.VM):
         if config_pubkey:
             cmds.append(f"uci set parker.nodeconfig.config_pubkey={config_pubkey}")
 
+        cmds += multipop_cmds()
         cmds += [
             "uci commit",
             "sync",

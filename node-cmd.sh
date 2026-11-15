@@ -9,8 +9,9 @@ set -eu
 node="$1"
 cmd="$2"
 timeout="${3:-15}"
+lab="${LAB:-ffmuc-mp-aa}"
 
-sudo docker exec -i "clab-ffmuc-${node}" python3 - "$cmd" "$timeout" <<'EOF'
+sudo docker exec -i "clab-${lab}-${node}" python3 - "$cmd" "$timeout" <<'EOF'
 import sys
 import telnetlib  # removed in Python 3.13; fine on the lab node images
 

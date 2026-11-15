@@ -13,7 +13,8 @@
 
 set -eu
 
-bridges="ap-1-lan ap-2-lan home-lan gateway-vpn"
+# The multi-PoP lab uses its own names, so it can run next to another lab.
+bridges="aa-ap-1-lan aa-ap-2-lan aa-home-lan aa-gateway-vpn"
 
 if [ "$(id -u)" != 0 ]; then
 	echo "needs root: sudo $0" >&2

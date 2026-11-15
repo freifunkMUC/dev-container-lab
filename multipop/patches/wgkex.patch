@@ -1,0 +1,247 @@
+diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
+index 86a22d1..5e44649 100644
+--- a/wgkex/broker/app.py
++++ b/wgkex/broker/app.py
+@@ -21,6 +21,7 @@ from waitress import serve
+ from wgkex.broker.ipam import ParkerIPAM
+ from wgkex.broker.ipam_netbox import NetboxIPAM
+ from wgkex.broker.ipam_json import JSONFileIPAM
++from wgkex.broker import multisite
+ from wgkex.broker.metrics import WorkerMetricsCollection, WorkerResult
+ from wgkex.broker.parker import ParkerQuery, ParkerResponse
+ from wgkex.broker.signer import sign_response
+@@ -119,6 +120,8 @@ parker_worker_metrics = WorkerMetricsCollection()
+ worker_data: Dict[Tuple[str, str], Dict] = {}
+ parker_worker_data: Dict[str, Dict] = {}
+ ipam: Optional[ParkerIPAM] = _load_parker_ipam()
++# LAB PROTOTYPE: per-site prefixes, see multisite.py.
++sites = multisite.load_sites()
+ # Track active brokers announced over MQTT
+ active_brokers: set[str] = set()
+ parker_active_brokers: set[str] = set()
+@@ -348,6 +351,13 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+             }, 400
+ 
+     concentrators = []
++    site_prefixes = multisite.site_prefixes(
++        sites, req_data.pubkey, config.get_config().parker.prefixes.ipv6.length
++    )
++
++    def worker_site(name: str) -> Optional[Dict[str, str]]:
++        worker_cfg = config.get_config().workers.get(name)
++        return site_prefixes.get(worker_cfg.pop) if worker_cfg else None
+ 
+     for worker in selected_workers:
+         # Update number of peers locally to interpolate data between MQTT updates from the worker.
+@@ -386,6 +396,11 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+                 "id": worker.id,
+             }
+         )
++        site = worker_site(worker.name)
++        if site is not None:
++            concentrators[-1].update(
++                {k: v for k, v in site.items() if k != "full_range6"}
++            )
+ 
+     # Provision the peer only on the workers this node was assigned to. A
+     # broadcast here would (re-)install the peer and its prefix routes on
+@@ -396,10 +411,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+         "Range6": str(full_range6),
+         "Keepalive": None,  # TODO make configurable
+     }
++
++    def worker_mqtt_data(name: str) -> Dict[str, Any]:
++        site = worker_site(name)
++        if site is None:
++            return mqtt_data
++        return {**mqtt_data, "Range6": site["full_range6"]}
++
+     for worker in selected_workers:
+         mqtt.publish(
+             f"parker/wireguard/{worker.name}",
+-            json.dumps(mqtt_data).encode("utf-8"),
++            json.dumps(worker_mqtt_data(worker.name)).encode("utf-8"),
+         )
+ 
+     # A de-selected worker would keep the node's peer and prefix route until
+@@ -413,7 +435,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+             continue
+         mqtt.publish(
+             f"parker/wireguard/{previous_name}",
+-            json.dumps({**mqtt_data, "Remove": True}).encode("utf-8"),
++            json.dumps({**worker_mqtt_data(previous_name), "Remove": True}).encode(
++                "utf-8"
++            ),
+         )
+ 
+     ipam.update_prefix(
+diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
+index ec49134..d33e39d 100644
+--- a/wgkex/broker/app_test.py
++++ b/wgkex/broker/app_test.py
+@@ -1,7 +1,9 @@
+ import importlib
+ import ipaddress
+ import json
++import os
+ import sys
++import tempfile
+ import unittest
+ 
+ import flask_mqtt
+@@ -593,6 +595,90 @@ class TestBrokerApp(unittest.TestCase):
+             self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
+             self.assertEqual(payload["Range6"], "2001:db8:42::/63")
+ 
++    def test_parker_exchange_hands_out_one_prefix_per_site(self):
++        cfg = _parker_config()
++        cfg.workers = config.Workers.from_dict(
++            {
++                "worker1": {"id": 1, "pop": "pop-a"},
++                "worker2": {"id": 2, "pop": "pop-b"},
++            },
++            10,
++        )
++        ipam = mock.MagicMock()
++        ipam.get_or_allocate_prefix.return_value = (
++            None,
++            ipaddress.IPv6Network("2001:db8:a:2::/63"),
++            [],
++        )
++        query = {"pubkey": _PUBLIC_KEY, "nonce": "nonce"}
++        for name in ("worker1", "worker2"):
++            self.broker_app.parker_worker_data[name] = {
++                "LinkAddress": "fe80::1",
++                "ExternalAddress": f"{name}.example",
++                "Port": 10000,
++                "PublicKey": f"{name}-key",
++            }
++        workers = [
++            self.broker_app.WorkerResult(
++                name="worker1", id=1, diff=0, peers=0, target=0
++            ),
++            self.broker_app.WorkerResult(
++                name="worker2", id=2, diff=0, peers=0, target=0
++            ),
++        ]
++        with tempfile.TemporaryDirectory() as tmp:
++            sites = {}
++            for pop, site, prefix in (
++                ("pop-a", "muc01", "2001:db8:a::/50"),
++                ("pop-b", "vie01", "2001:db8:b::/50"),
++            ):
++                ipam_file = os.path.join(tmp, f"{pop}.json")
++                with open(ipam_file, "w", encoding="utf-8") as handle:
++                    json.dump({"parent_prefix": prefix, "ranges": {}}, handle)
++                sites[pop] = {"site": site, "ipam_file": ipam_file, "dns64": site}
++
++            with (
++                mock.patch.object(
++                    self.broker_app.config, "get_config", return_value=cfg
++                ),
++                mock.patch.object(self.broker_app, "ipam", ipam),
++                mock.patch.object(self.broker_app, "sites", sites),
++                mock.patch.object(self.broker_app, "mqtt") as mqtt,
++                mock.patch.object(
++                    self.broker_app.parker_worker_metrics,
++                    "get_best_workers",
++                    return_value=workers,
++                ),
++                mock.patch.object(
++                    self.broker_app, "sign_response", return_value=b"signature"
++                ),
++            ):
++                response = self.broker_app.app.test_client().get(
++                    "/config", query_string=query
++                )
++
++        self.assertEqual(response.status_code, 200)
++        answer = json.loads(response.data.decode().splitlines()[0])
++        self.assertEqual(answer["range6"], "2001:db8:a:2::/64")
++        by_id = {c["id"]: c for c in answer["concentrators"]}
++        self.assertEqual(by_id[1]["site"], "muc01")
++        self.assertEqual(by_id[1]["range6"], "2001:db8:a:2::/64")
++        self.assertEqual(by_id[2]["site"], "vie01")
++        self.assertEqual(by_id[2]["range6"], "2001:db8:b:2::/64")
++        self.assertEqual(by_id[2]["xlat_range6"], "2001:db8:b:3::/64")
++        self.assertEqual(by_id[2]["node_address6"], "2001:db8:b:2::1")
++        published = {
++            call.args[0]: json.loads(call.args[1])["Range6"]
++            for call in mqtt.publish.call_args_list
++        }
++        self.assertEqual(
++            published,
++            {
++                "parker/wireguard/worker1": "2001:db8:a:2::/63",
++                "parker/wireguard/worker2": "2001:db8:b:2::/63",
++            },
++        )
++
+     def test_parker_exchange_removes_peer_from_deselected_workers(self):
+         cfg = _parker_config()
+         cfg.workers = config.Workers.from_dict(
+diff --git a/wgkex/broker/multisite.py b/wgkex/broker/multisite.py
+new file mode 100644
+index 0000000..a54effd
+--- /dev/null
++++ b/wgkex/broker/multisite.py
+@@ -0,0 +1,59 @@
++"""LAB PROTOTYPE: per-site prefixes for the Parker multi-PoP design.
++
++Each site (PoP) has its own IPv6 parent prefix. A node gets one /63 from each
++site. Every concentrator in the answer carries the prefixes of its own site,
++and every worker gets only the /63 of its own site.
++
++The sites come from a JSON file (WGKEX_SITES_FILE, default
++/etc/wgkex-sites.json). Without that file, nothing changes:
++
++    {
++      "pop-a": {"site": "muc01", "ipam_file": "/var/local/.../a.json",
++                "dns64": "2001:db8:a::53"},
++      "pop-b": {"site": "vie01", "ipam_file": "/var/local/.../b.json",
++                "dns64": "2001:db8:b::53"}
++    }
++"""
++
++import json
++import os
++from typing import Any, Dict
++
++from wgkex.broker.ipam_json import JSONFileIPAM
++from wgkex.common import logger
++
++SITES_FILE = os.environ.get("WGKEX_SITES_FILE", "/etc/wgkex-sites.json")
++
++
++def load_sites(path: str = SITES_FILE) -> Dict[str, Dict[str, Any]]:
++    if not os.path.exists(path):
++        return {}
++    with open(path, encoding="utf-8") as sites_file:
++        sites = json.load(sites_file)
++    logger.info("Multi-site mode (lab prototype): %s", sorted(sites))
++    return sites
++
++
++def site_prefixes(
++    sites: Dict[str, Dict[str, Any]], pubkey: str, length: int
++) -> Dict[str, Dict[str, str]]:
++    """Returns the prefixes of a node per PoP. A PoP without a free prefix is left out."""
++    result: Dict[str, Dict[str, str]] = {}
++    for pop, site in sites.items():
++        _, full, _ = JSONFileIPAM(site["ipam_file"]).get_or_allocate_prefix(
++            pubkey, False, True, 0, length
++        )
++        if full is None:
++            logger.error("No IPv6 range in site %s for %s", site.get("site"), pubkey)
++            continue
++        subnets = full.subnets(new_prefix=64)
++        range6 = next(subnets)
++        result[pop] = {
++            "site": site.get("site", pop),
++            "full_range6": str(full),
++            "range6": str(range6),
++            "xlat_range6": str(next(subnets)),
++            "node_address6": str(range6.network_address + 1),
++            "dns64": site.get("dns64", ""),
++        }
++    return result

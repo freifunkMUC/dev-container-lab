@@ -32,5 +32,5 @@ exec dnsmasq -i lan -k -F 192.168.10.100,192.168.10.199,6h \
 	--local=/lab/ \
 	--host-record=gw1.lab,198.51.100.1 \
 	--host-record=gw2.lab,198.51.100.2 \
-	--host-record=gw3.lab,198.51.100.3 \
-	--host-record=gw4.lab,198.51.100.4 # -F ::,constructor:lan,slaac
+	--host-record=gw3.lab,192.0.2.3 \
+	--host-record=gw4.lab,192.0.2.4 # -F ::,constructor:lan,slaac

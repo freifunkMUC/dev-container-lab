@@ -4,6 +4,9 @@ set -eEu
 
 cd "$(dirname "$0")"
 
+# Multi-PoP: per-site changes to the gateway submodules.
+./multipop/apply-patches.sh
+
 docker build --build-arg IMAGE=gluon-ffmuc-*-x86-64*.img gluon -t ffmuc-lab:gluon
 
 # The gateways install wgkex from a source tree, so Ansible needs a copy of it

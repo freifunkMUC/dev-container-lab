@@ -1,0 +1,260 @@
+diff --git a/group_vars/all/vars b/group_vars/all/vars
+index b3bca6b..b7da945 100644
+--- a/group_vars/all/vars
++++ b/group_vars/all/vars
+@@ -17,8 +17,29 @@ private_ipv4_range: '10.0.0.0/16'
+ # locally, so all of them use the same one.
+ client_ipv4_range: '10.0.4.0/22'
+ 
+-global_ipv6_range_without_prefix: '2001:db8:ff00'
++# Multi-PoP (LAB): two sites. Each site has its own /48 and its own IPv4
++# addresses, and announces only those. There is no routing between the sites.
++# The nodes get one /63 from the Parker pool of each site, and use the DNS64
++# server of the site through the tunnel to that site. wgkex_pop in host_vars
++# puts each gateway in its site.
++multipop_sites:
++  pop-a:
++    site: muc01
++    range6_without_prefix: '2001:db8:a'
++    pool6: '2001:db8:a::/50'
++    dns64: '2001:db8:a::53'
++    ipam_file: "{{ wgkex_ipam_file }}"
++  pop-b:
++    site: vie01
++    range6_without_prefix: '2001:db8:b'
++    pool6: '2001:db8:b::/50'
++    dns64: '2001:db8:b::53'
++    ipam_file: /var/local/wgkex/broker/ipv6_ranges_b.json
++
++global_ipv6_range_without_prefix: "{{ multipop_sites[wgkex_pop].range6_without_prefix }}"
+ global_ipv6_range_prefix: '48'
++dns64_ipv6: "{{ multipop_sites[wgkex_pop].dns64 }}"
++wgkex_sites_file: /etc/wgkex-sites.json
+ # One /63 per node, allocated from the range above. wgkex splits it into the
+ # /64 the node's clients live in and the /64 its CLAT translates into.
+ node_ipv6_prefix_length: 63
+diff --git a/host_vars/parker-gw03/vars b/host_vars/parker-gw03/vars
+index 3d6b656..4f26104 100644
+--- a/host_vars/parker-gw03/vars
++++ b/host_vars/parker-gw03/vars
+@@ -1,7 +1,7 @@
+-public_ipv4: '198.51.100.3'
++public_ipv4: '192.0.2.3'
+ vpn_ip4: '172.16.0.3'
+ vpn_ip: '172.16.0.3/24'
+-nat64_ipv4: '198.51.100.13'
++nat64_ipv4: '192.0.2.13'
+ nat64_ipv6: '{{ global_ipv6_range_without_prefix }}::1:3'
+ asn: 65103
+ 
+@@ -19,5 +19,5 @@ wgkex_worker_id: 3
+ wgkex_pop: pop-b
+ 
+ # The name nodes resolve this gateway's WireGuard endpoint by. The lab CPE
+-# answers it with 198.51.100.3, see cpe/entrypoint.sh.
++# answers it with 192.0.2.3, see cpe/entrypoint.sh.
+ wgkex_endpoint_name: gw3.lab
+diff --git a/host_vars/parker-gw04/vars b/host_vars/parker-gw04/vars
+index 4a50f76..4061adc 100644
+--- a/host_vars/parker-gw04/vars
++++ b/host_vars/parker-gw04/vars
+@@ -1,7 +1,7 @@
+-public_ipv4: '198.51.100.4'
++public_ipv4: '192.0.2.4'
+ vpn_ip4: '172.16.0.4'
+ vpn_ip: '172.16.0.4/24'
+-nat64_ipv4: '198.51.100.14'
++nat64_ipv4: '192.0.2.14'
+ nat64_ipv6: '{{ global_ipv6_range_without_prefix }}::1:4'
+ asn: 65104
+ 
+@@ -19,5 +19,5 @@ wgkex_worker_id: 4
+ wgkex_pop: pop-b
+ 
+ # The name nodes resolve this gateway's WireGuard endpoint by. The lab CPE
+-# answers it with 198.51.100.4, see cpe/entrypoint.sh.
++# answers it with 192.0.2.4, see cpe/entrypoint.sh.
+ wgkex_endpoint_name: gw4.lab
+diff --git a/playbook.yml b/playbook.yml
+index 3e68d9e..7c1bb2a 100644
+--- a/playbook.yml
++++ b/playbook.yml
+@@ -11,6 +11,7 @@
+       when: inventory_hostname in groups['MQTT']
+     - wgkex
+     - jool
++    - dns64
+   post_tasks:
+     # Restart everything that asked for it while the management interface still
+     # has the DHCP lease this build runs over.
+diff --git a/roles/dns64/files/test.lab.zone b/roles/dns64/files/test.lab.zone
+new file mode 100644
+index 0000000..3c3104e
+--- /dev/null
++++ b/roles/dns64/files/test.lab.zone
+@@ -0,0 +1,8 @@
++$ORIGIN test.lab.
++$TTL 60
++@       IN SOA ns.test.lab. hostmaster.test.lab. 1 3600 600 86400 60
++@       IN NS  ns.test.lab.
++ns      IN A    203.0.113.66
++v4only  IN A    203.0.113.66
++dual    IN A    203.0.113.66
++dual    IN AAAA 2001:db8:cafe:1::2
+diff --git a/roles/dns64/handlers/main.yml b/roles/dns64/handlers/main.yml
+new file mode 100644
+index 0000000..fd8e155
+--- /dev/null
++++ b/roles/dns64/handlers/main.yml
+@@ -0,0 +1,6 @@
++---
++- name: Restart unbound
++  ansible.builtin.systemd_service:
++    daemon_reload: true
++    name: unbound.service
++    state: restarted
+diff --git a/roles/dns64/tasks/main.yml b/roles/dns64/tasks/main.yml
+new file mode 100644
+index 0000000..900a2c9
+--- /dev/null
++++ b/roles/dns64/tasks/main.yml
+@@ -0,0 +1,43 @@
++---
++# Multi-PoP (LAB): the DNS64 server of the site. Both gateways of a site
++# answer on the same address (dns64_ipv6), and FRR announces it.
++- name: Install unbound
++  ansible.builtin.apt:
++    name: unbound
++    state: present
++
++- name: Configure unbound as DNS64
++  ansible.builtin.template:
++    src: dns64.conf.j2
++    dest: /etc/unbound/unbound.conf.d/dns64.conf
++    mode: '0644'
++  notify: Restart unbound
++
++- name: Add the lab test zone
++  ansible.builtin.copy:
++    src: test.lab.zone
++    dest: /etc/unbound/test.lab.zone
++    mode: '0644'
++  notify: Restart unbound
++
++- name: Create the unbound drop-in directory
++  ansible.builtin.file:
++    path: /etc/systemd/system/unbound.service.d
++    state: directory
++    mode: '0755'
++
++# The address must exist before FRR can announce it.
++- name: Put the DNS64 address on lo
++  ansible.builtin.copy:
++    content: |
++      [Service]
++      ExecStartPre=-/usr/sbin/ip -6 addr replace {{ dns64_ipv6 }}/128 dev lo
++    dest: /etc/systemd/system/unbound.service.d/dns64.conf
++    mode: '0644'
++  notify: Restart unbound
++
++- name: Enable unbound
++  ansible.builtin.systemd_service:
++    daemon_reload: true
++    name: unbound.service
++    enabled: true
+diff --git a/roles/dns64/templates/dns64.conf.j2 b/roles/dns64/templates/dns64.conf.j2
+new file mode 100644
+index 0000000..21d522f
+--- /dev/null
++++ b/roles/dns64/templates/dns64.conf.j2
+@@ -0,0 +1,18 @@
++#{{ ansible_managed }}
++server:
++    interface: {{ dns64_ipv6 }}
++    interface-automatic: no
++    ip-freebind: yes
++    access-control: ::/0 allow
++    access-control: 0.0.0.0/0 allow
++    module-config: "dns64 iterator"
++    dns64-prefix: 64:ff9b::/96
++    # The lab has no root servers. Only the test zone resolves.
++    do-not-query-localhost: no
++
++auth-zone:
++    name: "test.lab"
++    zonefile: /etc/unbound/test.lab.zone
++    for-downstream: no
++    for-upstream: yes
++    fallback-enabled: no
+diff --git a/roles/lab-net/templates/frr.conf.j2 b/roles/lab-net/templates/frr.conf.j2
+index c0b1db7..d289403 100644
+--- a/roles/lab-net/templates/frr.conf.j2
++++ b/roles/lab-net/templates/frr.conf.j2
+@@ -31,6 +31,8 @@ router bgp {{ asn }}
+     network {{ wg_gateway_v6 }}/128
+     ! Annouce specific route for our NAT64 IPv6
+     network {{ nat64_ipv6 }}/128
++    ! Announce the DNS64 server of our site (anycast inside the site)
++    network {{ dns64_ipv6 }}/128
+     ! Announce entire public IPv6 range used by APs
+     network {{ global_ipv6_range_without_prefix }}::/{{ global_ipv6_range_prefix }}
+     ! Announce the per-node prefixes routed to our wg-nodes tunnels
+diff --git a/roles/lab-net/templates/nftables.conf.j2 b/roles/lab-net/templates/nftables.conf.j2
+index bee3e2f..2db67c0 100644
+--- a/roles/lab-net/templates/nftables.conf.j2
++++ b/roles/lab-net/templates/nftables.conf.j2
+@@ -16,6 +16,9 @@ table inet filter {
+         # Allow Nginx access
+         tcp dport { 80, 443 } counter accept
+ 
++        # Allow DNS64 for the clients
++        meta l4proto { tcp, udp } th dport 53 counter accept
++
+         # Allow BGP
+         iif uplink tcp dport 179 counter accept
+ 
+diff --git a/roles/wgkex/tasks/main.yml b/roles/wgkex/tasks/main.yml
+index 3a7f8a9..158f7ce 100644
+--- a/roles/wgkex/tasks/main.yml
++++ b/roles/wgkex/tasks/main.yml
+@@ -66,13 +66,25 @@
+ # The JSON IPAM only allocates from the prefix it finds in this file, so it has
+ # to exist before the broker answers its first request. It also keeps the
+ # concentrators picked per node in here, which is what makes the selection stick.
+-- name: Seed the IPAM prefix pool
++# Multi-PoP (LAB): one pool per site. The pool of the first site is the main
++# IPAM file, so the top-level answer of the broker stays as before.
++- name: Seed the IPAM prefix pools
+   ansible.builtin.copy:
+     content: |
+-      {"parent_prefix": "{{ global_ipv6_range_without_prefix }}::/{{ global_ipv6_range_prefix }}", "ranges": {}, "concentrators": {}}
+-    dest: "{{ wgkex_ipam_file }}"
++      {"parent_prefix": "{{ item.value.pool6 }}", "ranges": {}, "concentrators": {}}
++    dest: "{{ item.value.ipam_file }}"
+     mode: '0640'
+     force: false
++  loop: "{{ multipop_sites | dict2items }}"
++  when: inventory_hostname in groups['Brokers']
++
++- name: Tell the broker the sites
++  ansible.builtin.copy:
++    content: "{{ multipop_sites | dict2items | items2dict | to_nice_json }}"
++    dest: "{{ wgkex_sites_file }}"
++    mode: '0644'
++  notify:
++    - Restart wgkex broker
+   when: inventory_hostname in groups['Brokers']
+ 
+ - name: Install wgkex broker unit
+diff --git a/roles/wgkex/templates/wgkex-broker.service.j2 b/roles/wgkex/templates/wgkex-broker.service.j2
+index 543e54c..c00d77b 100644
+--- a/roles/wgkex/templates/wgkex-broker.service.j2
++++ b/roles/wgkex/templates/wgkex-broker.service.j2
+@@ -7,6 +7,7 @@ Wants=network-online.target
+ [Service]
+ Type=simple
+ Environment=WGKEX_CONFIG_FILE={{ wgkex_config }}
++Environment=WGKEX_SITES_FILE={{ wgkex_sites_file }}
+ Environment=PYTHONUNBUFFERED=1
+ WorkingDirectory={{ wgkex_dir }}/src
+ ExecStart={{ wgkex_dir }}/venv/bin/python -m wgkex.broker.app
