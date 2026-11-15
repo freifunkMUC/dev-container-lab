@@ -65,17 +65,18 @@ files into the AP at the first boot.
 
 - `parker-as.lua`: site state, source routing, reject rule, RA and CLAT
   settings, IPv4 default route. It runs every 5 s.
-- `init.d/gluon-radvd`: one uradvd per site prefix.
+- `init.d/gluon-radvd`: one uradvd that sends both prefixes in one RA,
+  each with its own lifetimes. `parker-as.lua` writes the prefixes to
+  `/tmp/parker-as/ra-state` and sends SIGHUP. uradvd reads the file again.
+  The patch is `multipop/patches/uradvd.patch`. The gluon image builds it,
+  and `launch.py` copies it into the AP.
 - `init.d/ebpf-clat`: one xlat address per tunnel.
 
 The broker change is `gateway/packer/multipop/wgkex-multipop.patch`. The
 gateway change is `gateway/packer/multipop/overlay.yml`.
 
-Finding: dhcpcd sets the preferred lifetime of a prefix to 0 when the
-prefix is not in an RA from the same router. With one uradvd per prefix,
-the two RAs deprecate each other. The lab clients thus use kernel SLAAC for
-IPv6 and dhcpcd for IPv4 only. The firmware needs one uradvd with
-lifetimes per prefix.
+Clients: client-1 and client-3 use kernel SLAAC. client-2 and client-4
+use dhcpcd for IPv6. The tests run on both client types.
 
 ## Run it
 
@@ -102,6 +103,7 @@ tests/multipop_as.py normal       # one test
 |---|---|
 | ready | Each AP has two live sites and the correct primary. |
 | normal | IPv6, IPv4 through the CLAT, and DNS64 work. |
+| ra-single | One uradvd per AP. Each RA has both prefixes, the standby with preferred lifetime 0. |
 | source-prefix | Clients use the primary prefix. The internet sees it. |
 | inbound-standby | The internet reaches clients on the standby prefix (ICMP, TCP). |
 | failover-vie, failover-muc | Deprecation, source swap, ICMPv6 code 5, IPv4 failover, prefix removal. |

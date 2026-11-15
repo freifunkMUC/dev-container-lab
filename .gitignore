@@ -15,3 +15,5 @@ clab-ffmuc*
 __pycache__/
 results/
 artifacts/
+# Copy of multipop/patches/uradvd.patch for the gluon build context
+gluon/uradvd.patch

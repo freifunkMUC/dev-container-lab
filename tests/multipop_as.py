@@ -2,7 +2,7 @@
 """Tests for the multi-PoP active/standby lab (clab name ffmuc-mp-as).
 
 Usage: tests/multipop_as.py [--results DIR] [TEST ...]
-Tests, in this order: ready normal source-prefix inbound-standby
+Tests, in this order: ready normal ra-single source-prefix inbound-standby
 failover-vie recovery-vie failover-muc recovery-muc. Without TEST: all.
 
 Each test prints its evidence and writes DIR/test-NN-<test>.json with
@@ -34,6 +34,7 @@ SITES = {
             "pool4": {"198.51.100.13", "198.51.100.14"}},
 }
 # Each home: its AP, its clients and the primary site the broker gives it.
+# The second client of each home uses dhcpcd for IPv6, the first the kernel.
 HOMES = {
     "home1": {"ap": "ap-1", "clients": ["client-1", "client-2"], "primary": "muc"},
     "home2": {"ap": "ap-2", "clients": ["client-3", "client-4"], "primary": "vie"},
@@ -256,6 +257,54 @@ def t_normal(c):
         c.log(f"{cl} resolv.conf: {' | '.join(out.strip().splitlines())}")
 
 
+def ra_prefixes(client, wait_ms=10000):
+    """The RAs a client receives in wait_ms: a list of {site: preferred}."""
+    _, out = dx(client, f"rdisc6 -m -w {wait_ms} lan", timeout=wait_ms // 1000 + 20)
+    ras, cur, site = [], None, None
+    for line in out.splitlines():
+        if "Hop limit" in line:
+            cur = {}
+            ras.append(cur)
+        m = re.search(r"Prefix\s+:\s+([0-9a-f:]+)/64", line)
+        if m and cur is not None:
+            site = site_of(m.group(1))
+            cur[site] = None
+        m = re.search(r"Pref\. time\s+:\s+(\d+)", line)
+        if m and cur is not None and site in cur:
+            cur[site] = int(m.group(1))
+    return ras
+
+
+def t_ra_single(c):
+    """One uradvd per AP sends both prefixes in every RA: the primary with a
+    preferred lifetime, the standby with preferred lifetime 0. No address
+    changes state for 60 s, with kernel SLAAC and with dhcpcd."""
+    for home in HOMES.values():
+        ap, primary = home["ap"], home["primary"]
+        _, out = vm(ap, "pidof uradvd")
+        c.expect(len(out.split()) == 1, f"{ap} runs one uradvd (pids: {out.strip()!r})")
+        _, out = vm(ap, "cat /tmp/parker-as/ra-state")
+        c.log(f"{ap} ra-state: {' | '.join(out.strip().splitlines())}")
+        for cl in home["clients"]:
+            ras = ra_prefixes(cl)
+            good = [ra for ra in ras if set(ra) == {"muc", "vie"}
+                    and ra[primary] and ra[OTHER[primary]] == 0]
+            c.expect(ras and len(good) == len(ras),
+                     f"{cl}: {len(good)}/{len(ras)} RAs have both prefixes, {primary} preferred, "
+                     f"{OTHER[primary]} preferred 0: {ras}")
+    bad = set()
+    for _ in range(12):
+        for home in HOMES.values():
+            for cl in home["clients"]:
+                a = client_addrs(cl)
+                if not preferred(a, home["primary"]):
+                    bad.add(f"{cl}: {home['primary']} not preferred")
+                if OTHER[home["primary"]] not in a:
+                    bad.add(f"{cl}: {OTHER[home['primary']]} missing")
+        time.sleep(5)
+    c.expect(not bad, f"60 s: primary preferred and standby present on all clients {sorted(bad)}")
+
+
 def check_source(c, home, site):
     """Each client of the home uses site as its source. The other prefix is
     deprecated, and the internet sees sources of that site."""
@@ -391,6 +440,7 @@ def t_recovery(c, site):
 TESTS = [
     ("ready", t_ready),
     ("normal", t_normal),
+    ("ra-single", t_ra_single),
     ("source-prefix", t_source_prefix),
     ("inbound-standby", t_inbound_standby),
     ("failover-vie", lambda c: t_failover(c, "vie")),

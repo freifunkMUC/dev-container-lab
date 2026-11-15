@@ -57,6 +57,31 @@ def prototype_cmds(root):
     return cmds
 
 
+# LAB PROTOTYPE: the patched uradvd (multipop/patches/uradvd.patch). The
+# node has no base64, so it goes over as hex lines, and lua turns them back
+# into bytes.
+URADVD_HEX_DECODE = (
+    "lua -e 'local d = io.open(\"/tmp/uradvd.hex\"):read(\"*a\"):gsub(\"%s\", \"\")"
+    ":gsub(\"%x%x\", function(h) return string.char(tonumber(h, 16)) end)"
+    " local f = io.open(\"/tmp/uradvd.gz\", \"wb\") f:write(d) f:close()'"
+)
+
+
+def uradvd_cmds(path="/uradvd.gz"):
+    if not os.path.isfile(path):
+        return []
+    with open(path, "rb") as f:
+        data = f.read().hex()
+    cmds = [": > /tmp/uradvd.hex"]
+    cmds += [f"echo {data[i:i + 400]} >> /tmp/uradvd.hex" for i in range(0, len(data), 400)]
+    cmds += [
+        URADVD_HEX_DECODE,
+        "gunzip -c /tmp/uradvd.gz > /usr/sbin/uradvd && chmod 755 /usr/sbin/uradvd",
+        "rm -f /tmp/uradvd.hex /tmp/uradvd.gz",
+    ]
+    return cmds
+
+
 class Gluon_vm(vrnetlab.VM):
     def __init__(self, hostname):
         super().__init__('', '', disk_image='/gluon.qcow2', ram=512)
@@ -83,6 +108,7 @@ class Gluon_vm(vrnetlab.VM):
 
         # LAB PROTOTYPE: multi-PoP active/standby node code, see
         # /lab-prototype. Written over the serial console one line at a time.
+        cmds += uradvd_cmds()
         cmds += prototype_cmds("/lab-prototype")
 
         # 906-parker-nodeconfig copies the config server and the key its

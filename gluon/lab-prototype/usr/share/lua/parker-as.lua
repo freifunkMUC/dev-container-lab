@@ -11,9 +11,10 @@
 -- What it does:
 --   * puts the address6 of every site on br-client
 --   * source routing: from <site /64> -> table of the site -> its tunnel
---   * RA per prefix, one uradvd per site (see /etc/init.d/gluon-radvd).
---     The effective primary is preferred, every other prefix is sent with
---     preferred lifetime 0. A dead site is sent for DEAD_KEEP s, then not.
+--   * one RA with all prefixes, from one patched uradvd (see
+--     /etc/init.d/gluon-radvd). The effective primary is preferred, every
+--     other prefix is sent with preferred lifetime 0. A dead site is sent
+--     for DEAD_KEEP s, then not. SIGHUP makes uradvd read the new state.
 --   * rejects packets from a dead site's /64 with ICMPv6 code 5
 --   * the IPv4 default route follows the effective primary
 --   * one CLAT per tunnel, each with the xlat /64 of its own site
@@ -191,34 +192,58 @@ local function main()
     sh("ip6tables -I FORWARD 1 -j parker_as")
   end
 
-  -- RA: one file per site with the uradvd arguments.
-  local stock, prefix_flag = stock_radvd_args()
-  local radvd_changed = false
-  for _, name in ipairs(names) do
-    local site = conf.sites[name]
-    local path = STATE .. "/radvd." .. name
-    local dead_since = tonumber(read(STATE .. "/dead." .. name) or "")
-    local args = nil
-    if effective ~= nil and (live[name] or (dead_since and now - dead_since < DEAD_KEEP)) then
-      local preferred = (name == effective) and PREFERRED or 0
-      args = "-i " .. CLIENT_IF .. " " .. prefix_flag .. " " .. site.range6
-        .. " --preferred-lifetime " .. preferred .. " --valid-lifetime " .. VALID
-      if site.dns64 then args = args .. " --rdnss " .. site.dns64 end
-      if stock ~= "" then args = args .. " " .. stock end
-      if not stock:find("--pref64", 1, true) then
-        args = args .. " --pref64 " .. NAT64_PREFIX
+  -- RA: one patched uradvd (multipop/patches/uradvd.patch) sends all
+  -- prefixes in one RA. ra-args has the fixed arguments; ra-state has one
+  -- "<prefix>,<preferred>,<valid>" line per prefix and "rdnss <ip>" lines.
+  -- uradvd reads ra-state again on SIGHUP.
+  local stock = stock_radvd_args()
+  local ra_args, ra_state = nil, nil
+  if effective ~= nil then
+    ra_args = "-i " .. CLIENT_IF .. (stock ~= "" and (" " .. stock) or "")
+    if not stock:find("--pref64", 1, true) then
+      ra_args = ra_args .. " --pref64 " .. NAT64_PREFIX
+    end
+    -- The effective primary first, so its DNS64 is the first RDNSS.
+    local order = { effective }
+    for _, name in ipairs(names) do
+      if name ~= effective then table.insert(order, name) end
+    end
+    local lines, rdnss = {}, {}
+    for _, name in ipairs(order) do
+      local site = conf.sites[name]
+      local dead_since = tonumber(read(STATE .. "/dead." .. name) or "")
+      if live[name] or (dead_since and now - dead_since < DEAD_KEEP) then
+        local preferred = (name == effective) and PREFERRED or 0
+        table.insert(lines, site.range6 .. "," .. preferred .. "," .. VALID)
+        if live[name] and site.dns64 then table.insert(rdnss, "rdnss " .. site.dns64) end
       end
     end
-    if args then
-      radvd_changed = update_file(path, args .. "\n") or radvd_changed
-    elseif read(path) then
-      os.remove(path)
-      radvd_changed = true
-    end
+    for _, r in ipairs(rdnss) do table.insert(lines, r) end
+    ra_state = table.concat(lines, "\n") .. "\n"
   end
-  if radvd_changed then
+  local args_path, state_path = STATE .. "/ra-args", STATE .. "/ra-state"
+  local restart = false
+  if ra_state then
+    restart = update_file(args_path, ra_args .. "\n")
+    restart = (read(state_path) == nil) or restart
+    if update_file(state_path, ra_state) or restart then
+      local pid = nil
+      for p in output("pidof uradvd"):gmatch("%d+") do
+        if (read("/proc/" .. p .. "/cmdline") or ""):find("state-file", 1, true) then pid = p end
+      end
+      if pid and not restart then
+        sh("kill -HUP " .. pid)
+      else
+        sh("/etc/init.d/gluon-radvd restart")
+      end
+      log("RA: " .. ra_state:gsub("\n", ";") .. " effective primary " .. tostring(effective))
+    end
+  elseif read(state_path) then
+    -- No live site: back to the stock uradvd.
+    os.remove(state_path)
+    os.remove(args_path)
     sh("/etc/init.d/gluon-radvd restart")
-    log("RA changed, effective primary " .. tostring(effective))
+    log("RA: no live site, stock uradvd")
   end
 
   -- CLAT: each tunnel translates into the xlat /64 of its own site.
@@ -254,7 +279,7 @@ local function main()
   for _, name in ipairs(names) do
     table.insert(status, "site " .. name .. " " .. (live[name] and "live" or "dead")
       .. " iface=" .. tostring(iface[name]) .. " range6=" .. conf.sites[name].range6
-      .. " ra=" .. (read(STATE .. "/radvd." .. name) and "on" or "off"))
+      .. " ra=" .. ((read(STATE .. "/ra-state") or ""):find(conf.sites[name].range6 .. ",", 1, true) and "on" or "off"))
   end
   write(STATE .. "/status", table.concat(status, "\n") .. "\n")
 end
