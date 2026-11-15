@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Redirects write user-owned result files on purpose (SC2024); AP commands run remotely (SC2016).
+# shellcheck disable=SC2024,SC2016,SC2012
 # Build, deploy and test the multi-PoP active/standby lab on one fresh
 # Ubuntu 24.04 x86-64 machine, then destroy it.
 #
@@ -131,7 +133,7 @@ collect_logs() {
 	mkdir -p "${d}"
 	sudo containerlab inspect -t ffmuc.clab.yml > "${d}/inspect.txt" 2>&1
 	for c in $(sudo docker ps -a --format '{{.Names}}' | grep "^clab-${LAB}-"); do
-		sudo docker logs "${c}" > "${d}/${c#clab-${LAB}-}.docker.log" 2>&1
+		sudo docker logs "${c}" > "${d}/${c#clab-"${LAB}"-}.docker.log" 2>&1
 	done
 	for ap in ap-1 ap-2; do
 		timeout 120 ./node-cmd.sh "${ap}" 'cat /tmp/parker-as/status; for f in /tmp/parker-as/radvd.*; do echo "$f: $(cat $f)"; done; ip -6 rule; ip -6 route show table all | grep -v "^local\|^multicast\|fe80"; ip route; ip6tables -S parker_as; ip6tables -S FORWARD | head -5; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; ps w | grep -E "uradvd|clat|parker"; logread | tail -300' 60 \
