@@ -1,0 +1,5 @@
+# Only the launcher goes into the image. The qcow2 disks and the packer tree
+# are many GB and must not go into the build context.
+*
+!Dockerfile
+!*.py

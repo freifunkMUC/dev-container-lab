@@ -32,10 +32,12 @@ pushd gateway/packer
 ./build.sh
 popd
 
-docker build --build-arg IMAGE=parker-gw01.qcow2 gateway -t ffmuc-lab:gateway-parker-gw01
-docker build --build-arg IMAGE=parker-gw02.qcow2 gateway -t ffmuc-lab:gateway-parker-gw02
-docker build --build-arg IMAGE=parker-gw03.qcow2 gateway -t ffmuc-lab:gateway-parker-gw03
-docker build --build-arg IMAGE=parker-gw04.qcow2 gateway -t ffmuc-lab:gateway-parker-gw04
+# One gateway image for all four. The topology mounts gateway/parker-gwNN.qcow2
+# into it (read-only), so no disk is copied into an image or the build cache.
+for gw in gw01 gw02 gw03 gw04; do
+	qemu-img resize "gateway/parker-${gw}.qcow2" 10G
+done
+docker build gateway -t ffmuc-lab:gateway
 
 docker build toolbox -t ffmuc-lab:toolbox
 

@@ -39,7 +39,7 @@ logging.Logger.trace = trace
 class Gateway_vm(vrnetlab.VM):
     def __init__(self):
         for e in os.listdir("/"):
-            if re.search(".qcow2$", e):
+            if re.search(".qcow2$", e) and "-overlay" not in e:
                 disk_image = "/" + e
 
         super().__init__('', '', disk_image=disk_image, ram=1024)

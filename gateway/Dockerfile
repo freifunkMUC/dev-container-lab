@@ -1,8 +1,6 @@
 FROM debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG DISK_SIZE=10G
-
 RUN apt-get update -qy \
    && apt-get install -y \
    bridge-utils \
@@ -20,11 +18,10 @@ RUN apt-get update -qy \
    sshpass \
    && rm -rf /var/lib/apt/lists/*
 
-ARG IMAGE
-COPY $IMAGE* /
+# The image holds no disk. The topology mounts the qcow2 of each gateway
+# read-only at /<name>.qcow2, and launch.py starts the VM on an overlay. So
+# the four gateways share one small image and the disks are on disk once.
 COPY *.py /
-
-RUN qemu-img resize /${IMAGE} ${DISK_SIZE}
 
 EXPOSE 22 5000 10000-10099
 HEALTHCHECK CMD ["/healthcheck.py"]

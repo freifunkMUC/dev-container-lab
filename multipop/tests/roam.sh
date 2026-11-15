@@ -12,8 +12,8 @@ new64_b=$(p64 "$(addr_in client-3 "${PREFIX_B}")")
 log "$C has $old_a; the ap-2 prefixes are ${new64_a}::/64 and ${new64_b}::/64"
 
 move() {
-	sudo ip link set client1 nomaster
-	sudo ip link set client1 master "aa-$1-lan"
+	sudo ip link set aa-client1 nomaster
+	sudo ip link set aa-client1 master "aa-$1-lan"
 	dx "$C" rdisc6 -1 -w 2000 lan > /dev/null 2>&1 || true
 }
 

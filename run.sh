@@ -111,8 +111,12 @@ stage firmware pass "$(ls gluon/gluon-ffmuc-*-x86-64*.img), $(stat -c %s gluon/g
 start=${SECONDS}
 TERM=dumb ./build.sh < /dev/null > "${RESULTS}/build.log" 2>&1
 images=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -c '^ffmuc-lab:')
-[ "${images}" -ge 9 ] || fail_early build "build failed (${images} of 9 images), see build.log"
-stage build pass "9 images in $((SECONDS - start)) s"
+disks=$(ls gateway/parker-gw0[1-4].qcow2 2>/dev/null | wc -l)
+[ "${images}" -ge 6 ] && [ "${disks}" = 4 ] ||
+	fail_early build "build failed (${images} of 6 images, ${disks} of 4 gateway disks), see build.log"
+# The build cache is not needed any more.
+docker builder prune -af >/dev/null 2>&1 || true
+stage build pass "6 images and 4 gateway disks in $((SECONDS - start)) s, disk: $(df -h --output=used,avail / | tail -1)"
 
 # 4. Deploy and wait until both APs have both sites up.
 cleanup() {

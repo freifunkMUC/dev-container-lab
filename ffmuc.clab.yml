@@ -126,19 +126,27 @@ topology:
     gateway-gw01:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw01
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw01.qcow2:/parker-gw01.qcow2:ro
     gateway-gw02:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw02
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw02.qcow2:/parker-gw02.qcow2:ro
     gateway-gw03:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw03
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw03.qcow2:/parker-gw03.qcow2:ro
     gateway-gw04:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw04
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw04.qcow2:/parker-gw04.qcow2:ro
     aa-gateway-vpn:
       kind: bridge
 
@@ -250,37 +258,37 @@ topology:
         - multipop/svc/service.sh:/svc/service.sh
 
   links:
-    - endpoints: ["ap-1:eth1", "aa-ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
-    - endpoints: ["ap-1:eth2", "aa-home-lan:ap-1-wan"]     # AP-1 WAN interface, goes to the home LAN
-    - endpoints: ["client-1:lan", "aa-ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
-    - endpoints: ["client-2:lan", "aa-ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
-    - endpoints: ["cpe-1:lan", "aa-home-lan:cpe-1-lan"]    # CPE-1 LAN interface, goes to the home LAN
+    - endpoints: ["ap-1:eth1", "aa-ap-1-lan:aa-ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
+    - endpoints: ["ap-1:eth2", "aa-home-lan:aa-ap-1-wan"]     # AP-1 WAN interface, goes to the home LAN
+    - endpoints: ["client-1:lan", "aa-ap-1-lan:aa-client1"]   # Client-1 interface, goes to AP-1-LAN bridge
+    - endpoints: ["client-2:lan", "aa-ap-1-lan:aa-client2"]   # Client-2 interface, goes to AP-1-LAN bridge
+    - endpoints: ["cpe-1:lan", "aa-home-lan:aa-cpe-1-lan"]    # CPE-1 LAN interface, goes to the home LAN
     - endpoints: ["cpe-1:wan", "internet:cpe1"]         # CPE-1 internet uplink
     - endpoints: ["server:eth1", "internet:server"]     # Test server
 
-    - endpoints: ["ap-2:eth1", "aa-ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
-    - endpoints: ["ap-2:eth2", "aa-home-lan:ap-2-wan"]     # AP-2 WAN interface, goes to the same home LAN
-    - endpoints: ["client-3:lan", "aa-ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
-    - endpoints: ["client-4:lan", "aa-ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth1", "aa-ap-2-lan:aa-ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth2", "aa-home-lan:aa-ap-2-wan"]     # AP-2 WAN interface, goes to the same home LAN
+    - endpoints: ["client-3:lan", "aa-ap-2-lan:aa-client3"]   # Client-3 interface, goes to AP-2-LAN bridge
+    - endpoints: ["client-4:lan", "aa-ap-2-lan:aa-client4"]   # Client-4 interface, goes to AP-2-LAN bridge
 
     - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
     - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
     - endpoints: ["gateway-gw03:eth1", "internet:gw03"] # GW-03 internet uplink
     - endpoints: ["gateway-gw04:eth1", "internet:gw04"] # GW-04 internet uplink
-    - endpoints: ["gateway-gw01:eth2", "aa-gateway-vpn:gw01"] # GW-01 VPN
-    - endpoints: ["gateway-gw02:eth2", "aa-gateway-vpn:gw02"] # GW-02 VPN
-    - endpoints: ["gateway-gw03:eth2", "aa-gateway-vpn:gw03"] # GW-03 VPN
-    - endpoints: ["gateway-gw04:eth2", "aa-gateway-vpn:gw04"] # GW-04 VPN
+    - endpoints: ["gateway-gw01:eth2", "aa-gateway-vpn:aa-gw01"] # GW-01 VPN
+    - endpoints: ["gateway-gw02:eth2", "aa-gateway-vpn:aa-gw02"] # GW-02 VPN
+    - endpoints: ["gateway-gw03:eth2", "aa-gateway-vpn:aa-gw03"] # GW-03 VPN
+    - endpoints: ["gateway-gw04:eth2", "aa-gateway-vpn:aa-gw04"] # GW-04 VPN
     # The service LANs of the control plane, one per site.
-    - endpoints: ["internet:svc-a", "aa-svc-a:internet"]
-    - endpoints: ["internet:svc-b", "aa-svc-b:internet"]
-    - endpoints: ["lb-a:eth1", "aa-svc-a:lb-a"]
-    - endpoints: ["broker-a1:eth1", "aa-svc-a:broker-a1"]
-    - endpoints: ["broker-a2:eth1", "aa-svc-a:broker-a2"]
-    - endpoints: ["emqx-a1:eth1", "aa-svc-a:emqx-a1"]
-    - endpoints: ["emqx-a2:eth1", "aa-svc-a:emqx-a2"]
-    - endpoints: ["lb-b:eth1", "aa-svc-b:lb-b"]
-    - endpoints: ["broker-b1:eth1", "aa-svc-b:broker-b1"]
-    - endpoints: ["broker-b2:eth1", "aa-svc-b:broker-b2"]
-    - endpoints: ["emqx-b1:eth1", "aa-svc-b:emqx-b1"]
-    - endpoints: ["emqx-b2:eth1", "aa-svc-b:emqx-b2"]
+    - endpoints: ["internet:svc-a", "aa-svc-a:aa-inet-a"]
+    - endpoints: ["internet:svc-b", "aa-svc-b:aa-inet-b"]
+    - endpoints: ["lb-a:eth1", "aa-svc-a:aa-lb-a"]
+    - endpoints: ["broker-a1:eth1", "aa-svc-a:aa-broker-a1"]
+    - endpoints: ["broker-a2:eth1", "aa-svc-a:aa-broker-a2"]
+    - endpoints: ["emqx-a1:eth1", "aa-svc-a:aa-emqx-a1"]
+    - endpoints: ["emqx-a2:eth1", "aa-svc-a:aa-emqx-a2"]
+    - endpoints: ["lb-b:eth1", "aa-svc-b:aa-lb-b"]
+    - endpoints: ["broker-b1:eth1", "aa-svc-b:aa-broker-b1"]
+    - endpoints: ["broker-b2:eth1", "aa-svc-b:aa-broker-b2"]
+    - endpoints: ["emqx-b1:eth1", "aa-svc-b:aa-emqx-b1"]
+    - endpoints: ["emqx-b2:eth1", "aa-svc-b:aa-emqx-b2"]
