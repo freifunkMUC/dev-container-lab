@@ -207,14 +207,23 @@ Do not delete them while the lab runs.
   IPv4 (`tests/clientmon.sh`, server `tests/monsrv.py` on the internet
   node). Values: the longest gap with no ping reply (`ping6_max_gap_ms`,
   `ping4_max_gap_ms`), lost pings, if the TCP stream survived
-  (`tcp6_survived`, `tcp4_survived`), and the time from the failure until a
-  new connection works (`new_conn6_s`, `new_conn4_s`, 0 when no connection
+  (`tcp6_survived`, `tcp4_survived`), the time from the failure until a
+  replacement TCP stream has data (`tcp6_reconnect_s`, `tcp4_reconnect_s`),
+  the longest gap with no TCP data (`tcp6_max_gap_ms`), and the time from
+  the failure until a new connection works (`new_conn6_s`, `new_conn4_s`, 0 when no connection
   failed). The raw logs are in `results/mon-*.log`.
 
 Each ping runs for 1 s and then starts again, so a new ping selects the
 source address again, like a new application. After a site failover, an
-old TCP stream on the dead prefix stops (ICMPv6 code 5). The IPv4 TCP
-stream stops after each pgw change, because the NAT64 address changes.
+old TCP stream on the dead prefix stalls: the AP rejects its packets with
+ICMPv6 code 5, and Linux does not close an open stream for this. The
+monitor closes a stream after 3 s with no data and opens a new one, as an
+application with a keepalive does. The IPv4 TCP stream stops after each
+change of tunnel, because the NAT64 address changes.
+
+The Gluon AP boots first in setup mode, which gives clients a 192.168.1.x
+lease. The client link stays up when the AP reboots, so the `ready` test
+bounces the link of a client with such a lease to get a lease from the AP.
 
 To run the tests on a deployed lab:
 

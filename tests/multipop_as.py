@@ -125,7 +125,8 @@ def inet_argv(cmd):
 
 def vm(node, cmd, timeout=20):
     """Run a command on a VM node (AP or gateway) over its serial console."""
-    return run([os.path.join(ROOT, "node-cmd.sh"), node, cmd, str(timeout)], timeout + 30)
+    rc, out = run([os.path.join(ROOT, "node-cmd.sh"), node, cmd, str(timeout)], timeout + 30)
+    return rc, "".join(l for l in out.splitlines(True) if "DeprecationWarning" not in l)
 
 
 def wait_for(fn, timeout, step=10):
@@ -168,6 +169,9 @@ def ap_status(ap):
         if m:
             site = dict(kv.split("=", 1) for kv in m.group(3).split() if "=" in kv)
             site["state"] = m.group(2)
+            # The AP names a pgw parker-gwNN; the tests use gwNN.
+            if site.get("pgw", "").startswith("parker-"):
+                site["pgw"] = site["pgw"][len("parker-"):]
             st["sites"][m.group(1)] = site
     return st
 
@@ -183,14 +187,34 @@ def wait_status(ap, pred, timeout, step=1):
     return wait_for(poll, timeout, step)
 
 
-def client_v4(client):
-    """The DHCPv4 address of a client, or None. An IPv4LL (169.254/16)
-    address from dhcpcd does not count."""
+CLIENT_NET4 = ipaddress.ip_network("10.0.0.0/8")  # range4 of the APs
+
+
+def client_v4_all(client):
     _, out = dx(client, "ip -4 -o addr show dev lan scope global")
-    for a in re.findall(r"inet (\d+\.\d+\.\d+\.\d+)/", out):
-        if not a.startswith("169.254."):
+    return re.findall(r"inet (\d+\.\d+\.\d+\.\d+)/", out)
+
+
+def client_v4(client):
+    """The DHCPv4 address of a client from its AP (range4 in 10/8), or None.
+    IPv4LL (169.254/16) and a stale lease from the Gluon setup mode
+    (192.168.1/24) do not count."""
+    for a in client_v4_all(client):
+        if ipaddress.ip_address(a) in CLIENT_NET4:
             return a
     return None
+
+
+def renew_stale_v4(c, client):
+    """The AP boots once in setup mode, which gives 192.168.1.x. The client
+    link stays up when the AP reboots into normal mode, so dhcpcd keeps the
+    stale lease. A link bounce makes dhcpcd get a lease from the AP."""
+    stale = [a for a in client_v4_all(client)
+             if ipaddress.ip_address(a) not in CLIENT_NET4 and not a.startswith("169.254.")]
+    if stale:
+        c.log(f"{client} has stale IPv4 {stale}: bounce the link for a new lease")
+        dx(client, "ip link set lan down; sleep 1; ip link set lan up")
+    return bool(stale)
 
 
 def client_addrs(client):
@@ -271,6 +295,13 @@ def pmtu_ping(client, dst, src=None, size=1452):
     frm = f"-I {src} " if src else ""
     rc, out = dx(client, f"ping {six}-M do -s {size} {frm}-c 3 -W 2 {dst}", timeout=30)
     m = re.search(r"mtu[=: ]+(\d+)", out, re.I)
+    if not m and "Message too large" in out:
+        # The packet is larger than the link MTU (from the RA, or a cached
+        # PMTU): the kernel stops it. Read the MTU the kernel uses.
+        _, r = dx(client, f"ip {six}route get {dst} {'from ' + src if src else ''}; "
+                          f"cat /proc/sys/net/ipv{'6' if six else '4'}/conf/lan/mtu 2>/dev/null"
+                          f" || cat /sys/class/net/lan/mtu")
+        m = re.search(r"mtu (\d+)", r) or re.search(r"^(\d+)\s*$", r, re.M)
     return rc == 0, (int(m.group(1)) if m else None), out
 
 
@@ -298,9 +329,16 @@ def t_ready(c):
             if not all_up(ap_status(home["ap"]), home["primary"]):
                 return False
             for cl in home["clients"]:
-                if set(client_addrs(cl)) != {"muc", "vie"} or not client_v4(cl):
+                if not client_v4(cl):
+                    renew_stale_v4(c, cl)
                     return False
-        return all(set(client_addrs(cl)) == {OLD["site"]} and client_v4(cl) for cl in OLD["clients"])
+                if set(client_addrs(cl)) != {"muc", "vie"}:
+                    return False
+        for cl in OLD["clients"]:
+            if not client_v4(cl):
+                renew_stale_v4(c, cl)
+                return False
+        return all(set(client_addrs(cl)) == {OLD["site"]} for cl in OLD["clients"])
 
     t0 = time.time()
     c.expect(wait_for(ready, READY_TIMEOUT, step=20), f"lab ready after {int(time.time() - t0)} s")
@@ -518,18 +556,25 @@ def mon_parse(out, event):
         m[f"ping{f}_sent"] = sent
         m[f"ping{f}_lost"] = sent - got
         m[f"ping{f}_back"] = any(t > event for t in replies)
-        data, end = [], None
+        # A stream that ends (or stalls 3 s) is replaced by a new one. The
+        # gap covers the stall and the reconnect; reconnect_s is the time
+        # from the event until the new stream has data.
+        data, ends = [], []
         for line in sec.get(f"tcp{f}.log", []):
             parts = line.split(None, 1)
             t = _float(parts[0]) if parts else None
             if t is None:
                 continue
             if len(parts) > 1 and parts[1].startswith("END"):
-                end = end or t
+                ends.append(t)
             elif len(parts) > 1 and _float(parts[1]) is not None:
                 data.append(t)
-        m[f"tcp{f}_survived"] = bool(data) and (end is None or end >= stop) and max(data) > stop - 2
-        m[f"tcp{f}_max_gap_ms"] = _max_gap(data, data[0] if data else start, min(end or stop, stop))
+        broke = [t for t in ends if start + 2 <= t < stop]
+        m[f"tcp{f}_survived"] = bool(data) and not broke and max(data) > stop - 2
+        m[f"tcp{f}_max_gap_ms"] = _max_gap([t for t in data if t >= start + 2], start + 2, stop)
+        m[f"tcp{f}_reconnects"] = len(broke)
+        later = [t for t in data if broke and t > broke[0]]
+        m[f"tcp{f}_reconnect_s"] = round(later[0] - event, 1) if later else None
         fail_at, back = None, None
         for line in sec.get(f"curl{f}.log", []):
             parts = line.split()
@@ -578,8 +623,11 @@ def ap_metric(c, key, value):
 
 
 def inbound_time(addr, timeout=60):
-    """Seconds until the internet reaches addr with ping, or None."""
-    return time_to(lambda: run(inet_argv(f"ping -6 -c 1 -W 1 {addr}"), 20)[0] == 0, timeout, step=1)
+    """Seconds until the internet reaches addr with ping, or None. One
+    container pings every 0.2 s, so the docker start time is not added."""
+    t0 = time.time()
+    rc, _ = run(inet_argv(f"ping -6 -c 1 -w {timeout} -i 0.2 {addr}"), timeout + 30)
+    return round(time.time() - t0, 1) if rc == 0 else None
 
 
 def t_site_failure(c, site, long_outage=False):
@@ -617,12 +665,13 @@ def t_site_failure(c, site, long_outage=False):
 
     t6 = time_to(lambda: ping(cl, TARGET6, count=1)[0], 60, step=1)
     c.expect(t6 is not None, f"{cl} IPv6 through {backup} works (after {t6} s more)")
-    t4 = time_to(lambda: ping(cl, TARGET4, count=1)[0], 60, step=1)
-    c.expect(t4 is not None, f"{cl} IPv4 through the CLAT of {backup} works (after {t4} s more)")
+    # Measure inbound before the IPv4 check, so its wait is not added.
     addr = client_addrs(cl).get(backup, (None,))[0]
     ti = inbound_time(addr) if addr else None
     ap_metric(c, "inbound_after_switch_s", None if ti is None else round(time.time() - t0, 1))
     c.expect(ti is not None, f"internet -> {cl} [{addr}] ({backup}) works after the switch")
+    t4 = time_to(lambda: ping(cl, TARGET4, count=1)[0], 60, step=1)
+    c.expect(t4 is not None, f"{cl} IPv4 through the CLAT of {backup} works (after {t4} s more)")
     time.sleep(5)
     result = mon_stop(c, "site-failover", clients, t0)
     expect_traffic(c, "site-failover", {x: result[x] for x in home["clients"]}, GAP_SITE)
@@ -773,6 +822,10 @@ def pgw_switch(c, home_key, case):
             time.sleep(0.5)
         ap_metric(c, "intra_site_switch_s", switched)
         c.expect(switched is not None, f"{ap} moved wg tunnel of {site} to the other pgw ({switched} s)")
+        a = client_addrs(cl)[site][0]
+        ti = inbound_time(a)
+        ap_metric(c, "inbound_after_switch_s", None if ti is None else round(time.time() - t0, 1))
+        c.expect(ti is not None, f"internet -> {cl} [{a}] through the new pgw")
         gone = time_to(lambda: not pgw_routes(old, net), UNROUTE_TIMEOUT + 30, step=1)
         unroute = None if gone is None else round(time.time() - t0 - switched, 1) if switched else None
         ap_metric(c, "old_pgw_unroute_s", unroute)
@@ -783,10 +836,6 @@ def pgw_switch(c, home_key, case):
         c.log(f"brokers that took the report: {reporters(since)}")
         if new:
             c.log(f"{new} routes {net}: {pgw_routes(new, net)}")
-        a = client_addrs(cl)[site][0]
-        ti = inbound_time(a)
-        ap_metric(c, "inbound_after_switch_s", None if ti is None else round(time.time() - t0, 1))
-        c.expect(ti is not None, f"internet -> {cl} [{a}] through the new pgw")
         for x in home["clients"]:
             if not preferred(client_addrs(x), site):
                 not_preferred.add(x)
@@ -929,10 +978,23 @@ def t_roam(c):
         ok, out = ping(cl, TARGET4)
         c.expect(ok, f"{cl} ping IPv4 through ap-3: {last(out)}")
         if old.get("muc"):
+            # AP-3 has a mesh route to the AP-1 /63, so the old address can
+            # still work through AP-1. Else AP-3 must reject it with code 5.
+            # It must not time out.
             addr = old["muc"][0]
             dx(cl, f"ip -6 addr add {addr}/128 dev lan nodad preferred_lft 0")
-            code5_from(c, cl, addr)
+            ok, out = ping(cl, TARGET6, extra=f"-I {addr}", count=3)
+            if ok:
+                c.expect(True, f"{cl} old AP-1 source {addr} works through the mesh: {last(out)}")
+            else:
+                code5_from(c, cl, addr)
             dx(cl, f"ip -6 addr del {addr}/128 dev lan")
+        # A source of no node in the mesh: AP-3 rejects it with code 5.
+        # (2001:db8:100:ffff::/64 is outside the Parker /50 of MUC.)
+        foreign = "2001:db8:100:ffff::1234"
+        dx(cl, f"ip -6 addr add {foreign}/128 dev lan nodad preferred_lft 0")
+        code5_from(c, cl, foreign)
+        dx(cl, f"ip -6 addr del {foreign}/128 dev lan")
     finally:
         dx(cl, "ip link set lan down")
         run(["sudo", "ip", "link", "set", port, "nomaster"])
