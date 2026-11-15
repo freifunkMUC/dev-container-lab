@@ -3,6 +3,8 @@
 # it must change to the other pgw of site B. IPv6 and IPv4 are checked
 # separately: the site B /63 stays the same and works again through the new
 # pgw; IPv4 keeps working (on the active tunnel, or again after the change).
+# A pgw change inside a site must not deprecate the prefix: site B stays up
+# and preferred on the nodes, and the clients keep a preferred site B address.
 . "$(dirname "$0")/common.sh"
 # BROKER_DOWN=1: the broker on gw01 is stopped first (see broker-down.sh).
 
@@ -24,9 +26,26 @@ if [ "${BROKER_DOWN:-0}" = 1 ]; then
 		check "broker on gw01 is stopped" fail "$st"
 fi
 
+# Watch the site B addresses of the clients during the change. The serial
+# console allows one client only, so the nodes are checked after the change
+# (clear_damping removed their state change history).
+WATCH="${RESULTS}/${TEST}.watch"
+: > "${WATCH}"
+watch() {
+	while :; do
+		for c in ${CLIENTS}; do
+			dx "$c" ip -6 -o addr show dev lan | grep "${PREFIX_B}" | grep deprecated |
+				sed "s/^/$c /" >> "${WATCH}"
+		done
+		sleep 2
+	done
+}
+
 log "cutting $gw"
 dx internet ip link set "$gw" down
 t0=${SECONDS}
+watch &
+watcher=$!
 
 uses_other() { [ "$(pgw_gw ap-1 "$ifc")" = "$other" ]; }
 b_works() { [ "$(echo_src "$1" -6 -m 5 --interface "$2" "http://[${SERVER6}]:8080/")" = "$2" ]; }
@@ -47,10 +66,23 @@ for c in ${CLIENTS}; do
 done
 for ap in ${APS}; do
 	if wait_for 240 ap_has "$ap" vie01 'up .* preferred=300'; then
-		check "$ap: site B is up again" ok "$(node "$ap" 'cat /tmp/multipop/status' | grep vie01)"
+		check "$ap: site B is up" ok "$(node "$ap" 'cat /tmp/multipop/status' | grep vie01)"
 	else
-		check "$ap: site B is up again" fail "$(node "$ap" 'cat /tmp/multipop/status' | tr '\n' ';')"
+		check "$ap: site B is up" fail "$(node "$ap" 'cat /tmp/multipop/status' | tr '\n' ';')"
 	fi
+done
+
+kill "${watcher}" 2>/dev/null
+wait "${watcher}" 2>/dev/null
+if [ -s "${WATCH}" ]; then
+	check "clients: site B stays preferred during the pgw change" fail "$(sort -u "${WATCH}" | head -n 5 | tr '\n' ';')"
+else
+	check "clients: site B stays preferred during the pgw change" ok "no site B address was deprecated"
+fi
+for ap in ${APS}; do
+	n=$(node "$ap" "cat /tmp/multipop/$(site_ifc "$ap" vie01).changes 2>/dev/null | grep -c ." | tr -d '\r' | tail -n 1)
+	[ "${n:-0}" = 0 ] && check "$ap: site B did not change state" ok "0 state changes" ||
+		check "$ap: site B did not change state" fail "${n} state changes: $(node "$ap" 'logread | grep "vie01) is"' | tr '\n' ';')"
 done
 
 # IPv4: through the CLAT of the active tunnel.

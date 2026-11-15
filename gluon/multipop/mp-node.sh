@@ -8,10 +8,11 @@
 # primary_site. Every MP_INTERVAL seconds this script:
 #
 # - probes each tunnel (one ICMPv6 echo to the pgw, bound to wg_c<id>) and
-#   keeps a damped state: down after 3 misses or an old handshake, up after
-#   3 hits and a fresh handshake, at least MP_DWELL s in a state, a penalty
-#   after too many changes,
-# - selects the next pgw of the same site when the probe fails,
+#   keeps a damped state: up after 3 hits and a fresh handshake, at least
+#   MP_DWELL s in a state, a penalty after too many changes,
+# - selects the next pgw of the same site after 3 misses. This does not
+#   change the site state: the prefix stays preferred. The site is down only
+#   when all pgws of the site failed (3 misses each, in turn),
 # - routes each client prefix only through the tunnel of its site
 #   (ip rules 1000, 1050+, 1100+, one table per site),
 # - rejects packets to the tunnels with a source of a dead site or a foreign
@@ -78,8 +79,6 @@ fi
 switch_pgw() {
 	# Selects the next pgw of the site for tunnel $ifc (index $i). The peer
 	# exists on all pgws of the site, so this works without the broker.
-	n=0
-	while [ -n "$(pgw "$i" $n pubkey)" ]; do n=$((n + 1)); done
 	[ "$n" -gt 1 ] || return
 	next=$(((pj + 1) % n))
 	key=$(pgw "$i" $next pubkey)
@@ -132,11 +131,15 @@ tunnel() {
 	done
 	gw=$(pgw "$i" $pj address6)
 	[ -n "$gw" ] || { pj=0; gw=$(conc "$i" address6); }
+	n=0
+	while [ -n "$(pgw "$i" $n pubkey)" ]; do n=$((n + 1)); done
+	[ "$n" -gt 0 ] || n=1
 
-	# Probe and damping.
+	# Probe and damping. $ifc.tried counts the pgws that failed in turn.
 	if ping -c 1 -W 2 -I "$ifc" "$gw" >/dev/null 2>&1; then
 		put "$ifc.hits" $(($(get "$ifc.hits") + 1))
 		put "$ifc.misses" 0
+		put "$ifc.tried" 0
 	else
 		put "$ifc.misses" $(($(get "$ifc.misses") + 1))
 		put "$ifc.hits" 0
@@ -145,18 +148,27 @@ tunnel() {
 	age=$((now - ${hs:-0}))
 	state=$(get "$ifc.state" down)
 	misses=$(get "$ifc.misses")
+	tried=$(get "$ifc.tried")
+	# All pgws of the site failed: the current one and the n - 1 before it.
+	all_failed=0
+	[ "$misses" -ge "$DOWN_AFTER" ] && [ $((tried + 1)) -ge "$n" ] && all_failed=1
 	in_state=$((now - $(get "$ifc.since")))
 	penalty=$(($(get "$ifc.penalty") - now))
-	if [ "$state" = up ] && [ "$in_state" -ge "$DWELL" ] &&
-		{ [ "$misses" -ge "$DOWN_AFTER" ] || [ "$age" -gt "$HS_MAX" ]; }; then
+	if [ "$state" = up ] && [ "$in_state" -ge "$DWELL" ] && [ "$all_failed" = 1 ]; then
 		change down && state=down
-		log "$ifc ($site) is down (misses $misses, handshake ${age} s): deprecating $range6"
+		log "$ifc ($site) is down (all $n pgws failed): deprecating $range6"
 	elif [ "$state" = down ] && [ "$in_state" -ge "$DWELL" ] && [ "$penalty" -le 0 ] &&
 		[ "$(get "$ifc.hits")" -ge "$UP_AFTER" ] && [ "$age" -le "$HS_MAX" ]; then
 		change up && state=up && log "$ifc ($site) is up: announcing $range6"
 	fi
-	# Another pgw of the same site after each DOWN_AFTER misses.
-	[ "$misses" -gt 0 ] && [ $((misses % DOWN_AFTER)) = 0 ] && switch_pgw
+	# Another pgw of the same site after DOWN_AFTER misses. The site stays
+	# up. The new pgw routes the node /63 only after a fresh handshake, and
+	# the site comes up again only with a fresh handshake.
+	if [ "$misses" -ge "$DOWN_AFTER" ]; then
+		switch_pgw
+		put "$ifc.misses" 0
+		put "$ifc.tried" $((tried + 1))
+	fi
 
 	# The node address on the tunnel, with the pgw as peer.
 	if [ "$(get "$ifc.addr" "")" != "$addr $gw" ]; then
@@ -197,6 +209,7 @@ tunnel() {
 		clat_changed=1
 	}
 	[ "$penalty" -gt 0 ] || penalty=0
+	[ "${hs:-0}" -gt 0 ] || age=none
 	echo "$ifc $site $state $range6 preferred=$announced pgw=$(pgw "$i" $pj id) handshake=${age} changes=$(grep -c . "$ST/$ifc.changes" 2>/dev/null) penalty=$penalty" >> "$ST/status.next"
 }
 

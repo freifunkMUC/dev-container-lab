@@ -54,11 +54,14 @@ the serial console. They are not production code.
 3. Routing: rule 1000 `lookup main suppress_prefixlength 0` comes first.
    Then each site has a table with `default dev wg_cX`, a rule for its
    prefix, and a rule `to <DNS64> iif lo` for the node itself.
-4. Every 10 s the node pings its gateway through each tunnel. A site goes
-   down after 3 misses. It comes up after 3 hits and a handshake that is
-   less than 180 s old. Damping: a site stays at least 60 s in one state.
-   More than 3 changes in 10 minutes give a penalty of 600 s.
-5. After 3 misses, the node also changes to the next gateway of the site.
+4. Every 10 s the node pings its gateway through each tunnel. After 3
+   misses, the node changes to the next gateway of the same site. This does
+   not change the site state: the prefix stays preferred. The new gateway
+   routes the node /63 only after a fresh handshake.
+5. A site goes down only when all its gateways failed (3 misses each). It
+   comes up after 3 hits and a handshake that is less than 180 s old.
+   Damping: a site stays at least 60 s in one state. More than 3 changes in
+   10 minutes give a penalty of 600 s.
 6. When a site is down:
    - the node sends that prefix with preferred lifetime 0,
    - the `parker_src` ip6tables chain rejects packets from that prefix with
@@ -114,7 +117,7 @@ set `FIRMWARE=<path>`.
 | `rule8-tie.sh` | To the DNS64 of a site, the client uses the address of that site. To other destinations (a tie in RFC 6724 rule 8), the source is in one site, stays the same, and works. |
 | `pmtu.sh` | Per site: a packet of the tunnel MTU arrives, 1 byte more gives "packet too big". The same for IPv4 through the CLAT. |
 | `roam.sh` | client-1 moves from ap-1 to ap-2. It gets the ap-2 prefixes and uses them. An old ap-1 source works or fails fast. |
-| `pgw-failure.sh` | One site B gateway fails. The node changes to the other gateway of site B. IPv6 (same address) and IPv4 are checked separately. |
+| `pgw-failure.sh` | One site B gateway fails. The node changes to the other gateway of site B. Site B stays up and preferred: no client address becomes deprecated. IPv6 (same address) and IPv4 are checked separately. |
 | `broker-down.sh` | The same, with the broker stopped. |
 | `site-failure.sh` | Site B fails. The site B address becomes deprecated. Traffic from it is rejected. IPv4 moves to site A. The prefix is withdrawn and expires. |
 | `recovery.sh` | Site B comes back. The prefix is preferred again. IPv6, NAT64 and IPv4 work through site B. |
