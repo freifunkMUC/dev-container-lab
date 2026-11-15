@@ -183,6 +183,16 @@ def wait_status(ap, pred, timeout, step=1):
     return wait_for(poll, timeout, step)
 
 
+def client_v4(client):
+    """The DHCPv4 address of a client, or None. An IPv4LL (169.254/16)
+    address from dhcpcd does not count."""
+    _, out = dx(client, "ip -4 -o addr show dev lan scope global")
+    for a in re.findall(r"inet (\d+\.\d+\.\d+\.\d+)/", out):
+        if not a.startswith("169.254."):
+            return a
+    return None
+
+
 def client_addrs(client):
     """Global IPv6 addresses of a client: {site: (addr, deprecated)}."""
     _, out = dx(client, "ip -6 -o addr show dev lan scope global")
@@ -280,15 +290,17 @@ def home_with_primary(site):
 
 def t_ready(c):
     """The lab is up: each AP has two live sites and the right primary, and
-    each client has an address from both sites."""
+    each client has an address from both sites and a DHCPv4 lease. noderoute
+    starts DHCPv4 only after the IPv4 route of the AP is up, so tests that
+    start before that see no IPv4 at all."""
     def ready():
         for home in list(HOMES.values()) + [AP3]:
             if not all_up(ap_status(home["ap"]), home["primary"]):
                 return False
             for cl in home["clients"]:
-                if set(client_addrs(cl)) != {"muc", "vie"}:
+                if set(client_addrs(cl)) != {"muc", "vie"} or not client_v4(cl):
                     return False
-        return all(set(client_addrs(cl)) == {OLD["site"]} for cl in OLD["clients"])
+        return all(set(client_addrs(cl)) == {OLD["site"]} and client_v4(cl) for cl in OLD["clients"])
 
     t0 = time.time()
     c.expect(wait_for(ready, READY_TIMEOUT, step=20), f"lab ready after {int(time.time() - t0)} s")
@@ -298,7 +310,7 @@ def t_ready(c):
         c.expect(st.get("primary_site") == home["primary"],
                  f"{home['ap']} primary_site from broker = {st.get('primary_site')} (want {home['primary']})")
         for cl in home["clients"]:
-            c.log(f"{cl} addresses: {client_addrs(cl)}")
+            c.log(f"{cl} addresses: {client_addrs(cl)} IPv4 {client_v4(cl)}")
 
 
 def t_normal(c):

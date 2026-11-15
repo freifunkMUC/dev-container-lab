@@ -207,8 +207,13 @@ local function resolve(endpoint)
   if host then return endpoint end
   host, port = endpoint:match("^(.+):(%d+)$")
   if not host or host:match("^[%d%.]+$") then return endpoint end
-  local addr = nil
-  for a in output("nslookup " .. host):gmatch("Address:?%s+([%x%.:]+)") do addr = a end
+  -- The pgw names resolve only on the WAN (the local dnsmasq forwards to the
+  -- site DNS64). gluon-wan-dns sends the query to the WAN resolver. The
+  -- WAN is IPv4, so ask for A only. Skip the "Server:" block: busybox prints
+  -- "Address: <server>:53" there, also on NXDOMAIN.
+  local out = output("gluon-wan-dns nslookup -type=a " .. host .. " 2>/dev/null")
+  local answer = out:match("\nName:.*$") or ""
+  local addr = answer:match("Address:?%s+(%d+%.%d+%.%d+%.%d+)")
   if not addr then return nil end
   if addr:find(":", 1, true) then return "[" .. addr .. "]:" .. port end
   return addr .. ":" .. port
