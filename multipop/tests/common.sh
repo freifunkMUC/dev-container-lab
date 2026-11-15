@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for the multi-PoP lab tests. Source this file.
-# Each test writes results/<test>.json: {"test", "status", "evidence"}.
+# Each test writes results/<test>.json: {"test", "status", "evidence"} and,
+# for the failover tests, "metrics" (see meas_start and meas_stop).
 # shellcheck disable=SC2034  # used by the tests that source this file
 
 LAB="${LAB:-ffmuc-mp-aa}"
@@ -24,6 +25,8 @@ TEST="${TEST:-$(basename "$0" .sh)}"
 LOG="${RESULTS}/${TEST}.log"
 EVIDENCE=()
 FAILED=0
+METRICS="${RESULTS}/${TEST}.metrics.json"
+rm -f "${METRICS}"
 
 log() { echo "[$(date +%T)] $*" | tee -a "${LOG}" >&2; }
 dx() { local n="$1"; shift; sudo docker exec "clab-${LAB}-${n}" "$@"; }
@@ -40,8 +43,10 @@ check() {
 finish() {
 	local status=pass
 	[ "${FAILED}" = 0 ] || status=fail
+	[ -s "${METRICS}" ] || echo '{}' > "${METRICS}"
 	printf '%s\n' "${EVIDENCE[@]}" | jq -R . | jq -s \
-		--arg t "${TEST}" --arg s "${status}" '{test: $t, status: $s, evidence: .}' \
+		--arg t "${TEST}" --arg s "${status}" --slurpfile m "${METRICS}" \
+		'{test: $t, status: $s, evidence: ., metrics: $m[0]} | if .metrics == {} then del(.metrics) else . end' \
 		> "${RESULTS}/${TEST}.json"
 	log "${TEST}: ${status}"
 	[ "${status}" = pass ]
@@ -75,7 +80,7 @@ ap_has() { node "$1" "cat /tmp/multipop/status" | grep "^wg_c[0-9]* $2 " | grep 
 # changes of one test do not set the flapping penalty in the next test.
 clear_damping() {
 	local ap
-	for ap in ${APS}; do node "$ap" 'rm -f /tmp/multipop/*.changes /tmp/multipop/*.penalty'; done
+	for ap in ${APS}; do node "$ap" 'rm -f /tmp/multipop/*.changes /tmp/multipop/*.penalty /tmp/multipop/*.penalties'; done
 }
 
 # The /64 of an address.
@@ -110,3 +115,72 @@ pgw_gw() { node "$1" "wg show $2 endpoints" | awk '{split($2, a, "[.:]"); print 
 
 # The wg_cX tunnel of a site on an AP.
 site_ifc() { node "$1" "cat /tmp/multipop/status" | awk -v s="$2" '$2 == s {print $1}'; }
+
+# metric <jq path> <JSON value>: record a number in the metrics of the test,
+# for example: metric '.pgw_switch.node.detection_s' 3
+metric() {
+	[ -s "${METRICS}" ] || echo '{}' > "${METRICS}"
+	jq --argjson v "$2" "$1 = \$v" "${METRICS}" > "${METRICS}.tmp" && mv "${METRICS}.tmp" "${METRICS}"
+}
+
+now() { date +%s.%N; }
+
+# Outage as the clients see it. meas_start <case> [<client> <address>]
+# starts the probes of outage-client.sh on all clients. With a client and an
+# address, the server also pings that address (inbound). meas_event <case>
+# records the time of the cut; meas_stop <case> stops the probes, and writes
+# for each client the longest gap, the lost packets, whether the TCP streams
+# survived, and the time until a new connection works. The case also gets
+# "downtime_s" (seconds, the worst client): ipv6_a and ipv6_b (ping from the
+# site A and site B address), ipv4, new_conn_ipv6 and new_conn_ipv4 (curl),
+# and inbound (the server pings a client address).
+OUTAGE_SH="$(cat "${ROOT}/multipop/tests/outage-client.sh")"
+declare -A MEAS_EVENT
+meas_start() {
+	local c
+	for c in ${CLIENTS}; do dx "$c" bash -c "${OUTAGE_SH}" - start "/tmp/meas/$1"; done
+	[ -n "${3:-}" ] && dx server bash -c "${OUTAGE_SH}" - start "/tmp/meas/$1" "$3" &&
+		metric ".\"$1\".inbound_target" "$(jq -n --arg c "$2" --arg a "$3" '{client: $c, address: $a}')"
+	MEAS_EVENT[$1]=$(now)
+	sleep 2
+}
+meas_event() { MEAS_EVENT[$1]=$(now); }
+meas_stop() {
+	local c dir m worst
+	dir="${RESULTS}/${TEST}.meas/$1"
+	for c in ${CLIENTS} server; do
+		dx "$c" test -d "/tmp/meas/$1" 2>/dev/null || continue
+		dx "$c" bash -c "${OUTAGE_SH}" - stop "/tmp/meas/$1"
+		mkdir -p "${dir}/$c"
+		dx "$c" tar -C "/tmp/meas/$1" -c . | tar -C "${dir}/$c" -x
+		dx "$c" rm -rf "/tmp/meas/$1"
+		m=$(python3 "${ROOT}/multipop/tests/outage.py" "${dir}/$c" "${MEAS_EVENT[$1]}") || m='{"error": "no data"}'
+		if [ "$c" = server ]; then
+			metric ".\"$1\".inbound" "$m"
+		else
+			metric ".\"$1\".clients.\"$c\"" "$m"
+		fi
+	done
+	# The worst client; null if a client never got a reply or a connection.
+	worst=$(jq --arg k "$1" 'def worst(f): [.clients[] | f] |
+			if length == 0 or any(. == null) then null else max / 1000 end;
+		.[$k] | {
+		ipv6_a: worst(.ping6a.max_gap_ms), ipv6_b: worst(.ping6b.max_gap_ms),
+		ipv4: worst(.ping4.max_gap_ms),
+		new_conn_ipv6: worst(.curl6.new_conn_ms), new_conn_ipv4: worst(.curl4.new_conn_ms),
+		inbound: (if .inbound.ping6 then .inbound.ping6.max_gap_ms / 1000 else null end)}' "${METRICS}")
+	metric ".\"$1\".downtime_s" "${worst}"
+	log "$1: downtime ${worst//[$'\n' ]/}"
+}
+
+# node_event <ap> <event> <tunnel|.> <case>: the first event of mp-node after
+# the cut of the case, in seconds after the cut (the node clock has 1 s steps;
+# it is corrected with the offset to the host clock). Empty if none.
+node_event() {
+	local out h0
+	h0=$(now)
+	out=$(node "$1" "date +%s; cat /tmp/multipop/events" | tr -d '\r')
+	echo "${out}" | awk -v h="$(echo "${h0} $(now)" | awk '{printf "%.3f", ($1 + $2) / 2}')" -v e="$2" -v i="$3" -v t0="${MEAS_EVENT[$4]}" '
+		NR == 1 { off = h - $1; next }
+		$3 == e && (i == "." || $2 == i) && $1 + off >= t0 - 1 { printf "%.0f\n", $1 + off - t0; exit }'
+}

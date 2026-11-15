@@ -15,7 +15,7 @@ cd "$(dirname "$0")" || exit 1
 ROOT=$PWD
 export LAB=ffmuc-mp-aa
 export RESULTS="${ROOT}/results"
-TESTS="${TESTS:-normal ra-single source-prefix rule8-tie pmtu roam pgw-failure broker-down site-failure recovery flapping long-outage old-firmware}"
+TESTS="${TESTS:-normal ra-single source-prefix rule8-tie pmtu roam pgw-failure broker-down site-failure recovery site-a-failover flapping long-outage old-firmware}"
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 export PATH="${HOME}/.local/bin:${PATH}"
 mkdir -p "${RESULTS}"
@@ -42,10 +42,15 @@ summary() {
 		done
 	} | jq -s '{lab: "'"${LAB}"'", variant: "active/active", tests: .}' > "${RESULTS}/summary.json.tmp"
 	jq -e 'all(.tests[]; .status == "pass")' "${RESULTS}/summary.json.tmp" >/dev/null || all=fail
-	jq --arg s "${all}" '. + {status: $s}' "${RESULTS}/summary.json.tmp" > "${RESULTS}/summary.json"
+	# "downtime": for each failover case, the worst client outage in seconds
+	# and the node times (the full numbers are in the metrics of each test).
+	jq --arg s "${all}" '. + {status: $s, downtime: ([.tests[].metrics // {} | to_entries[] |
+		{(.key): ((.value.downtime_s // {}) + {node: .value.node})}] | add)}' \
+		"${RESULTS}/summary.json.tmp" > "${RESULTS}/summary.json"
 	rm -f "${RESULTS}/summary.json.tmp"
 	echo "=== result: ${all}"
 	jq -r '.tests[] | "\(.status)\t\(.test)"' "${RESULTS}/summary.json"
+	jq -c '.downtime // {} | to_entries[] | {(.key): .value}' "${RESULTS}/summary.json"
 	[ "${all}" = pass ]
 }
 

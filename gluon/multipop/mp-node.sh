@@ -7,12 +7,16 @@
 # xlat_range6, node_address6, dns64), a list of all pgws of the site, and
 # primary_site. Every MP_INTERVAL seconds this script:
 #
-# - probes each tunnel (one ICMPv6 echo to the pgw, bound to wg_c<id>) and
-#   keeps a damped state: up after 3 hits and a fresh handshake, at least
-#   MP_DWELL s in a state, a penalty after too many changes,
+# - probes all tunnels at the same time (one ICMPv6 echo to the pgw, bound
+#   to wg_c<id>, 1 s timeout) and keeps a damped state: down at once when
+#   all pgws of the site failed; up after 3 hits, a handshake newer than the
+#   down event and MP_DWELL s down. More than MP_MAX_CHANGES changes in
+#   MP_CHANGE_WINDOW s give a penalty that doubles each time,
 # - selects the next pgw of the same site after 3 misses. This does not
 #   change the site state: the prefix stays preferred. The site is down only
-#   when all pgws of the site failed (3 misses each, in turn),
+#   when all pgws of the site failed (3 misses each, in turn). After the
+#   first handshake with the new pgw, it tells the broker (POST
+#   /api/v3/switch). The broker tells the old pgw to drop the node /63 route,
 # - routes each client prefix only through the tunnel of its site
 #   (ip rules 1000, 1050+, 1100+, one table per site),
 # - rejects packets to the tunnels with a source of a dead site or a foreign
@@ -24,25 +28,26 @@
 #   On a change it sends SIGHUP 3 times, 3 s apart,
 # - keeps the IPv4 default (with it the CLAT of that tunnel) and the main
 #   IPv6 default on the active tunnel. The active tunnel is the primary site
-#   while it is up. After a failover it goes back to the primary site only
-#   after the primary site was up for MP_HOLD_DOWN s,
+#   while it is up (the damping above delays the switch-back),
 # - writes the dnsmasq server list: the DNS64 of the live sites, the active
 #   site first.
 #
-# Status for the lab tests: /tmp/multipop/status, /tmp/multipop/active.
+# Status for the lab tests: /tmp/multipop/status, /tmp/multipop/active,
+# /tmp/multipop/events ("<epoch> <tunnel> <event> <detail>").
 
 CONF=/tmp/ff-Ohb0ba0u/noderoute.json
 ROUTE4_FILE=/tmp/ff-Ohb0ba0u/noderoute-route4
 ST=/tmp/multipop
-INTERVAL=${MP_INTERVAL:-10}
+INTERVAL=${MP_INTERVAL:-1}
 DOWN_AFTER=${MP_DOWN_AFTER:-3}
 UP_AFTER=${MP_UP_AFTER:-3}
 HS_MAX=${MP_HS_MAX:-180}
-DWELL=${MP_DWELL:-60}
-HOLD_DOWN=${MP_HOLD_DOWN:-120}
+DWELL=${MP_DWELL:-10}
 MAX_CHANGES=${MP_MAX_CHANGES:-3}
 CHANGE_WINDOW=${MP_CHANGE_WINDOW:-600}
-PENALTY=${MP_PENALTY:-600}
+# The first penalty is MP_PENALTY s. Each further one doubles, up to MP_PENALTY_MAX.
+PENALTY=${MP_PENALTY:-30}
+PENALTY_MAX=${MP_PENALTY_MAX:-600}
 # The design example is 10 minutes. The lab uses less to keep the tests short.
 WITHDRAW_AFTER=${MP_WITHDRAW_AFTER:-120}
 PREFERRED=${MP_PREFERRED:-300}
@@ -51,6 +56,7 @@ VALID=${MP_VALID:-600}
 [ -r /etc/multipop.conf ] && . /etc/multipop.conf
 
 log() { logger -t mp-node "$*"; }
+event() { echo "$(date +%s) $*" >> "$ST/events"; }
 conc() { jsonfilter -i "$CONF" -e "@.concentrators[$1].$2" 2>/dev/null; }
 pgw() { jsonfilter -i "$CONF" -e "@.concentrators[$1].pgws[$2].$3" 2>/dev/null; }
 get() { cat "$ST/$1" 2>/dev/null || echo "${2-0}"; }
@@ -79,36 +85,89 @@ fi
 switch_pgw() {
 	# Selects the next pgw of the site for tunnel $ifc (index $i). The peer
 	# exists on all pgws of the site, so this works without the broker.
-	[ "$n" -gt 1 ] || return
+	# With one pgw, it adds the same peer again: then WireGuard makes a new
+	# handshake when the pgw comes back, and the site can come up at once.
 	next=$(((pj + 1) % n))
 	key=$(pgw "$i" $next pubkey)
 	ka=$(wg show "$ifc" persistent-keepalive | awk '{print $2; exit}')
 	ips=$(wg show "$ifc" allowed-ips | awk '{for (i = 2; i <= NF; i++) printf "%s%s", (i > 2 ? "," : ""), $i; exit}')
 	[ "$ka" = off ] && ka=0
+	[ -n "$key" ] || return
 	log "$ifc ($site): pgw $(pgw "$i" "$pj" id) does not answer, using pgw $(pgw "$i" $next id)"
 	wg set "$ifc" peer "$cur" remove
 	wg set "$ifc" peer "$key" endpoint "$(pgw "$i" $next endpoint)" \
 		persistent-keepalive "${ka:-25}" allowed-ips "${ips:-::/0}"
 	echo "$key" > "$ST/pgw.$id"
+	put "$ifc.switch_ts" "$now"
+	[ "$next" != "$pj" ] || return
+	event "$ifc" pgw_switch "$(pgw "$i" "$pj" id) $(pgw "$i" $next id)"
+	# Report the switch after the first handshake with the new pgw. With
+	# switches in a row, the first old pgw is the one with the route.
+	[ -e "$ST/$ifc.report" ] || echo "$(pgw "$i" "$pj" id)" > "$ST/$ifc.report"
 	cur=$key
 	pj=$next
 	gw=$(pgw "$i" $next address6)
 }
 
+report_switch() {
+	# Tells the broker that $ifc uses pgw $2 now instead of pgw $1. The broker
+	# tells the old pgw to drop the node route at once. Without the report,
+	# the old pgw drops it when the handshake is older than 180 s.
+	[ "$1" != "$2" ] || { rm -f "$ST/$ifc.report"; return; }
+	[ -e "$ST/report.lock" ] && return
+	server=$(uci -q get parker.nodeconfig.config_server) || return
+	key=$(sed 's/+/%2B/g; s#/#%2F#g; s/=/%3D/g' /etc/parker/wg-pubkey)
+	touch "$ST/report.lock"
+	(
+		# libpacketmark: the request goes out over the WAN like nodeconfig.
+		if LD_PRELOAD=libpacketmark.so wget -q -T 3 -O /dev/null \
+			--post-data "pubkey=$key&old=$1&new=$2" "http://$server/api/v3/switch"; then
+			rm -f "$ST/$3.report"
+			event "$3" switch_reported "$1 $2"
+			log "$3: told the broker that pgw $1 can drop the route"
+		fi
+		rm -f "$ST/report.lock"
+	) </dev/null >/dev/null 2>&1 &
+}
+
 change() {
 	# Records a state change of $ifc to $1. Returns 1 if the penalty stops it.
 	hist=$(awk -v m=$((now - CHANGE_WINDOW)) '$1 > m' "$ST/$ifc.changes" 2>/dev/null)
+	# A quiet window resets the penalty.
+	[ -n "$hist" ] || put "$ifc.penalties" 0
 	if [ "$1" = up ] && [ $(($(echo "$hist" | grep -c .) + 1)) -gt "$MAX_CHANGES" ]; then
-		put "$ifc.penalty" $((now + PENALTY))
+		k=$(get "$ifc.penalties")
+		p=$PENALTY
+		while [ "$k" -gt 0 ] && [ "$p" -lt "$PENALTY_MAX" ]; do p=$((p * 2)); k=$((k - 1)); done
+		[ "$p" -le "$PENALTY_MAX" ] || p=$PENALTY_MAX
+		put "$ifc.penalties" $(($(get "$ifc.penalties") + 1))
+		put "$ifc.penalty" $((now + p))
 		# Start a new history, so that the penalty is not set again at its end.
 		put "$ifc.changes" "$now"
-		log "$ifc ($site) changed state too often: down for ${PENALTY} s (penalty)"
+		event "$ifc" penalty "$p"
+		log "$ifc ($site) changed state too often: down for $p s (penalty)"
 		return 1
 	fi
 	printf '%s\n%s\n' "$hist" "$now" | grep . > "$ST/$ifc.changes"
 	put "$ifc.state" "$1"
 	put "$ifc.since" "$now"
 	put "$ifc.${1}_since" "$now"
+	event "$ifc" "site_$1" "$site"
+}
+
+probe_all() {
+	# One echo per tunnel, all at the same time, so a cycle takes about 1 s.
+	# Wait only for the pings, not for the RA burst or a switch report.
+	pids=""
+	for f in "$ST"/wg_c*.gw; do
+		[ -e "$f" ] || continue
+		t=$(basename "$f" .gw)
+		rm -f "$ST/$t.probe"
+		(ping -c 1 -W 1 -I "$t" "$(cat "$f")" >/dev/null 2>&1 && touch "$ST/$t.probe") &
+		pids="$pids $!"
+	done
+	# shellcheck disable=SC2086
+	[ -z "$pids" ] || wait $pids
 }
 
 tunnel() {
@@ -136,7 +195,13 @@ tunnel() {
 	[ "$n" -gt 0 ] || n=1
 
 	# Probe and damping. $ifc.tried counts the pgws that failed in turn.
-	if ping -c 1 -W 2 -I "$ifc" "$gw" >/dev/null 2>&1; then
+	# probe_all pinged $ST/$ifc.gw. Without it (first cycle), ping here.
+	if [ "$(get "$ifc.gw" "")" = "$gw" ]; then
+		[ -e "$ST/$ifc.probe" ]
+	else
+		ping -c 1 -W 1 -I "$ifc" "$gw" >/dev/null 2>&1
+	fi
+	if [ $? = 0 ]; then
 		put "$ifc.hits" $(($(get "$ifc.hits") + 1))
 		put "$ifc.misses" 0
 		put "$ifc.tried" 0
@@ -154,11 +219,14 @@ tunnel() {
 	[ "$misses" -ge "$DOWN_AFTER" ] && [ $((tried + 1)) -ge "$n" ] && all_failed=1
 	in_state=$((now - $(get "$ifc.since")))
 	penalty=$(($(get "$ifc.penalty") - now))
-	if [ "$state" = up ] && [ "$in_state" -ge "$DWELL" ] && [ "$all_failed" = 1 ]; then
+	# Fresh: a handshake after the site went down (WireGuard renews it when
+	# the pgw comes back, because switch_pgw adds the peer again).
+	if [ "$state" = up ] && [ "$all_failed" = 1 ]; then
 		change down && state=down
 		log "$ifc ($site) is down (all $n pgws failed): deprecating $range6"
 	elif [ "$state" = down ] && [ "$in_state" -ge "$DWELL" ] && [ "$penalty" -le 0 ] &&
-		[ "$(get "$ifc.hits")" -ge "$UP_AFTER" ] && [ "$age" -le "$HS_MAX" ]; then
+		[ "$(get "$ifc.hits")" -ge "$UP_AFTER" ] && [ "$age" -le "$HS_MAX" ] &&
+		[ "${hs:-0}" -ge "$(get "$ifc.down_since")" ]; then
 		change up && state=up && log "$ifc ($site) is up: announcing $range6"
 	fi
 	# Another pgw of the same site after DOWN_AFTER misses. The site stays
@@ -168,6 +236,11 @@ tunnel() {
 		switch_pgw
 		put "$ifc.misses" 0
 		put "$ifc.tried" $((tried + 1))
+	fi
+	put "$ifc.gw" "$gw"
+	# A pending switch report goes out after the first handshake with the new pgw.
+	if [ -e "$ST/$ifc.report" ] && [ "${hs:-0}" -ge "$(get "$ifc.switch_ts")" ]; then
+		report_switch "$(cat "$ST/$ifc.report")" "$(pgw "$i" "$pj" id)" "$ifc"
 	fi
 
 	# The node address on the tunnel, with the pgw as peer.
@@ -214,20 +287,16 @@ tunnel() {
 }
 
 select_active() {
-	# The active tunnel: the primary site, else the current one while it is
-	# up, else the first live tunnel. Back to the primary site only after it
-	# was up for HOLD_DOWN s.
+	# The active tunnel: the primary site while it is up, else the current
+	# one while it is up, else the first live tunnel.
 	old=$(get active "")
-	new=""
-	if [ -n "$primary_ifc" ]; then
-		if [ -z "$old" ] || [ "$old" = "$primary_ifc" ] || ! in_live "$old" ||
-			[ $((now - $(get "$primary_ifc.up_since"))) -ge "$HOLD_DOWN" ]; then
-			new=$primary_ifc
-		fi
-	fi
+	new=$primary_ifc
 	[ -z "$new" ] && in_live "$old" && new=$old
 	[ -z "$new" ] && new=$(echo "$live" | awk '{print $1}')
-	[ "$new" = "$old" ] || log "active tunnel: ${old:-none} -> ${new:-none}"
+	if [ "$new" != "$old" ]; then
+		log "active tunnel: ${old:-none} -> ${new:-none}"
+		event "${new:-none}" active "${old:-none}"
+	fi
 	put active "$new"
 }
 
@@ -317,6 +386,7 @@ cycle() {
 
 	sh /usr/sbin/mp-fw.sh
 	set_rule 1000 lookup main suppress_prefixlength 0
+	probe_all
 
 	j=0
 	while [ -n "$(conc $j id)" ]; do
@@ -355,6 +425,9 @@ cycle() {
 
 log "starting (lab prototype)"
 while true; do
+	# A cycle starts every INTERVAL s, or when the previous one ends.
+	sleep "$INTERVAL" &
+	tick=$!
 	cycle
-	sleep "$INTERVAL"
+	wait $tick
 done

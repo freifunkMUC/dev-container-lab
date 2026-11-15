@@ -248,6 +248,19 @@ index 3a7f8a9..158f7ce 100644
    when: inventory_hostname in groups['Brokers']
  
  - name: Install wgkex broker unit
+diff --git a/roles/wgkex/templates/nginx-location.conf.j2 b/roles/wgkex/templates/nginx-location.conf.j2
+index 1db4895..197b6b4 100644
+--- a/roles/wgkex/templates/nginx-location.conf.j2
++++ b/roles/wgkex/templates/nginx-location.conf.j2
+@@ -8,3 +8,8 @@ location = /api/v3/config {
+ 	proxy_pass http://127.0.0.1:5000;
+ 	proxy_set_header X-Real-IP $remote_addr;
+ }
++# LAB PROTOTYPE (multi-PoP): a node reports a pgw switch inside a site.
++location = /api/v3/switch {
++	proxy_pass http://127.0.0.1:5000;
++	proxy_set_header X-Real-IP $remote_addr;
++}
 diff --git a/roles/wgkex/templates/wgkex-broker.service.j2 b/roles/wgkex/templates/wgkex-broker.service.j2
 index 543e54c..c00d77b 100644
 --- a/roles/wgkex/templates/wgkex-broker.service.j2

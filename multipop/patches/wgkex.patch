@@ -1,5 +1,5 @@
 diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
-index 86a22d1..c003b5f 100644
+index 86a22d1..cb2c57e 100644
 --- a/wgkex/broker/app.py
 +++ b/wgkex/broker/app.py
 @@ -2,6 +2,7 @@
@@ -136,7 +136,43 @@ index 86a22d1..c003b5f 100644
          "utf-8"
      )
      if config.get_config().broker_signing_key is None:
-@@ -740,6 +767,26 @@ def handle_mqtt_message(
+@@ -458,6 +485,35 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+     )
+ 
+ 
++@app.route("/api/v3/switch", methods=["POST"])
++def wg_api_v3_switch() -> Tuple[Response | Dict, int]:
++    """LAB PROTOTYPE: a node moved to another pgw of the same site and has a
++    fresh handshake with it. Tell the old pgw to drop the node route at once.
++    The old pgw keeps the peer, so the node can come back.
++
++    NOTE: the report is not authenticated in the lab. A real version must
++    check that the node signed it with its WireGuard key."""
++    if not sites:
++        return {"error": {"message": "Multi-site mode is not enabled"}}, 400
++    try:
++        pubkey = is_valid_wg_pubkey(request.values.get("pubkey", ""))
++        old_id = int(request.values.get("old", ""))
++        new_id = int(request.values.get("new", ""))
++    except Exception:
++        return {"error": {"message": "Invalid data received."}}, 400
++    old_name = multisite.switch_target(
++        sites, config.get_config().workers._workers, old_id, new_id
++    )
++    if old_name is None:
++        return {"error": {"message": "Not a pgw switch inside one site."}}, 400
++    mqtt.publish(
++        f"parker/drop-route/{old_name}",
++        json.dumps({"PublicKey": pubkey}).encode("utf-8"),
++    )
++    logger.info("pgw switch of %s: dropping route on %s", pubkey, old_name)
++    return {"dropped": old_name}, 200
++
++
+ @mqtt.on_connect()
+ def handle_mqtt_connect(
+     client: mqtt_client.Client, userdata: bytes, flags: Any, rc: Any
+@@ -740,6 +796,26 @@ def handle_mqtt_message(
      )
  
  
@@ -164,7 +200,7 @@ index 86a22d1..c003b5f 100644
      """Concatenate a port string with a host string using a colon.
      The host may be either a hostname, IPv4 or IPv6 address.
 diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
-index ec49134..f374d19 100644
+index ec49134..b4f05a7 100644
 --- a/wgkex/broker/app_test.py
 +++ b/wgkex/broker/app_test.py
 @@ -1,7 +1,9 @@
@@ -177,7 +213,7 @@ index ec49134..f374d19 100644
  import unittest
  
  import flask_mqtt
-@@ -593,6 +595,124 @@ class TestBrokerApp(unittest.TestCase):
+@@ -593,6 +595,160 @@ class TestBrokerApp(unittest.TestCase):
              self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
              self.assertEqual(payload["Range6"], "2001:db8:42::/63")
  
@@ -299,15 +335,51 @@ index ec49134..f374d19 100644
 +            published, {"parker/wireguard/worker2": "2001:db8:a:2::/63"}
 +        )
 +
++    def test_pgw_switch_drops_route_on_old_pgw(self):
++        cfg = _parker_config()
++        cfg.workers = config.Workers.from_dict(
++            {
++                "worker1": {"id": 1, "pop": "pop-a"},
++                "worker2": {"id": 2, "pop": "pop-a"},
++                "worker3": {"id": 3, "pop": "pop-b"},
++            },
++            10,
++        )
++        sites = {"pop-a": {"site": "muc01"}, "pop-b": {"site": "vie01"}}
++        with (
++            mock.patch.object(self.broker_app.config, "get_config", return_value=cfg),
++            mock.patch.object(self.broker_app, "sites", sites),
++            mock.patch.object(self.broker_app, "mqtt") as mqtt,
++        ):
++            client = self.broker_app.app.test_client()
++            ok = client.post(
++                "/api/v3/switch", data={"pubkey": _PUBLIC_KEY, "old": 1, "new": 2}
++            )
++            cross_site = client.post(
++                "/api/v3/switch", data={"pubkey": _PUBLIC_KEY, "old": 2, "new": 3}
++            )
++            bad_key = client.post(
++                "/api/v3/switch", data={"pubkey": "x", "old": 1, "new": 2}
++            )
++
++        self.assertEqual(ok.status_code, 200)
++        self.assertEqual(ok.json, {"dropped": "worker1"})
++        self.assertEqual(cross_site.status_code, 400)
++        self.assertEqual(bad_key.status_code, 400)
++        mqtt.publish.assert_called_once_with(
++            "parker/drop-route/worker1",
++            json.dumps({"PublicKey": _PUBLIC_KEY}).encode("utf-8"),
++        )
++
      def test_parker_exchange_removes_peer_from_deselected_workers(self):
          cfg = _parker_config()
          cfg.workers = config.Workers.from_dict(
 diff --git a/wgkex/broker/multisite.py b/wgkex/broker/multisite.py
 new file mode 100644
-index 0000000..c871756
+index 0000000..e6a920f
 --- /dev/null
 +++ b/wgkex/broker/multisite.py
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,167 @@
 +"""LAB PROTOTYPE: per-site prefixes for the Parker multi-PoP design.
 +
 +Each site (PoP) has its own IPv6 parent prefix. A node gets one /63 from each
@@ -461,6 +533,20 @@ index 0000000..c871756
 +        },
 +        sites[primary].get("site", primary),
 +    )
++
++
++def switch_target(
++    sites: Dict[str, Dict[str, Any]], workers: Dict[str, Any], old_id: int, new_id: int
++) -> Optional[str]:
++    """Returns the name of the old pgw after a pgw switch inside a site, or
++    None if the two pgws are not two different pgws of one known site."""
++    by_id = {cfg.id: (name, cfg.pop) for name, cfg in workers.items() if cfg}
++    old, new = by_id.get(old_id), by_id.get(new_id)
++    if old is None or new is None or old_id == new_id:
++        return None
++    if old[1] != new[1] or old[1] not in sites:
++        return None
++    return old[0]
 diff --git a/wgkex/broker/parker.py b/wgkex/broker/parker.py
 index a480752..b4d40d9 100644
 --- a/wgkex/broker/parker.py
@@ -516,10 +602,10 @@ index da74438..203bb52 100644
      finally:
 diff --git a/wgkex/worker/handshake_routes.py b/wgkex/worker/handshake_routes.py
 new file mode 100644
-index 0000000..e8e2407
+index 0000000..0ea666c
 --- /dev/null
 +++ b/wgkex/worker/handshake_routes.py
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,139 @@
 +"""LAB PROTOTYPE: install a node /63 route only while its handshake is fresh.
 +
 +In the multi-PoP design every pgw of a site has the peer of every node of the
@@ -527,6 +613,11 @@ index 0000000..e8e2407
 +the route follows the handshake, and the peer stays.
 +
 +Set WGKEX_ROUTE_ON_HANDSHAKE=<seconds> (for example 180) to enable it.
++
++When a node moves to another pgw of the same site, the broker tells the old
++pgw to drop the route at once (drop_route). The old pgw then keeps the route
++away until the node makes a new handshake with it. The timeout stays as a
++safety net only.
 +"""
 +
 +import os
@@ -542,7 +633,12 @@ index 0000000..e8e2407
 +from wgkex.worker import netlink
 +
 +INTERFACE = "wg-nodes"
-+SYNC_INTERVAL = 5.0
++SYNC_INTERVAL = 1.0
++
++# prefix -> time of the drop request. A route comes back only after a
++# handshake that is newer than the drop.
++_dropped: Dict[str, float] = {}
++_dropped_lock = threading.Lock()
 +
 +
 +def fresh_seconds() -> Optional[float]:
@@ -551,9 +647,15 @@ index 0000000..e8e2407
 +
 +
 +def wanted_routes(
-+    peers: list, prefix_length: int, fresh: float, now: float
++    peers: list,
++    prefix_length: int,
++    fresh: float,
++    now: float,
++    dropped: Optional[Dict[str, float]] = None,
 +) -> Dict[str, bool]:
-+    """Maps the /63 of each peer to True if its handshake is fresh."""
++    """Maps the /63 of each peer to True if its handshake is fresh and newer
++    than a drop request for the prefix."""
++    dropped = dropped or {}
 +    wanted: Dict[str, bool] = {}
 +    for peer in peers:
 +        try:
@@ -561,7 +663,11 @@ index 0000000..e8e2407
 +            handshake = netlink._last_handshake_seconds(peer)
 +        except (ValueError, AttributeError):
 +            continue
-+        is_fresh = bool(handshake) and now - handshake < fresh
++        is_fresh = (
++            bool(handshake)
++            and now - handshake < fresh
++            and handshake > dropped.get(prefix, 0)
++        )
 +        wanted[prefix] = wanted.get(prefix, False) or is_fresh
 +    return wanted
 +
@@ -573,7 +679,13 @@ index 0000000..e8e2407
 +        peers = []
 +        for msg in netlink._wireguard_info(wg, INTERFACE):
 +            peers.extend(msg.get_attr("WGDEVICE_A_PEERS") or [])
-+    wanted = wanted_routes(peers, prefix_length, fresh, clock())
++    with _dropped_lock:
++        dropped = dict(_dropped)
++    wanted = wanted_routes(peers, prefix_length, fresh, clock(), dropped)
++    with _dropped_lock:
++        for prefix, is_fresh in wanted.items():
++            if is_fresh:
++                _dropped.pop(prefix, None)
 +    with pyroute2.IPRoute() as ip:
 +        oif = ip.link_lookup(ifname=INTERFACE)[0]
 +        present = {
@@ -595,6 +707,28 @@ index 0000000..e8e2407
 +                logger.warning("Handshake route %s failed: %s", prefix, error)
 +
 +
++def drop_route(
++    public_key: str, prefix_length: int, clock: Callable[[], float] = time
++) -> list:
++    """Removes the /63 route of a peer at once and keeps the peer."""
++    prefixes = netlink.get_parker_prefixes_for_peer(
++        INTERFACE, public_key, prefix_length
++    )
++    now = clock()
++    with _dropped_lock:
++        for prefix in prefixes:
++            _dropped[prefix] = now
++    with pyroute2.IPRoute() as ip:
++        oif = ip.link_lookup(ifname=INTERFACE)[0]
++        for prefix in prefixes:
++            try:
++                ip.route("del", dst=prefix, oif=oif)
++                logger.info("Dropped route %s of %s on request", prefix, public_key)
++            except pyroute2.netlink.exceptions.NetlinkError as error:
++                logger.info("Drop route %s: %s", prefix, error)
++    return list(prefixes)
++
++
 +def start(exit_event: threading.Event, prefix_length: int) -> Optional[threading.Thread]:
 +    fresh = fresh_seconds()
 +    if fresh is None:
@@ -613,10 +747,10 @@ index 0000000..e8e2407
 +    return thread
 diff --git a/wgkex/worker/handshake_routes_test.py b/wgkex/worker/handshake_routes_test.py
 new file mode 100644
-index 0000000..7684a58
+index 0000000..afc2fcd
 --- /dev/null
 +++ b/wgkex/worker/handshake_routes_test.py
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,48 @@
 +import unittest
 +
 +from wgkex.worker import handshake_routes
@@ -649,9 +783,144 @@ index 0000000..7684a58
 +            },
 +        )
 +
++    def test_dropped_route_needs_newer_handshake(self):
++        peers = [_Peer("2001:db8:a::/63", 1000)]
++        dropped = {"2001:db8:a::/63": 1050}
++        self.assertEqual(
++            handshake_routes.wanted_routes(peers, 63, 180, 1100, dropped),
++            {"2001:db8:a::/63": False},
++        )
++        peers = [_Peer("2001:db8:a::/63", 1060)]
++        self.assertEqual(
++            handshake_routes.wanted_routes(peers, 63, 180, 1100, dropped),
++            {"2001:db8:a::/63": True},
++        )
++
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/wgkex/worker/mqtt.py b/wgkex/worker/mqtt.py
+index 45b85c0..8bd5708 100644
+--- a/wgkex/worker/mqtt.py
++++ b/wgkex/worker/mqtt.py
+@@ -15,6 +15,7 @@ import pyroute2.netlink.exceptions
+ from wgkex.common import logger
+ from wgkex.common.mqtt import MQTTTopics
+ from wgkex.config.config import get_config
++from wgkex.worker import handshake_routes
+ from wgkex.worker.msg_queue import q
+ from wgkex.worker.netlink import (
+     get_connected_peers_count,
+@@ -62,6 +63,7 @@ def connect(exit_event: threading.Event) -> None:
+ 
+     if parker_enabled:
+         client.message_callback_add("parker/wireguard/#", on_message_parker)
++        client.message_callback_add("parker/drop-route/#", on_message_drop_route)
+     else:
+         client.message_callback_add("wireguard/#", on_message_wireguard)
+     logger.info("connecting to broker %s", broker_address)
+@@ -195,7 +197,11 @@ def on_connect(client: mqtt.Client, userdata: Any, flags, rc) -> None:
+         # config; external_name is only the advertised endpoint address.
+         # "all" stays subscribed so a broker that still broadcasts keeps
+         # working during a rollout.
+-        for topic in (f"parker/wireguard/{_HOSTNAME}", "parker/wireguard/all"):
++        for topic in (
++            f"parker/wireguard/{_HOSTNAME}",
++            "parker/wireguard/all",
++            f"parker/drop-route/{_HOSTNAME}",
++        ):
+             logger.info(f"Subscribing to topic {topic}")
+             client.subscribe(topic)
+ 
+@@ -317,6 +323,28 @@ def on_message_parker(
+     q.put(str(message.payload.decode("utf-8")))
+ 
+ 
++def on_message_drop_route(
++    client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage
++) -> None:
++    """LAB PROTOTYPE: the node moved to another pgw of the site. Remove its
++    route here at once and keep the peer (handshake_routes.drop_route)."""
++    if message.topic.rpartition("/")[2] != _HOSTNAME:
++        return
++    # Only handshake_routes can put the route back later.
++    if handshake_routes.fresh_seconds() is None:
++        logger.warning("Ignoring drop-route: WGKEX_ROUTE_ON_HANDSHAKE is not set")
++        return
++    try:
++        public_key = json.loads(message.payload.decode("utf-8"))["PublicKey"]
++        if not isinstance(public_key, str) or not public_key:
++            raise ValueError("no PublicKey")
++        handshake_routes.drop_route(
++            public_key, get_config().parker.prefixes.ipv6.length or 63
++        )
++    except Exception as error:
++        logger.warning("Ignoring drop-route message: %s", error)
++
++
+ def publish_metrics_loop(
+     exit_event: threading.Event,
+     client: mqtt.Client,
+diff --git a/wgkex/worker/mqtt_test.py b/wgkex/worker/mqtt_test.py
+index 09ac76e..f8c8747 100644
+--- a/wgkex/worker/mqtt_test.py
++++ b/wgkex/worker/mqtt_test.py
+@@ -135,6 +135,7 @@ class MQTTTest(unittest.TestCase):
+             [
+                 mock.call().subscribe(f"parker/wireguard/{hostname}"),
+                 mock.call().subscribe("parker/wireguard/all"),
++                mock.call().subscribe(f"parker/drop-route/{hostname}"),
+                 mock.call().publish(
+                     f"parker/wireguard-worker/{hostname}/data",
+                     '{"ExternalAddress": "%s", "Port": 51820, "PublicKey": "456asdf=", "LinkAddress": "fe80::1"}'
+@@ -157,6 +158,7 @@ class MQTTTest(unittest.TestCase):
+             [
+                 mock.call().subscribe(f"parker/wireguard/{hostname}"),
+                 mock.call().subscribe("parker/wireguard/all"),
++                mock.call().subscribe(f"parker/drop-route/{hostname}"),
+                 mock.call().publish(
+                     f"parker/wireguard-worker/{hostname}/status", 0, qos=1, retain=True
+                 ),
+@@ -357,8 +359,11 @@ class MQTTTest(unittest.TestCase):
+             qos=1,
+             retain=True,
+         )
+-        client.message_callback_add.assert_called_once_with(
+-            "parker/wireguard/#", mqtt.on_message_parker
++        client.message_callback_add.assert_has_calls(
++            [
++                mock.call("parker/wireguard/#", mqtt.on_message_parker),
++                mock.call("parker/drop-route/#", mqtt.on_message_drop_route),
++            ]
+         )
+         self.assertEqual(thread.call_count, 2)
+         client.loop_forever.assert_called_once()
+@@ -420,6 +425,25 @@ class MQTTTest(unittest.TestCase):
+         mqtt.on_message_parker(None, None, message)
+         self.assertEqual(mqtt.q.get_nowait(), '{"PublicKey":"key"}')
+ 
++    @mock.patch.object(mqtt, "get_config")
++    @mock.patch.object(mqtt.handshake_routes, "drop_route")
++    def test_on_message_drop_route(self, drop_mock, config_mock):
++        config_mock.return_value.parker.prefixes.ipv6.length = 63
++        message = paho.mqtt.client.MQTTMessage()
++        message.payload = b'{"PublicKey":"key"}'
++        message.topic = "parker/drop-route/some-other-worker".encode()
++        with mock.patch.dict("os.environ", {"WGKEX_ROUTE_ON_HANDSHAKE": "180"}):
++            mqtt.on_message_drop_route(None, None, message)
++            drop_mock.assert_not_called()
++            message.topic = f"parker/drop-route/{socket.gethostname()}".encode()
++            mqtt.on_message_drop_route(None, None, message)
++        drop_mock.assert_called_once_with("key", 63)
++
++        drop_mock.reset_mock()
++        with mock.patch.dict("os.environ", {"WGKEX_ROUTE_ON_HANDSHAKE": ""}):
++            mqtt.on_message_drop_route(None, None, message)
++        drop_mock.assert_not_called()
++
+     def test_metrics_loop_validation_exception_and_offline_publish(self):
+         with self.assertRaisesRegex(ValueError, "Domain must be passed"):
+             mqtt.publish_metrics_loop(threading.Event(), mock.MagicMock(), None, False)
 diff --git a/wgkex/worker/netlink.py b/wgkex/worker/netlink.py
 index 378558d..8ae8ad5 100644
 --- a/wgkex/worker/netlink.py
