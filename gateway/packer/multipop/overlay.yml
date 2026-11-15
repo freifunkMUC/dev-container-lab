@@ -1,0 +1,126 @@
+---
+# Multi-PoP active/standby lab overlay. Runs after ffbs-ansible/playbook.yml,
+# with the same inventory and with vars.yml as extra vars. All changes take
+# effect when the image boots in the lab.
+
+- hosts: all
+  become: true
+  vars:
+    dns64_here: "{{ lab_sites[lab_site].dns64_host == inventory_hostname }}"
+    dns64_addr: "{{ lab_sites[lab_site].dns64 }}"
+  tasks:
+    # --- DNS64: one resolver per site, on the first gateway of the site ---
+    - name: Install unbound
+      ansible.builtin.apt:
+        name: unbound
+        state: present
+      when: dns64_here
+
+    - name: Put the site DNS64 address on lo at boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-dns64-addr.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Lab DNS64 address on lo
+          Before=unbound.service frr.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/ip -6 addr replace {{ dns64_addr }}/128 dev lo
+          [Install]
+          WantedBy=multi-user.target
+      when: dns64_here
+
+    - name: Enable the DNS64 address unit
+      ansible.builtin.systemd_service:
+        name: lab-dns64-addr.service
+        enabled: true
+        daemon_reload: true
+      when: dns64_here
+
+    - name: Zone for the lab names
+      ansible.builtin.copy:
+        dest: /etc/unbound/lab.zone
+        mode: '0644'
+        content: |
+          $TTL 60
+          lab.          IN SOA ns.lab. hostmaster.lab. 1 3600 600 86400 60
+          lab.          IN NS   ns.lab.
+          ns.lab.       IN AAAA {{ dns64_addr }}
+          internet.lab. IN A    203.0.113.42
+          v6.lab.       IN AAAA 2001:db8:cafe::1
+      when: dns64_here
+
+    - name: Configure unbound as DNS64
+      ansible.builtin.copy:
+        dest: /etc/unbound/unbound.conf.d/lab-dns64.conf
+        mode: '0644'
+        content: |
+          server:
+            interface: {{ dns64_addr }}
+            ip-freebind: yes
+            do-ip4: no
+            access-control: ::/0 refuse
+          {% for site in lab_sites.values() %}
+            access-control: {{ site.prefix }}::/48 allow
+          {% endfor %}
+            module-config: "dns64 iterator"
+            dns64-prefix: 64:ff9b::/96
+          auth-zone:
+            name: "lab."
+            zonefile: "/etc/unbound/lab.zone"
+            for-upstream: yes
+            for-downstream: no
+            fallback-enabled: no
+      when: dns64_here
+
+    - name: Announce the DNS64 address by BGP
+      ansible.builtin.lineinfile:
+        path: /etc/frr/frr.conf
+        insertafter: '^\s+network {{ wg_gateway_v6 }}/128'
+        line: "    network {{ dns64_addr }}/128"
+      when: dns64_here
+
+    - name: Let DNS in through the gateway firewall
+      ansible.builtin.lineinfile:
+        path: /etc/nftables.conf
+        insertbefore: '^\s+tcp dport \{ 80, 443 \} counter accept'
+        firstmatch: true
+        line: "        meta l4proto {tcp, udp} th dport 53 counter accept"
+      when: dns64_here
+
+    # --- Broker: per-site prefixes and primary_site ---
+    - name: Stop the broker while its state changes
+      ansible.builtin.systemd_service:
+        name: wgkex-broker.service
+        state: stopped
+      when: inventory_hostname in groups['Brokers']
+
+    - name: Allocate the node /63s from the Parker prefix of the home site
+      ansible.builtin.copy:
+        dest: "{{ wgkex_ipam_file }}"
+        mode: '0640'
+        content: |
+          {"parent_prefix": "{{ lab_sites[lab_default_primary].parker_prefix }}", "ranges": {}, "concentrators": {}}
+      when: inventory_hostname in groups['Brokers']
+
+    - name: Add the lab_multipop block to the broker config
+      ansible.builtin.blockinfile:
+        path: "{{ wgkex_config }}"
+        marker: "# {mark} LAB PROTOTYPE multi-PoP active/standby"
+        block: |
+          lab_multipop:
+            home_site: {{ lab_default_primary }}
+            default_primary: {{ lab_default_primary }}
+            primary_site_by_source:
+          {% for ip, site in lab_primary_site_by_source.items() %}
+              {{ ip }}: {{ site }}
+          {% endfor %}
+            sites:
+          {% for name, site in lab_sites.items() %}
+              {{ name }}:
+                parker_prefix: {{ site.parker_prefix }}
+                dns64: {{ site.dns64 }}
+          {% endfor %}
+      when: inventory_hostname in groups['Brokers']

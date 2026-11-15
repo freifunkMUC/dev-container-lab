@@ -1,3 +1,8 @@
+> **Branch `multipop-active-standby`:** this branch runs the multi-PoP
+> design with active/standby sites (two sites, two homes). Read
+> [MULTIPOP-AS.md](MULTIPOP-AS.md) first. The text below is for the
+> single-site lab.
+
 ## Overview
 
 This lab setup deploys a full Parker-style network, consisting of:

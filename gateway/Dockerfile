@@ -1,7 +1,6 @@
 FROM debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG DISK_SIZE=10G
 
 RUN apt-get update -qy \
    && apt-get install -y \
@@ -23,8 +22,6 @@ RUN apt-get update -qy \
 ARG IMAGE
 COPY $IMAGE* /
 COPY *.py /
-
-RUN qemu-img resize /${IMAGE} ${DISK_SIZE}
 
 EXPOSE 22 5000 10000-10099
 HEALTHCHECK CMD ["/healthcheck.py"]

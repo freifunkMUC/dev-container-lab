@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# LAB PROTOTYPE: replaces the stock gluon-radvd init. Not upstream firmware.
+# One uradvd per site, with the arguments parker-as writes into
+# /tmp/parker-as/radvd.<site>. Without such files: the stock single uradvd.
+# shellcheck disable=SC2034,SC2046
+START=50
+USE_PROCD=1
+
+start_service() {
+  found=0
+  for f in /tmp/parker-as/radvd.*; do
+    [ -r "$f" ] || continue
+    found=1
+    procd_open_instance "${f##*/}"
+    procd_set_param command /usr/sbin/uradvd $(cat "$f")
+    procd_set_param respawn
+    procd_close_instance
+  done
+  if [ "$found" = 0 ]; then
+    procd_open_instance
+    procd_set_param command /usr/sbin/uradvd $(/lib/gluon/radvd/arguments)
+    procd_set_param respawn
+    procd_close_instance
+  fi
+}

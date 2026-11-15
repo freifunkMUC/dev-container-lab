@@ -22,14 +22,18 @@ fi
 mkdir -p gateway/packer/wgkex-src
 tar -C "${WGKEX_SRC}" --exclude=.git --exclude=bazel-\* -cf - . \
 	| tar -C gateway/packer/wgkex-src -xf -
+# Multi-PoP active/standby lab: per-site prefixes and primary_site in the
+# broker answer. LAB PROTOTYPE, see gateway/packer/multipop/.
+patch -d gateway/packer/wgkex-src -p1 < gateway/packer/multipop/wgkex-multipop.patch
 
 pushd gateway/packer
 ./build.sh
 popd
 
-docker build --build-arg IMAGE=parker-gw01.qcow2 gateway -t ffmuc-lab:gateway-parker-gw01
-docker build --build-arg IMAGE=parker-gw02.qcow2 gateway -t ffmuc-lab:gateway-parker-gw02
-docker build --build-arg IMAGE=parker-gw03.qcow2 gateway -t ffmuc-lab:gateway-parker-gw03
-docker build --build-arg IMAGE=parker-gw04.qcow2 gateway -t ffmuc-lab:gateway-parker-gw04
+# Resize on the host: a resize in the Dockerfile stores the image twice.
+for gw in parker-gw01 parker-gw02 parker-gw03 parker-gw04; do
+	qemu-img resize "gateway/${gw}.qcow2" "${GATEWAY_DISK_SIZE:-10G}"
+	docker build --build-arg IMAGE="${gw}.qcow2" gateway -t "ffmuc-lab:gateway-${gw}"
+done
 
 docker build toolbox -t ffmuc-lab:toolbox

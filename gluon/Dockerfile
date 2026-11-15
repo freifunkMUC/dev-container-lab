@@ -34,6 +34,8 @@ RUN apt-get update -qy \
 
 COPY --from=img-convert /gluon.qcow2 .
 COPY *.py /
+# LAB PROTOTYPE files for the multi-PoP active/standby lab, see launch.py.
+COPY lab-prototype /lab-prototype
 
 EXPOSE 22 5000 10000-10099
 HEALTHCHECK CMD ["/healthcheck.py"]

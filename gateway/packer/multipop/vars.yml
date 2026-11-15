@@ -1,0 +1,32 @@
+---
+# Multi-PoP active/standby lab: two sites, each with its own /48.
+# Passed with --extra-vars, so these values override ffbs-ansible.
+# Per-host values are looked up by inventory_hostname.
+
+lab_site_of:
+  parker-gw01: muc
+  parker-gw02: muc
+  parker-gw03: vie
+  parker-gw04: vie
+
+lab_sites:
+  muc:
+    prefix: '2001:db8:100'
+    parker_prefix: '2001:db8:100:4000::/50'
+    dns64: '2001:db8:100::53'
+    dns64_host: parker-gw01
+  vie:
+    prefix: '2001:db8:200'
+    parker_prefix: '2001:db8:200:4000::/50'
+    dns64: '2001:db8:200::53'
+    dns64_host: parker-gw03
+
+# The broker knows a node by the public IPv4 of its home (the CPE WAN).
+lab_primary_site_by_source:
+  203.0.113.1: muc
+  203.0.113.5: vie
+lab_default_primary: muc
+
+lab_site: "{{ lab_site_of[inventory_hostname] }}"
+wgkex_pop: "{{ lab_site_of[inventory_hostname] }}"
+global_ipv6_range_without_prefix: "{{ lab_sites[lab_site_of[inventory_hostname]].prefix }}"

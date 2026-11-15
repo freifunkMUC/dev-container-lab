@@ -1,0 +1,250 @@
+diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
+index 86a22d1..1e338ec 100644
+--- a/wgkex/broker/app.py
++++ b/wgkex/broker/app.py
+@@ -2,6 +2,7 @@
+ """wgkex broker"""
+ 
+ import dataclasses
++import ipaddress
+ import json
+ import random
+ import signal
+@@ -18,6 +19,7 @@ from flask.app import Flask as Flask_app
+ from flask_mqtt import Mqtt
+ from waitress import serve
+ 
++from wgkex.broker import lab_multipop
+ from wgkex.broker.ipam import ParkerIPAM
+ from wgkex.broker.ipam_netbox import NetboxIPAM
+ from wgkex.broker.ipam_json import JSONFileIPAM
+@@ -314,6 +316,16 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+     range6 = next(ranges)
+     xlat_range6 = next(ranges)
+ 
++    # LAB PROTOTYPE (multi-PoP active/standby): one /63 per site.
++    lab = lab_multipop.settings(config.get_config().get("lab_multipop"))
++    lab_ranges = lab_multipop.site_ranges(lab, full_range6) if lab else {}
++
++    def worker_range6(name: str) -> str:
++        cfg = config.get_config().workers.get(name)
++        if cfg is not None and cfg.pop in lab_ranges:
++            return str(lab_ranges[cfg.pop])
++        return str(full_range6)
++
+     logger.info(f"wg_api_v3_key_exchange: Key:{req_data.pubkey}")
+ 
+     domain = "parker"
+@@ -399,7 +411,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+     for worker in selected_workers:
+         mqtt.publish(
+             f"parker/wireguard/{worker.name}",
+-            json.dumps(mqtt_data).encode("utf-8"),
++            json.dumps({**mqtt_data, "Range6": worker_range6(worker.name)}).encode(
++                "utf-8"
++            ),
+         )
+ 
+     # A de-selected worker would keep the node's peer and prefix route until
+@@ -413,7 +427,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+             continue
+         mqtt.publish(
+             f"parker/wireguard/{previous_name}",
+-            json.dumps({**mqtt_data, "Remove": True}).encode("utf-8"),
++            json.dumps(
++                {**mqtt_data, "Range6": worker_range6(previous_name), "Remove": True}
++            ).encode("utf-8"),
+         )
+ 
+     ipam.update_prefix(
+@@ -423,6 +439,22 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+         [w.name for w in selected_workers],
+     )
+ 
++    lab_fields: Dict[str, Any] = {}
++    if lab:
++        primary = lab_multipop.primary_site(
++            lab, request.headers.get("X-Real-IP", request.remote_addr)
++        )
++        concentrator_by_site = {}
++        for w in selected_workers:
++            cfg = config.get_config().workers.get(w.name)
++            if cfg is not None:
++                concentrator_by_site[cfg.pop] = w.id
++        sites = lab_multipop.sites_field(lab, lab_ranges, concentrator_by_site)
++        if primary in sites:
++            range6 = ipaddress.IPv6Network(sites[primary]["range6"])
++            xlat_range6 = ipaddress.IPv6Network(sites[primary]["xlat_range6"])
++            lab_fields = {"primary_site": primary, "sites": sites}
++
+     response = ParkerResponse(
+         nonce=req_data.nonce,
+         time=int(datetime.now(tz=timezone.utc).timestamp()),
+@@ -434,7 +466,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+         concentrators=concentrators,
+     )
+ 
+-    data = json.dumps(dataclasses.asdict(response)).encode("utf-8") + "\n".encode(
++    data = json.dumps({**dataclasses.asdict(response), **lab_fields}).encode(
++        "utf-8"
++    ) + "\n".encode(
+         "utf-8"
+     )
+     if config.get_config().broker_signing_key is None:
+diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
+index ec49134..e285abb 100644
+--- a/wgkex/broker/app_test.py
++++ b/wgkex/broker/app_test.py
+@@ -593,6 +593,78 @@ class TestBrokerApp(unittest.TestCase):
+             self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
+             self.assertEqual(payload["Range6"], "2001:db8:42::/63")
+ 
++    def test_parker_exchange_lab_multipop_sites(self):
++        cfg = _parker_config()
++        cfg.workers = config.Workers.from_dict(
++            {"gw01": {"id": 1, "pop": "muc"}, "gw03": {"id": 3, "pop": "vie"}}, 10
++        )
++        cfg.raw["lab_multipop"] = {
++            "home_site": "muc",
++            "default_primary": "muc",
++            "primary_site_by_source": {"203.0.113.5": "vie"},
++            "sites": {
++                "muc": {"parker_prefix": "2001:db8:100:4000::/50", "dns64": "2001:db8:100::53"},
++                "vie": {"parker_prefix": "2001:db8:200:4000::/50", "dns64": "2001:db8:200::53"},
++            },
++        }
++        ipam = mock.MagicMock()
++        ipam.get_or_allocate_prefix.return_value = (
++            None,
++            ipaddress.IPv6Network("2001:db8:100:4002::/63"),
++            [],
++        )
++        for name in ("gw01", "gw03"):
++            self.broker_app.parker_worker_data[name] = {
++                "LinkAddress": "fe80::1",
++                "ExternalAddress": f"{name}.example",
++                "Port": 10000,
++                "PublicKey": f"{name}-key",
++            }
++        workers = [
++            self.broker_app.WorkerResult(name="gw01", id=1, diff=0, peers=0, target=0),
++            self.broker_app.WorkerResult(name="gw03", id=3, diff=0, peers=0, target=0),
++        ]
++
++        with (
++            mock.patch.object(self.broker_app.config, "get_config", return_value=cfg),
++            mock.patch.object(self.broker_app, "ipam", ipam),
++            mock.patch.object(self.broker_app, "mqtt") as mqtt,
++            mock.patch.object(
++                self.broker_app.parker_worker_metrics,
++                "get_best_workers",
++                return_value=workers,
++            ),
++            mock.patch.object(
++                self.broker_app, "sign_response", return_value=b"signature"
++            ),
++        ):
++            response = self.broker_app.app.test_client().get(
++                "/config",
++                query_string={"pubkey": _PUBLIC_KEY, "nonce": "nonce"},
++                headers={"X-Real-IP": "203.0.113.5"},
++            )
++
++        self.assertEqual(response.status_code, 200)
++        published = {
++            call.args[0]: json.loads(call.args[1])["Range6"]
++            for call in mqtt.publish.call_args_list
++        }
++        self.assertEqual(
++            published,
++            {
++                "parker/wireguard/gw01": "2001:db8:100:4002::/63",
++                "parker/wireguard/gw03": "2001:db8:200:4002::/63",
++            },
++        )
++        body = json.loads(response.data.split(b"\n")[0])
++        self.assertEqual(body["primary_site"], "vie")
++        self.assertEqual(body["range6"], "2001:db8:200:4002::/64")
++        self.assertEqual(body["xlat_range6"], "2001:db8:200:4003::/64")
++        self.assertEqual(body["sites"]["muc"]["concentrator"], 1)
++        self.assertEqual(body["sites"]["vie"]["concentrator"], 3)
++        self.assertEqual(body["sites"]["muc"]["address6"], "2001:db8:100:4002::1")
++        self.assertEqual(body["sites"]["vie"]["dns64"], "2001:db8:200::53")
++
+     def test_parker_exchange_removes_peer_from_deselected_workers(self):
+         cfg = _parker_config()
+         cfg.workers = config.Workers.from_dict(
+diff --git a/wgkex/broker/lab_multipop.py b/wgkex/broker/lab_multipop.py
+new file mode 100644
+index 0000000..5dced8d
+--- /dev/null
++++ b/wgkex/broker/lab_multipop.py
+@@ -0,0 +1,68 @@
++"""LAB PROTOTYPE: multi-PoP active/standby fields for the Parker config.
++
++Only used by dev-container-lab (branch multipop-active-standby). It reads the
++optional `lab_multipop` block of the config file:
++
++    lab_multipop:
++      home_site: muc            # the site the IPAM parent prefix belongs to
++      default_primary: muc
++      primary_site_by_source:   # node public source IP -> primary site
++        203.0.113.5: vie
++      sites:
++        muc: {parker_prefix: 2001:db8:100:4000::/50, dns64: 2001:db8:100::53}
++        vie: {parker_prefix: 2001:db8:200:4000::/50, dns64: 2001:db8:200::53}
++
++Every node gets the same /63 offset in each site's Parker prefix. A worker's
++PoP name is its site name.
++"""
++
++import ipaddress
++from typing import Any, Dict, Optional
++
++
++def settings(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
++    if not raw or not raw.get("sites"):
++        return None
++    return raw
++
++
++def site_ranges(
++    lab: Dict[str, Any], full_range6: ipaddress.IPv6Network
++) -> Dict[str, ipaddress.IPv6Network]:
++    """The node's /63 in every site, at the offset it has in the home site."""
++    home = ipaddress.IPv6Network(lab["sites"][lab["home_site"]]["parker_prefix"])
++    offset = int(full_range6.network_address) - int(home.network_address)
++    result = {}
++    for name, site in lab["sites"].items():
++        parent = ipaddress.IPv6Network(site["parker_prefix"])
++        result[name] = ipaddress.IPv6Network(
++            (int(parent.network_address) + offset, full_range6.prefixlen)
++        )
++    return result
++
++
++def primary_site(lab: Dict[str, Any], source_ip: Optional[str]) -> str:
++    by_source = lab.get("primary_site_by_source") or {}
++    return str(by_source.get(source_ip, lab.get("default_primary", lab["home_site"])))
++
++
++def sites_field(
++    lab: Dict[str, Any],
++    ranges: Dict[str, ipaddress.IPv6Network],
++    concentrator_by_site: Dict[str, int],
++) -> Dict[str, Dict[str, Any]]:
++    result = {}
++    for name, net in ranges.items():
++        subnets = net.subnets(new_prefix=64)
++        range6 = next(subnets)
++        xlat_range6 = next(subnets)
++        entry: Dict[str, Any] = {
++            "range6": str(range6),
++            "xlat_range6": str(xlat_range6),
++            "address6": str(range6.network_address + 1),
++            "dns64": lab["sites"][name].get("dns64"),
++        }
++        if name in concentrator_by_site:
++            entry["concentrator"] = concentrator_by_site[name]
++        result[name] = entry
++    return result

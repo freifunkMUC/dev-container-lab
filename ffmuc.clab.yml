@@ -1,4 +1,11 @@
-name: ffmuc
+# Multi-PoP active/standby lab. Its own name, management network and host
+# bridges (prefix "as-"), so it can run next to the active/active lab.
+name: ffmuc-mp-as
+
+mgmt:
+  network: ffmuc-mp-as
+  ipv4-subnet: 172.20.40.0/24
+  ipv6-subnet: 3fff:172:20:40::/64
 
 topology:
   nodes:
@@ -31,8 +38,7 @@ topology:
         # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
         # replacing the production key the image was built with.
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
-        MESHONWAN: "1"
-    ap-1-lan:
+    as-ap1-lan:
       kind: bridge
     # Two clients connected to the AP. They just run DHCP.
     client-1:
@@ -49,9 +55,9 @@ topology:
       cmd: /entrypoint.sh
       binds:
         - client/entrypoint.sh:/entrypoint.sh
-    # The CPE ("home router") both APs are connected to.
+    # The CPE ("home router") of home 1.
     # Has a IPv4-only connection to the internet, and provides the usual
-    # home network connectivity (DHCP server, NAT to public IP) to the APs.
+    # home network connectivity (DHCP server, NAT to public IP) to the AP.
     cpe-1:
       kind: linux
       network-mode: none
@@ -62,12 +68,25 @@ topology:
         WAN_GW4: 203.0.113.2
       binds:
         - cpe/entrypoint.sh:/entrypoint.sh
-    # The LAN of the home. Both APs hang off it with their WAN port, which is
-    # what lets them mesh with each other over it.
-    home-lan:
+    as-home1:
       kind: bridge
 
-    # The second AP, in the same home as the first one and with its own clients
+    # The CPE of home 2. A second public IPv4 lets the broker give AP-2 a
+    # different primary site (VIE).
+    cpe-2:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      env:
+        WAN_IP4: 203.0.113.5/30
+        WAN_GW4: 203.0.113.6
+      binds:
+        - cpe/entrypoint.sh:/entrypoint.sh
+    as-home2:
+      kind: bridge
+
+    # The second AP, in home 2, with its own clients. Primary site VIE.
     ap-2:
       kind: generic_vm
       network-mode: none
@@ -78,8 +97,7 @@ topology:
           ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
         CONFIGSERVER: 198.51.100.1
         CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
-        MESHONWAN: "1"
-    ap-2-lan:
+    as-ap2-lan:
       kind: bridge
     client-3:
       kind: linux
@@ -96,9 +114,10 @@ topology:
       binds:
         - client/entrypoint.sh:/entrypoint.sh
 
-    # The four gateways. Announce their public IPv4 and the IPv6 prefix to the
-    # internet and terminate WireGuard. Route IPv6 directly and offer NAT64 for
-    # the client IPv4 the APs translate. The first one also serves the config.
+    # The four gateways in two sites: gw01/gw02 = MUC (2001:db8:100::/48),
+    # gw03/gw04 = VIE (2001:db8:200::/48). Each announces its site /48, its
+    # public IPv4 and its NAT64 IPv4 to the internet and terminates WireGuard.
+    # gw01 and gw03 run the DNS64 of their site. gw01 also serves the config.
     gateway-gw01:
       kind: generic_vm
       network-mode: none
@@ -115,27 +134,29 @@ topology:
       kind: generic_vm
       network-mode: none
       image: ffmuc-lab:gateway-parker-gw04
-    gateway-vpn:
+    as-gw-vpn:
       kind: bridge
 
   links:
-    - endpoints: ["ap-1:eth1", "ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
-    - endpoints: ["ap-1:eth2", "home-lan:ap-1-wan"]     # AP-1 WAN interface, goes to the home LAN
-    - endpoints: ["client-1:lan", "ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
-    - endpoints: ["client-2:lan", "ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
-    - endpoints: ["cpe-1:lan", "home-lan:cpe-1-lan"]    # CPE-1 LAN interface, goes to the home LAN
+    - endpoints: ["ap-1:eth1", "as-ap1-lan:ap-1"]       # AP-1 LAN interface
+    - endpoints: ["ap-1:eth2", "as-home1:ap-1-wan"]     # AP-1 WAN interface, goes to home 1
+    - endpoints: ["client-1:lan", "as-ap1-lan:client1"]
+    - endpoints: ["client-2:lan", "as-ap1-lan:client2"]
+    - endpoints: ["cpe-1:lan", "as-home1:cpe-1-lan"]
     - endpoints: ["cpe-1:wan", "internet:cpe1"]         # CPE-1 internet uplink
 
-    - endpoints: ["ap-2:eth1", "ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
-    - endpoints: ["ap-2:eth2", "home-lan:ap-2-wan"]     # AP-2 WAN interface, goes to the same home LAN
-    - endpoints: ["client-3:lan", "ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
-    - endpoints: ["client-4:lan", "ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth1", "as-ap2-lan:ap-2"]       # AP-2 LAN interface
+    - endpoints: ["ap-2:eth2", "as-home2:ap-2-wan"]     # AP-2 WAN interface, goes to home 2
+    - endpoints: ["client-3:lan", "as-ap2-lan:client3"]
+    - endpoints: ["client-4:lan", "as-ap2-lan:client4"]
+    - endpoints: ["cpe-2:lan", "as-home2:cpe-2-lan"]
+    - endpoints: ["cpe-2:wan", "internet:cpe2"]         # CPE-2 internet uplink
 
     - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
     - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
     - endpoints: ["gateway-gw03:eth1", "internet:gw03"] # GW-03 internet uplink
     - endpoints: ["gateway-gw04:eth1", "internet:gw04"] # GW-04 internet uplink
-    - endpoints: ["gateway-gw01:eth2", "gateway-vpn:gw01"] # GW-01 VPN
-    - endpoints: ["gateway-gw02:eth2", "gateway-vpn:gw02"] # GW-02 VPN
-    - endpoints: ["gateway-gw03:eth2", "gateway-vpn:gw03"] # GW-03 VPN
-    - endpoints: ["gateway-gw04:eth2", "gateway-vpn:gw04"] # GW-04 VPN
+    - endpoints: ["gateway-gw01:eth2", "as-gw-vpn:gw01"] # GW-01 VPN (MQTT)
+    - endpoints: ["gateway-gw02:eth2", "as-gw-vpn:gw02"]
+    - endpoints: ["gateway-gw03:eth2", "as-gw-vpn:gw03"]
+    - endpoints: ["gateway-gw04:eth2", "as-gw-vpn:gw04"]

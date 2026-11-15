@@ -37,6 +37,26 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
+def prototype_cmds(root):
+    """Shell commands that copy the files below root onto the node."""
+    cmds = []
+    for dirpath, _, files in sorted(os.walk(root)):
+        for name in sorted(files):
+            src = os.path.join(dirpath, name)
+            dst = "/" + os.path.relpath(src, root)
+            cmds.append(f"mkdir -p {os.path.dirname(dst)} && : > {dst}")
+            with open(src) as f:
+                for line in f.read().splitlines():
+                    # No tabs: the console shell would complete on them.
+                    line = line.replace("\t", "    ").replace("'", "'\\''")
+                    cmds.append(f"printf '%s\\n' '{line}' >> {dst}")
+            if os.access(src, os.X_OK) or dst.startswith("/etc/init.d/"):
+                cmds.append(f"chmod +x {dst}")
+    if os.path.exists(os.path.join(root, "etc/init.d/parker-as")):
+        cmds.append("/etc/init.d/parker-as enable")
+    return cmds
+
+
 class Gluon_vm(vrnetlab.VM):
     def __init__(self, hostname):
         super().__init__('', '', disk_image='/gluon.qcow2', ram=512)
@@ -61,14 +81,9 @@ class Gluon_vm(vrnetlab.VM):
             redirect = ">" if n == 0 else ">>"
             cmds.append(f"echo '{key}' {redirect} /etc/dropbear/authorized_keys")
 
-        if os.environ.get("MESHONWAN", "") == "1":
-            # Mesh with the other APs on the LAN our WAN port hangs off. The
-            # role only turns into a network configuration once the upgrade
-            # scripts below have run.
-            cmds += [
-                "uci -q del_list gluon.iface_wan.role='mesh'",
-                "uci add_list gluon.iface_wan.role='mesh'",
-            ]
+        # LAB PROTOTYPE: multi-PoP active/standby node code, see
+        # /lab-prototype. Written over the serial console one line at a time.
+        cmds += prototype_cmds("/lab-prototype")
 
         # 906-parker-nodeconfig copies the config server and the key its
         # answers are verified with out of site.conf and into uci every time
