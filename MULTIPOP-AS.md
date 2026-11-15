@@ -191,6 +191,10 @@ tests, collects the logs and destroys the lab. The results go to
 `results/summary.json`. The exit code is 0 only when all tests pass.
 The tests take about 1.5 h.
 
+The four gateway disks (`gateway/parker-gw0X.qcow2`) are not in a Docker
+image. containerlab binds each disk read-only into its gateway container.
+Do not delete them while the lab runs.
+
 `summary.json` has the measured downtimes in `downtime`:
 
 - `ap`: seconds until the AP status shows the change: `intra_site_switch_s`,

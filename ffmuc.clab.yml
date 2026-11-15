@@ -178,19 +178,27 @@ topology:
     gateway-gw01:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw01
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw01.qcow2:/parker-gw01.qcow2:ro
     gateway-gw02:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw02
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw02.qcow2:/parker-gw02.qcow2:ro
     gateway-gw03:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw03
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw03.qcow2:/parker-gw03.qcow2:ro
     gateway-gw04:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw04
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw04.qcow2:/parker-gw04.qcow2:ro
     as-gw-vpn:
       kind: bridge
 

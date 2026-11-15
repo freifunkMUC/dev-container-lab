@@ -19,8 +19,9 @@ RUN apt-get update -qy \
    sshpass \
    && rm -rf /var/lib/apt/lists/*
 
-ARG IMAGE
-COPY $IMAGE* /
+# The gateway disk (qcow2) is not in the image. containerlab binds it
+# read-only to /<name>.qcow2, and qemu writes to an overlay in the container.
+# A copy in the image costs about 3 times the disk size during the build.
 COPY *.py /
 
 EXPOSE 22 5000 10000-10099

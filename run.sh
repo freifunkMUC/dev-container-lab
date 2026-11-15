@@ -113,9 +113,11 @@ build_images() {
 	# Headless packer, and no "reset" on a missing terminal.
 	sudo -E env TERM=dumb PACKER_ARGS="-var headless=true" PATH="${PATH}" \
 		./build.sh < /dev/null
+	# The gateways bind gateway/*.qcow2 at run time: keep them. Free the
+	# packer download cache and the build cache.
 	ls -l gateway/*.qcow2
-	# The images now hold the qcow2s; free the disk.
-	sudo rm -f gateway/*.qcow2
+	du -sh gateway/*.qcow2
+	sudo rm -rf gateway/packer/packer_cache
 	sudo docker builder prune -af >/dev/null
 	sudo docker images
 	df -h "${ROOT}" /var/lib

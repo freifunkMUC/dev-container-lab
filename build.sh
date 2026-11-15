@@ -37,10 +37,13 @@ pushd gateway/packer
 ./build.sh
 popd
 
-# Resize on the host: a resize in the Dockerfile stores the image twice.
+# One gateway image for all four. Each gateway disk stays in gateway/ and
+# ffmuc.clab.yml binds it into the container (read-only), so the disks are
+# never copied into an image or the build cache. Keep gateway/*.qcow2 while
+# the lab runs. The resize changes only the virtual size.
 for gw in parker-gw01 parker-gw02 parker-gw03 parker-gw04; do
 	qemu-img resize "gateway/${gw}.qcow2" "${GATEWAY_DISK_SIZE:-10G}"
-	docker build --build-arg IMAGE="${gw}.qcow2" gateway -t "ffmuc-lab:gateway-${gw}"
 done
+docker build gateway -t ffmuc-lab:gateway
 
 docker build toolbox -t ffmuc-lab:toolbox
