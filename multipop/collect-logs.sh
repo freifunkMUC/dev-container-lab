@@ -13,7 +13,7 @@ for c in $(sudo docker ps -a --format '{{.Names}}' | grep "^clab-${LAB}-"); do
 done
 
 for ap in ap-1 ap-2; do
-	./node-cmd.sh "${ap}" 'cat /tmp/multipop/status; cat /tmp/multipop/radvd/*; ip -6 addr; ip -6 rule; ip -6 route show table all; ip -4 route; ip6tables -S; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; logread' 60 \
+	./node-cmd.sh "${ap}" 'cat /tmp/multipop/status; cat /tmp/multipop/ra-state; ps w | grep [u]radvd; ip -6 addr; ip -6 rule; ip -6 route show table all; ip -4 route; ip6tables -S; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; logread' 60 \
 		> "${OUT}/${ap}.state.log" 2>&1
 done
 

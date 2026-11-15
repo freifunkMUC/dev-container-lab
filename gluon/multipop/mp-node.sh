@@ -9,9 +9,12 @@
 # - puts the /64 of each site on br-client and the site address on its tunnel,
 # - routes each client prefix only through the tunnel of its site,
 # - pings the gateway through each tunnel,
-# - lets one uradvd instance per site announce its prefix: preferred while
-#   the tunnel is up, preferred lifetime 0 while it is down, and not at all
-#   when it is down for longer than MP_WITHDRAW_AFTER seconds,
+# - writes the prefixes for the router advertisement to $ST/ra-state, for
+#   one patched uradvd (multipop/patches/uradvd.patch) that sends all of
+#   them in one RA: preferred while the tunnel is up, preferred lifetime 0
+#   while it is down, and not at all when it is down for longer than
+#   MP_WITHDRAW_AFTER seconds. The DNS64 of each live site goes in as RDNSS.
+#   uradvd re-reads the file on SIGHUP and does not restart,
 # - rejects client packets from a prefix whose tunnel is down with ICMPv6
 #   type 1 code 5 (source address failed ingress/egress policy),
 # - moves the IPv4 default route (the CLAT) off a dead tunnel,
@@ -33,7 +36,7 @@ log() { logger -t mp-node "$*"; }
 conc() { jsonfilter -i "$CONF" -e "@.concentrators[$1].$2" 2>/dev/null; }
 count() { echo $(($(cat "$ST/$1" 2>/dev/null || echo 0) + 1)) > "$ST/$1"; }
 
-mkdir -p "$ST/radvd"
+mkdir -p "$ST"
 ip6tables -N mp_reject 2>/dev/null
 
 tunnel() {
@@ -96,8 +99,8 @@ tunnel() {
 	down_for=$((now - $(cat "$ST/$ifc.down_since" 2>/dev/null || echo 0)))
 	announced=withdrawn
 	if [ "$state" = up ] || [ "$down_for" -lt "$WITHDRAW_AFTER" ]; then
-		echo "-i br-client -p $range6 ${dns:+--rdnss $dns} --pref64 64:ff9b::/96 $mtu" \
-			"--preferred-lifetime $preferred --valid-lifetime $VALID" > "$ST/radvd.next/$site"
+		echo "$range6,$preferred,$VALID" >> "$ST/ra-state.next"
+		[ "$state" = up ] && [ -n "$dns" ] && echo "rdnss $dns" >> "$ST/rdnss.next"
 		announced=$preferred
 	fi
 
@@ -136,15 +139,25 @@ move_ipv4() {
 	ip -6 route replace default via "$(conc $j address6)" dev "$new" proto 23
 }
 
+radvd_reload() {
+	# The uradvd that reads the state file only needs a SIGHUP. Any other
+	# uradvd (the Gluon one from before the first state) needs a restart.
+	for pid in $(pidof uradvd); do
+		if grep -q state-file "/proc/$pid/cmdline"; then
+			kill -HUP "$pid"
+			return
+		fi
+	done
+	/etc/init.d/gluon-radvd restart
+}
+
 cycle() {
 	[ -r "$CONF" ] || return
 	# Not a multi-site answer: leave everything to the firmware.
 	[ -n "$(conc 0 site)" ] || return
 	now=$(date +%s)
-	mtu=""
-	[ -r /tmp/adv_mtu ] && mtu="--adv-link-mtu $(cat /tmp/adv_mtu)"
-	rm -rf "$ST/radvd.next" "$ST/status.next"
-	mkdir -p "$ST/radvd.next"
+	rm -f "$ST/ra-state.next" "$ST/rdnss.next" "$ST/status.next"
+	touch "$ST/ra-state.next"
 	live=""
 	clat_changed=0
 
@@ -157,12 +170,12 @@ cycle() {
 	done
 	mv "$ST/status.next" "$ST/status" 2>/dev/null
 
-	if [ "$(cat "$ST"/radvd/* 2>/dev/null)" != "$(cat "$ST"/radvd.next/* 2>/dev/null)" ]; then
-		rm -rf "$ST/radvd"
-		mv "$ST/radvd.next" "$ST/radvd"
-		log "router advertisements: $(cat "$ST"/radvd/* | tr '\n' ';')"
-		/etc/init.d/gluon-radvd restart
-	fi
+	cat "$ST/rdnss.next" >> "$ST/ra-state.next" 2>/dev/null
+	cmp -s "$ST/ra-state.next" "$ST/ra-state" || {
+		mv "$ST/ra-state.next" "$ST/ra-state"
+		log "router advertisement: $(tr '\n' ';' < "$ST/ra-state")"
+		radvd_reload
+	}
 	[ "$clat_changed" = 1 ] && /etc/init.d/ebpf-clat restart
 	move_ipv4
 }

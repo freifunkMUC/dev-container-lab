@@ -6,6 +6,8 @@ cd "$(dirname "$0")"
 
 # Multi-PoP: per-site changes to the gateway submodules.
 ./multipop/apply-patches.sh
+# The gluon image builds the patched uradvd; its build context is gluon/.
+cp multipop/patches/uradvd.patch gluon/multipop/uradvd.patch
 
 docker build --build-arg IMAGE=gluon-ffmuc-*-x86-64*.img gluon -t ffmuc-lab:gluon
 

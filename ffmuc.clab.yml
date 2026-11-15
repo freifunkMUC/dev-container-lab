@@ -52,7 +52,7 @@ topology:
         MESHONWAN: "1"
     aa-ap-1-lan:
       kind: bridge
-    # Two clients connected to the AP. They just run DHCP.
+    # Two clients connected to the AP. One uses kernel SLAAC, one dhcpcd.
     client-1:
       kind: linux
       network-mode: none
@@ -65,6 +65,8 @@ topology:
       network-mode: none
       image: ffmuc-lab:toolbox
       cmd: /entrypoint.sh
+      env:
+        IPV6_CLIENT: dhcpcd   # dhcpcd does IPv6 here; the others use the kernel
       binds:
         - client/entrypoint.sh:/entrypoint.sh
     # The CPE ("home router") both APs are connected to.
@@ -111,6 +113,8 @@ topology:
       network-mode: none
       image: ffmuc-lab:toolbox
       cmd: /entrypoint.sh
+      env:
+        IPV6_CLIENT: dhcpcd   # dhcpcd does IPv6 here; the others use the kernel
       binds:
         - client/entrypoint.sh:/entrypoint.sh
 

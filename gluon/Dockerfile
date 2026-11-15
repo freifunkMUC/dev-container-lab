@@ -11,6 +11,19 @@ RUN qemu-img convert -O qcow2 /${IMAGE} /gluon.qcow2
 RUN qemu-img resize /gluon.qcow2 ${DISK_SIZE}
 
 
+# LAB PROTOTYPE: uradvd with one RA for all prefixes (multipop/patches).
+# launch.py copies it onto the node.
+FROM alpine:3.20 AS uradvd
+ARG URADVD_COMMIT=9c44a2cae9e3573047f152c716950807767a8da3
+RUN apk add --no-cache build-base linux-headers curl patch
+COPY multipop/uradvd.patch /
+RUN mkdir /src && cd /src \
+   && curl -sfL https://codeload.github.com/freifunkMUC/uradvd/tar.gz/${URADVD_COMMIT} | tar xz --strip-components 1 \
+   && patch -p1 < /uradvd.patch \
+   && gcc -Wall -Wextra -Werror -Os -static -DVERSION='"multipop"' -o /uradvd uradvd.c \
+   && strip /uradvd && gzip -9 /uradvd
+
+
 FROM debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -35,6 +48,7 @@ RUN apt-get update -qy \
 COPY --from=img-convert /gluon.qcow2 .
 COPY *.py /
 COPY multipop /multipop
+COPY --from=uradvd /uradvd.gz /multipop/uradvd.gz
 
 EXPOSE 22 5000 10000-10099
 HEALTHCHECK CMD ["/healthcheck.py"]

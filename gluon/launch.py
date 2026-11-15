@@ -70,7 +70,33 @@ def multipop_cmds():
             quoted = line.replace("'", "'\\''")
             cmds.append(f"printf '%s\\n' '{quoted}' >> {path}")
         cmds.append(f"chmod 755 {path}")
+    cmds += uradvd_cmds()
     cmds += [NODECONFIG_SED, "/etc/init.d/mp-node enable"]
+    return cmds
+
+
+# The node has no base64, so the patched uradvd goes over as hex lines, and
+# lua turns them back into bytes.
+URADVD_HEX_DECODE = (
+    "lua -e 'local d = io.open(\"/tmp/uradvd.hex\"):read(\"*a\"):gsub(\"%s\", \"\")"
+    ":gsub(\"%x%x\", function(h) return string.char(tonumber(h, 16)) end)"
+    " local f = io.open(\"/tmp/uradvd.gz\", \"wb\") f:write(d) f:close()'"
+)
+
+
+def uradvd_cmds():
+    path = os.path.join(MULTIPOP_DIR, "uradvd.gz")
+    if not os.path.isfile(path):
+        return []
+    with open(path, "rb") as f:
+        data = f.read().hex()
+    cmds = [": > /tmp/uradvd.hex"]
+    cmds += [f"echo {data[i:i + 400]} >> /tmp/uradvd.hex" for i in range(0, len(data), 400)]
+    cmds += [
+        URADVD_HEX_DECODE,
+        "gunzip -c /tmp/uradvd.gz > /usr/sbin/uradvd && chmod 755 /usr/sbin/uradvd",
+        "rm -f /tmp/uradvd.hex /tmp/uradvd.gz",
+    ]
     return cmds
 
 

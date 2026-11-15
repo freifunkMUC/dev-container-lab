@@ -15,3 +15,5 @@ clab-ffmuc-mp-aa
 results/
 .ffmuc.clab.yml.bak
 multipop/firmware/
+gluon/multipop/uradvd.patch
+__pycache__/

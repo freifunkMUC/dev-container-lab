@@ -45,8 +45,10 @@ The firmware does not have the multi-PoP functions yet. The lab adds them as
 the serial console. They are not production code.
 
 1. One WireGuard tunnel goes to each site.
-2. Both client prefixes go into the router advertisement (one uradvd instance
-   for each site).
+2. One uradvd sends one router advertisement with the prefixes of both sites.
+   Each prefix has its own lifetimes. `mp-node.sh` writes the prefixes to
+   `/tmp/multipop/ra-state` and sends SIGHUP to uradvd. uradvd does not
+   restart. The patch is `multipop/patches/uradvd.patch`.
 3. Source routing sends each prefix only into the tunnel of its site.
 4. The node pings the gateway through each tunnel. When a tunnel fails:
    - the node sends that prefix with preferred lifetime 0,
@@ -79,6 +81,10 @@ set `FIRMWARE=<path>`.
 | Test | What it shows |
 |---|---|
 | `normal.sh` | Each site announces only its prefixes. Each client has an address from each site. IPv6, DNS64 and NAT64 work through each site. IPv4 works through the CLAT. |
+| `ra-single.sh` | The node sends one RA with both prefixes. No client address becomes deprecated. client-2 and client-4 use dhcpcd for IPv6, the other clients use the kernel. |
 | `source-prefix.sh` | The source prefix that each client uses by default. |
 | `site-failure.sh` | Site B fails. The site B address becomes deprecated. Traffic from it is rejected. IPv4 moves to site A. The prefix is withdrawn and expires. |
 | `recovery.sh` | Site B comes back. The prefix is preferred again. IPv6, NAT64 and IPv4 work through site B. |
+
+`multipop/tests/uradvd-smoke.sh` tests the uradvd patch alone in a Docker
+container, without the lab.
