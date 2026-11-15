@@ -113,8 +113,9 @@ Findings for production:
    Each site table has `default dev wg_cX`.
 3. The IPv4 default route is on the tunnel of the active site. That
    selects the CLAT of that site.
-4. Every 1 s the AP sends an ICMPv6 echo to the link-local address of the
-   pgw, through wg_cX.
+4. Every 1 s the AP sends an ICMPv6 echo to the address of the current
+   pgw, through wg_cX. The reject rule lets this probe pass, also while
+   the site is down.
 5. When a pgw misses 3 probes (about 3 s), the AP moves the tunnel to the
    next pgw of the same site. The prefix stays preferred. The AP routes
    through the new pgw only after a fresh handshake. Then it reports the

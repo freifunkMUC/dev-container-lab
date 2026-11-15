@@ -11,8 +11,9 @@
 -- Tunnel wg_c<concentrator> goes to one pgw of the site at a time.
 --
 -- Health (per site, every tick): one ICMPv6 echo (1 s timeout) to the
--- link-local address of the pgw, sent out of wg_cX. All sites are probed at
--- the same time.
+-- address6 of the current pgw, sent out of wg_cX (wg-nodes on the pgw has no
+-- link-local address). The reject chain lets the probe pass also while the
+-- site is down. All sites are probed at the same time.
 --   * 3 misses in a row (about 3 s): switch wg_cX to the next pgw of the
 --     same site. The site stays up and its prefix stays preferred. After a
 --     fresh handshake with the new pgw, the node reports the switch to the
@@ -359,9 +360,17 @@ local function apply_rules(want)
 end
 
 local function apply_firewall(conf, names, up)
-  -- The pgw probe goes to a link-local address with the site address as
-  -- source. It must pass also while the site is down.
+  -- The pgw probe goes to the pgw address (wg-nodes has no link-local
+  -- address) with the site address as source. It must pass also while the
+  -- site is down, else a down site never comes up.
   local want = { "-N parker_src", "-A parker_src -d fe80::/10 -j RETURN" }
+  for _, name in ipairs(names) do
+    for _, pgw in ipairs(conf.sites[name].pgws or {}) do
+      if pgw.address6 then
+        table.insert(want, "-A parker_src -d " .. pgw.address6 .. " -j RETURN")
+      end
+    end
+  end
   for _, name in ipairs(names) do
     if not up[name] then
       table.insert(want, "-A parker_src -s " .. net63(conf.sites[name].range6)
@@ -496,6 +505,13 @@ apply = function(conf, names, db, iface, tbl, up, active, now)
       -- The site address as /128 on the tunnel: the probe source.
       sh("ip -6 addr replace " .. site.address6 .. "/128 dev " .. iface[name])
       sh("ip -6 route replace fe80::/64 dev " .. iface[name])
+      -- Probe targets: each pgw of the site through the site tunnel, also
+      -- while the main default route is on the other tunnel.
+      for _, pgw in ipairs(site.pgws or {}) do
+        if pgw.address6 then
+          sh("ip -6 route replace " .. pgw.address6 .. "/128 dev " .. iface[name])
+        end
+      end
       sh("ip -6 route replace default dev " .. iface[name] .. " src " .. site.address6
         .. " table " .. tbl[name])
       if site.dns64 then
