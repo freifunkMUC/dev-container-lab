@@ -1,0 +1,5 @@
+# EMQX as in production (emqx/emqx 5.8.x), plus "ip" for the lab address setup.
+FROM emqx/emqx:5.8.9
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+	&& rm -rf /var/lib/apt/lists/*

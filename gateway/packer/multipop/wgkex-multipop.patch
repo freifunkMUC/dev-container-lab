@@ -1,5 +1,5 @@
 diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
-index 86a22d1..418c124 100644
+index 86a22d1..b868ab5 100644
 --- a/wgkex/broker/app.py
 +++ b/wgkex/broker/app.py
 @@ -18,6 +18,7 @@ from flask.app import Flask as Flask_app
@@ -10,7 +10,20 @@ index 86a22d1..418c124 100644
  from wgkex.broker.ipam import ParkerIPAM
  from wgkex.broker.ipam_netbox import NetboxIPAM
  from wgkex.broker.ipam_json import JSONFileIPAM
-@@ -314,6 +315,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -89,6 +90,12 @@ def _load_parker_ipam() -> Optional[ParkerIPAM]:
+         return None
+ 
+     ipam: ParkerIPAM
++    # LAB PROTOTYPE (multi-PoP): several stateless brokers, see lab_multipop.py.
++    lab_ipam = lab_multipop.load_ipam(
++        lab_multipop.settings(config.get_config().get("lab_multipop"))
++    )
++    if lab_ipam is not None:
++        return lab_ipam
+     ipam_type = config.get_config().parker.ipam
+ 
+     match ipam_type:
+@@ -314,6 +321,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      range6 = next(ranges)
      xlat_range6 = next(ranges)
  
@@ -20,7 +33,7 @@ index 86a22d1..418c124 100644
      logger.info(f"wg_api_v3_key_exchange: Key:{req_data.pubkey}")
  
      domain = "parker"
-@@ -396,10 +400,59 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -396,10 +406,59 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          "Range6": str(full_range6),
          "Keepalive": None,  # TODO make configurable
      }
@@ -58,7 +71,7 @@ index 86a22d1..418c124 100644
 +            full_range6,
 +            multiprefix,
 +            lab_multipop.primary_site(
-+                lab, request.headers.get("X-Real-IP", request.remote_addr)
++                lab, lab_multipop.client_ip(lab, request.headers, request.remote_addr)
 +            ),
 +            lab_workers,
 +            [w.name for w in selected_workers],
@@ -83,7 +96,7 @@ index 86a22d1..418c124 100644
          )
  
      # A de-selected worker would keep the node's peer and prefix route until
-@@ -411,6 +464,8 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -411,6 +470,8 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      for previous_name in old_selected_concentrators:
          if previous_name in selected_names:
              continue
@@ -92,7 +105,7 @@ index 86a22d1..418c124 100644
          mqtt.publish(
              f"parker/wireguard/{previous_name}",
              json.dumps({**mqtt_data, "Remove": True}).encode("utf-8"),
-@@ -420,9 +475,11 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -420,9 +481,11 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          req_data.pubkey,
          not config.get_config().parker.xlat,
          True,
@@ -105,7 +118,7 @@ index 86a22d1..418c124 100644
      response = ParkerResponse(
          nonce=req_data.nonce,
          time=int(datetime.now(tz=timezone.utc).timestamp()),
-@@ -434,9 +491,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -434,9 +497,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          concentrators=concentrators,
      )
  
@@ -117,7 +130,7 @@ index 86a22d1..418c124 100644
      if config.get_config().broker_signing_key is None:
          logger.error(
              "Parker is enabled, but no broker_signing_key is set in the config file. Can't respond to key exchange."
-@@ -458,6 +515,38 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -458,6 +521,50 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      )
  
  
@@ -153,14 +166,41 @@ index 86a22d1..418c124 100644
 +    logger.info("lab switch: %s site=%s pgw=%s unroute=%s", pubkey, site, pgw, others)
 +    return {"unroute": others}, 200
 +
++
++@app.route("/api/v3/lab/health", methods=["GET"])
++def wg_api_v3_lab_health() -> Tuple[Response | Dict, int]:
++    """LAB PROTOTYPE (multi-PoP): haproxy health check.
++
++    A broker without MQTT cannot add peers or send an unroute, so it is down.
++    """
++    if not mqtt.connected:
++        return {"mqtt": False}, 503
++    return {"mqtt": True}, 200
++
++
  @mqtt.on_connect()
  def handle_mqtt_connect(
      client: mqtt_client.Client, userdata: bytes, flags: Any, rc: Any
+@@ -798,4 +905,13 @@ if __name__ == "__main__":
+         listen_host = listen_config.host
+         listen_port = listen_config.port
+ 
+-    serve(app, host=listen_host, port=listen_port)
++    # LAB PROTOTYPE (multi-PoP): waitress drops X-Forwarded-For from
++    # untrusted peers and trusts only one proxy address. Keep the header;
++    # lab_multipop.client_ip trusts it only from the listed haproxies.
++    lab_cfg = lab_multipop.settings(config.get_config().get("lab_multipop"))
++    serve(
++        app,
++        host=listen_host,
++        port=listen_port,
++        clear_untrusted_proxy_headers=not (lab_cfg and lab_cfg.get("trusted_proxies")),
++    )
 diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
-index ec49134..66fd713 100644
+index ec49134..64f489f 100644
 --- a/wgkex/broker/app_test.py
 +++ b/wgkex/broker/app_test.py
-@@ -593,6 +593,157 @@ class TestBrokerApp(unittest.TestCase):
+@@ -593,6 +593,169 @@ class TestBrokerApp(unittest.TestCase):
              self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
              self.assertEqual(payload["Range6"], "2001:db8:42::/63")
  
@@ -179,6 +219,7 @@ index ec49134..66fd713 100644
 +            "home_site": "muc",
 +            "default_primary": "muc",
 +            "primary_site_by_source": {"203.0.113.5": "vie"},
++            "trusted_proxies": ["127.0.0.1"],
 +            "sites": {
 +                "muc": {"parker_prefix": "2001:db8:100:4000::/50", "dns64": "2001:db8:100::53", "tunnel_id": 1},
 +                "vie": {"parker_prefix": "2001:db8:200:4000::/50", "dns64": "2001:db8:200::53", "tunnel_id": 3},
@@ -224,7 +265,7 @@ index ec49134..66fd713 100644
 +            ),
 +        ):
 +            response = self.broker_app.app.test_client().get(
-+                "/config", query_string=query, headers={"X-Real-IP": "203.0.113.5"}
++                "/config", query_string=query, headers={"X-Forwarded-For": "203.0.113.5"}
 +            )
 +        self.assertEqual(response.status_code, 200)
 +        published = {}
@@ -250,14 +291,15 @@ index ec49134..66fd713 100644
 +        self.assertEqual(body["xlat_range6"], "2001:db8:200:4003::/64")
 +        self.assertEqual(
 +            sorted((c["id"], c["pubkey"]) for c in body["concentrators"]),
-+            [(1, "gw01-key"), (3, "gw04-key")],
++            [(1, "gw01-key"), (3, "gw03-key")],
 +        )
 +        vie = body["sites"]["vie"]
 +        self.assertEqual(vie["concentrator"], 3)
 +        self.assertEqual(vie["dns64"], "2001:db8:200::53")
++        # Stateless: the first pgw by name, not the stock selection (gw04).
 +        self.assertEqual(
 +            [(p["name"], p["preferred"]) for p in vie["pgws"]],
-+            [("gw03", False), ("gw04", True)],
++            [("gw03", True), ("gw04", False)],
 +        )
 +        self.assertEqual(body["sites"]["muc"]["address6"], "2001:db8:100:4002::1")
 +
@@ -274,6 +316,16 @@ index ec49134..66fd713 100644
 +        self.assertNotIn("primary_site", body)
 +        self.assertEqual(body["range6"], "2001:db8:200:4002::/64")
 +        self.assertEqual(sorted(c["id"] for c in body["concentrators"]), [3, 4])
++
++    def test_lab_health_follows_mqtt(self):
++        with mock.patch.object(self.broker_app, "mqtt") as mqtt:
++            client = self.broker_app.app.test_client()
++            mqtt.connected = False
++            down = client.get("/api/v3/lab/health")
++            mqtt.connected = True
++            up = client.get("/api/v3/lab/health")
++        self.assertEqual(down.status_code, 503)
++        self.assertEqual(up.status_code, 200)
 +
 +    def test_lab_switch_unroutes_other_pgws_of_the_site(self):
 +        cfg = _parker_config()
@@ -320,10 +372,10 @@ index ec49134..66fd713 100644
          cfg.workers = config.Workers.from_dict(
 diff --git a/wgkex/broker/lab_multipop.py b/wgkex/broker/lab_multipop.py
 new file mode 100644
-index 0000000..445283d
+index 0000000..1c800c4
 --- /dev/null
 +++ b/wgkex/broker/lab_multipop.py
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,208 @@
 +"""LAB PROTOTYPE: multi-PoP active/standby fields for the Parker config.
 +
 +Only used by dev-container-lab (branch multipop-active-standby). It reads the
@@ -338,17 +390,28 @@ index 0000000..445283d
 +        muc: {parker_prefix: 2001:db8:100:4000::/50, dns64: 2001:db8:100::53, tunnel_id: 1}
 +        vie: {parker_prefix: 2001:db8:200:4000::/50, dns64: 2001:db8:200::53, tunnel_id: 3}
 +      gate: {handshake_max_age: 180}   # worker side, see worker/lab_gate.py
++      stateless_ipam: true      # HashIPAM below instead of the JSON file
++      trusted_proxies: [198.51.100.66]  # haproxy, its X-Forwarded-For is used
 +
 +Every node gets the same /63 offset in each site's Parker prefix. A worker's
 +PoP name is its site name. A node that sends `caps=multiprefix` gets one
 +tunnel per site (id = the site tunnel_id) and the list of all pgws of each
 +site. Other nodes get only their primary site, as stock Parker config.
++
++The lab runs several brokers behind haproxy, as production does. A broker
++keeps no state of its own: the worker data comes from MQTT, the /63 comes
++from a hash of the public key (HashIPAM) and the preferred pgw of a site is
++the first online pgw by name. So every broker gives a node the same answer.
++Production uses NetBox as the shared IPAM instead.
 +"""
 +
 +import base64
 +import binascii
++import hashlib
 +import ipaddress
 +from typing import Any, Callable, Dict, List, Optional, Tuple
++
++from wgkex.broker.ipam import ParkerIPAM
 +
 +
 +def settings(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -372,6 +435,65 @@ index 0000000..445283d
 +    return result
 +
 +
++class HashIPAM(ParkerIPAM):
++    """Stateless IPAM: the /63 of a node is a hash of its public key.
++
++    The first /63 of the parent stays reserved, as in JSONFileIPAM. Two keys
++    can get the same /63; with 8191 /63s in a /50 that is unlikely for the
++    few nodes of the lab. It holds no concentrator selection.
++    """
++
++    def __init__(self, parent_prefix: str) -> None:
++        self.parent = ipaddress.IPv6Network(parent_prefix)
++
++    def get_or_allocate_prefix(
++        self,
++        pubkey: str,
++        ipv4: bool,
++        ipv6: bool,
++        ipv4_prefix_length: int = 22,
++        ipv6_prefix_length: int = 63,
++    ) -> Tuple[
++        Optional[ipaddress.IPv4Network], Optional[ipaddress.IPv6Network], List[str]
++    ]:
++        if ipv4:
++            raise NotImplementedError("Non-464XLAT mode not implemented in HashIPAM")
++        if not ipv6:
++            return None, None, []
++        slots = 2 ** (ipv6_prefix_length - self.parent.prefixlen)
++        digest = int.from_bytes(hashlib.sha256(pubkey.encode()).digest()[:8], "big")
++        index = 1 + digest % (slots - 1)
++        size = 2 ** (128 - ipv6_prefix_length)
++        return None, ipaddress.IPv6Network(
++            (int(self.parent.network_address) + index * size, ipv6_prefix_length)
++        ), []
++
++    def release_prefix(self, pubkey: str) -> None:
++        pass
++
++    def update_prefix(
++        self, pubkey: str, ipv4: bool, ipv6: bool, selected_concentrators: List[str]
++    ) -> None:
++        pass
++
++
++def load_ipam(lab: Optional[Dict[str, Any]]) -> Optional[ParkerIPAM]:
++    if not isinstance(lab, dict) or lab.get("stateless_ipam") is not True:
++        return None
++    return HashIPAM(lab["sites"][lab["home_site"]]["parker_prefix"])
++
++
++def client_ip(lab: Dict[str, Any], headers: Any, remote_addr: Optional[str]) -> Optional[str]:
++    """The node address: X-Forwarded-For from a trusted proxy, else the peer.
++
++    haproxy overwrites X-Forwarded-For, so the header holds one address.
++    """
++    forwarded = str(headers.get("X-Forwarded-For", "") or "")
++    if remote_addr in (lab.get("trusted_proxies") or []) and forwarded:
++        return forwarded.split(",")[-1].strip()
++    return remote_addr
++
++
 +def primary_site(lab: Dict[str, Any], source_ip: Optional[str]) -> str:
 +    by_source = lab.get("primary_site_by_source") or {}
 +    return str(by_source.get(source_ip, lab.get("default_primary", lab["home_site"])))
@@ -389,8 +511,10 @@ index 0000000..445283d
 +    """Build the lab answer.
 +
 +    workers: (name, site, worker id) of every online, configured worker.
-+    selected: names the stock selection picked (one per PoP); they become the
-+    preferred pgw of their site.
++    selected: names the stock selection picked (one per PoP). Not used: the
++    stock selection depends on the order the broker learned the workers in,
++    so two brokers can pick differently. The preferred pgw of a site is its
++    first online pgw by name.
 +    concentrator(name, id): the stock concentrator entry for a worker.
 +
 +    Returns concentrators, mqtt targets (name -> Range6), keep (worker names
@@ -403,10 +527,10 @@ index 0000000..445283d
 +    names = [primary] if not multiprefix else list(lab["sites"])
 +    for name in names:
 +        site_cfg = lab["sites"][name]
-+        pgws = [w for w in workers if w[1] == name]
++        pgws = sorted(w for w in workers if w[1] == name)
 +        if not pgws:
 +            continue
-+        preferred = next((w for w in pgws if w[0] in selected), pgws[0])
++        preferred = pgws[0]
 +        subnets = ranges[name].subnets(new_prefix=64)
 +        range6 = next(subnets)
 +        xlat_range6 = next(subnets)
@@ -460,6 +584,55 @@ index 0000000..445283d
 +def unroute_targets(worker_sites: Dict[str, Any], site: str, pgw: str) -> List[str]:
 +    """All pgws of `site` except the one the node uses now."""
 +    return sorted(n for n, s in worker_sites.items() if s == site and n != pgw)
+diff --git a/wgkex/broker/lab_multipop_test.py b/wgkex/broker/lab_multipop_test.py
+new file mode 100644
+index 0000000..65bb5a4
+--- /dev/null
++++ b/wgkex/broker/lab_multipop_test.py
+@@ -0,0 +1,43 @@
++import ipaddress
++import unittest
++
++from wgkex.broker import lab_multipop
++
++_LAB = {
++    "home_site": "muc",
++    "stateless_ipam": True,
++    "trusted_proxies": ["198.51.100.66"],
++    "sites": {"muc": {"parker_prefix": "2001:db8:100:4000::/50"}},
++}
++_KEY = "HCmk9FGT+iz27gS7HGE11Ai5Zwd4xe+hZcWgcUEPoSk="
++
++
++class TestLabMultipop(unittest.TestCase):
++    def test_hash_ipam_gives_every_broker_the_same_63(self):
++        a = lab_multipop.load_ipam(_LAB).get_or_allocate_prefix(_KEY, False, True)
++        b = lab_multipop.load_ipam(dict(_LAB)).get_or_allocate_prefix(_KEY, False, True)
++        self.assertEqual(a, b)
++        _, net, selected = a
++        parent = ipaddress.IPv6Network("2001:db8:100:4000::/50")
++        self.assertEqual(net.prefixlen, 63)
++        self.assertTrue(net.subnet_of(parent))
++        self.assertNotEqual(net.network_address, parent.network_address)
++        self.assertEqual(selected, [])
++        other = lab_multipop.load_ipam(_LAB).get_or_allocate_prefix(
++            "GNPCwrCQUZ+0cngV2R+jgTsCOj+eiMw0IXH6me6oLkI=", False, True
++        )[1]
++        self.assertNotEqual(net, other)
++
++    def test_no_hash_ipam_without_the_flag(self):
++        self.assertIsNone(lab_multipop.load_ipam({**_LAB, "stateless_ipam": False}))
++        self.assertIsNone(lab_multipop.load_ipam(None))
++
++    def test_client_ip_trusts_only_the_proxy(self):
++        headers = {"X-Forwarded-For": "203.0.113.5"}
++        self.assertEqual(lab_multipop.client_ip(_LAB, headers, "198.51.100.66"), "203.0.113.5")
++        self.assertEqual(lab_multipop.client_ip(_LAB, headers, "203.0.113.9"), "203.0.113.9")
++        self.assertEqual(lab_multipop.client_ip(_LAB, {}, "198.51.100.66"), "198.51.100.66")
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/wgkex/worker/app.py b/wgkex/worker/app.py
 index da74438..f4c4400 100644
 --- a/wgkex/worker/app.py

@@ -12,7 +12,7 @@ All addresses are documentation addresses. They are not FFMUC prefixes.
 ```mermaid
 flowchart LR
   subgraph MUC[Site MUC 2001:db8:100::/48]
-    gw01[gw01<br/>broker, DNS64]
+    gw01[gw01<br/>DNS64]
     gw02[gw02]
   end
   subgraph VIE[Site VIE 2001:db8:200::/48]
@@ -48,7 +48,58 @@ flowchart LR
   (`GET /api/v3/lab/switch`). The broker tells the other pgws of that site
   over MQTT (`LabUnroute`) to remove the node /63 at once. They keep the
   peer. The route comes back only after a new handshake. The 180 s limit
-  is only a safety net, for example when the broker is down.
+  is only a safety net, for example when no broker answers.
+
+## Broker plane
+
+The broker plane has the same layout as wgkex in production
+(ffmuc-salt-public `wgkex/`). It is in `multipop/brokers/`.
+
+```mermaid
+flowchart LR
+  ap[AP] -- broker.lab<br/>anycast .100 --> lbm & lbv
+  subgraph DCM[DC MUC]
+    lbm[haproxy] --> bm1[broker 1] & bm2[broker 2]
+    em1[EMQX 1] ~~~ em2[EMQX 2]
+  end
+  subgraph DCV[DC VIE]
+    lbv[haproxy] --> bv1[broker 1] & bv2[broker 2]
+    ev1[EMQX 1] ~~~ ev2[EMQX 2]
+  end
+  lbm -. health checks .-> bv1 & bv2
+  lbv -. health checks .-> bm1 & bm2
+  em1 & em2 <== one EMQX cluster ==> ev1 & ev2
+  gw[gw01..gw04 worker] -- mqtt.lab .101<br/>over the gateway VPN --> em1 & ev1
+```
+
+- Each site has 2 brokers, 2 EMQX 5.8 nodes, 1 haproxy and 1 DC router.
+  No part is behind a pgw.
+- The 4 EMQX nodes are one cluster (static seeds). Each broker uses the
+  EMQX node next to it.
+- The brokers keep no state of their own. The /63 of a node comes from a
+  hash of its public key. The pgw lists and `primary_site` come from the
+  config file. Worker state comes from MQTT. Thus all brokers give the
+  same answer.
+- `broker.lab` (198.51.100.100) is an anycast address. Each DC router
+  announces it over BGP while its haproxy is healthy (checked every 1 s).
+  The haproxy backend is all 4 brokers, with health checks. haproxy sets
+  `X-Forwarded-For`. The brokers trust it only from the haproxy addresses.
+- `mqtt.lab` (198.51.100.101) is an ECMP route on each DC router to the
+  healthy local EMQX nodes. The DC routers announce it to the gateways
+  over the gateway VPN, like `ov.ffmuc.net` in production. Thus the
+  workers reach MQTT also when a test cuts a gateway uplink.
+- The AP knows only the name `broker.lab`.
+
+Findings for production:
+
+- EMQX `dist_net_ticktime` is 2 min by default. In this time a dead EMQX
+  node stays in the cluster. A worker with a fixed client ID cannot
+  connect to another node ("failed_to_kick_session_on_remote_node").
+  The lab sets 10 s.
+- waitress 2.x removes `X-Forwarded-For` unless the peer is a trusted
+  proxy, and it trusts only one proxy address. The broker patch turns
+  this off when `trusted_proxies` is set and checks the proxy address
+  itself.
 
 ## How the AP works
 
@@ -117,10 +168,9 @@ client-2 and client-4 use dhcpcd for IPv6.
 
 - A site goes down without delay. Dwell and penalty delay only the way
   back.
-- The broker runs on gw01, and the AP reaches it through the gw01 uplink.
-  When gw01 fails, the report cannot go out. The old pgw then removes the
-  /63 after the 180 s safety net. In this time, inbound traffic can go to
-  the old pgw.
+- When no broker answers, the report cannot go out. The old pgw then
+  removes the /63 after the 180 s safety net. In this time, inbound
+  traffic can go to the old pgw.
 - `/api/v3/lab/switch` has no authentication (lab prototype). A false call
   removes the route of a node only until its next handshake.
 - The probe is ICMPv6 only. The AP does not use BFD.
@@ -178,8 +228,13 @@ tests/multipop_as.py normal       # one test
 | pmtu | DF packets through the tunnel of each site get the correct PMTU. |
 | old-firmware | AP 4 gets one site. IPv6 and IPv4 work. |
 | roam | client-1 moves from AP 1 to AP 3. It gets the AP 3 prefixes. Its old source gets ICMPv6 code 5. |
-| pgw-failure | One VIE pgw fails. The AP moves to the other pgw. The prefix stays preferred. The old pgw removes the /63 in less than 15 s. Client outage is measured. |
-| broker-down-pgw | The broker is stopped and a pgw fails. The AP still moves. The report waits for the broker. |
+| plane | The EMQX cluster has 4 nodes. All brokers and `broker.lab` are healthy. The gateways reach `mqtt.lab` over the VPN. |
+| pgw-failure | One VIE pgw fails (home 2). The AP moves to the other pgw. The prefix stays preferred. The old pgw removes the /63 in less than 15 s. Client outage is measured. |
+| pgw-failure-home1 | As above, for gw01 (home 1, MUC). |
+| plane-broker-down | broker-muc-1 is cut off. Then a pgw fails. The report goes through another broker. The old pgw removes the /63 in the normal limit. |
+| plane-emqx-down | As above, with emqx-muc-1 cut off. |
+| plane-haproxy-down | As above, with the MUC haproxy cut off. `broker.lab` moves to VIE. |
+| broker-down-pgw | All brokers are cut off and a pgw fails. The AP still moves. The report waits for a broker. |
 | site-failure-vie | Deprecation, source swap, ICMPv6 code 5, IPv4 failover, prefix removal. Client outage is measured. |
 | recovery-vie | The AP goes back to its primary site after dwell, with no hold-down. Client traffic does not stop. |
 | site-failure-long-muc | As above, and the dead address expires on the clients. |

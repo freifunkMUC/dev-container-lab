@@ -28,6 +28,11 @@ tar -C "${WGKEX_SRC}" --exclude=.git --exclude=bazel-\* -cf - . \
 # broker answer. LAB PROTOTYPE, see gateway/packer/multipop/.
 patch -d gateway/packer/wgkex-src -p1 < gateway/packer/multipop/wgkex-multipop.patch
 
+# Broker plane (multipop/brokers/): the stateless brokers run the same
+# patched source, and EMQX gets "ip" for the lab address setup.
+docker build -f multipop/brokers/Dockerfile gateway/packer/wgkex-src -t ffmuc-lab:broker
+docker build -f multipop/brokers/Dockerfile.emqx multipop/brokers -t ffmuc-lab:emqx
+
 pushd gateway/packer
 ./build.sh
 popd

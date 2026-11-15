@@ -111,4 +111,5 @@ and the BGP peering would need to be adjusted for the actual peer router.
   - Network container (sets up interfaces, firewall and routing)
   - Mgmt container (runs wgkex and MQTT)
 - Redraw `overview.svg`: one home with two meshing APs, and wgkex instead of etcd
-- Run a second wgkex broker so the lab survives gw01 going away
+- Run a second wgkex broker so the lab survives gw01 going away (done on
+  this branch, see the broker plane in MULTIPOP-AS.md)

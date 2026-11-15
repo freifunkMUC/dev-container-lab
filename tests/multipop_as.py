@@ -46,6 +46,18 @@ AP3 = {"ap": "ap-3", "clients": ["client-5"], "primary": "muc"}
 # AP-4: old firmware, home 2. The broker gives it one site.
 OLD = {"ap": "ap-4", "clients": ["client-6"], "site": "vie"}
 OTHER = {"muc": "vie", "vie": "muc"}
+# The broker plane (multipop/brokers), as the wgkex setup in production:
+# stateless brokers, one EMQX cluster, one haproxy per site on broker.lab.
+PLANE = {
+    "brokers": {"broker-muc-1": "198.51.100.67", "broker-muc-2": "198.51.100.68",
+                "broker-vie-1": "198.51.100.83", "broker-vie-2": "198.51.100.84"},
+    "emqx": ["emqx-muc-1", "emqx-muc-2", "emqx-vie-1", "emqx-vie-2"],
+    "lbs": ["lb-muc", "lb-vie"],
+}
+BROKER_LAB = "198.51.100.100"
+MQTT_LAB = "198.51.100.101"
+# MQTT keepalive 5 s and EMQX dist_net_ticktime 10 s, plus slack.
+PLANE_SETTLE = int(os.environ.get("PLANE_SETTLE", "30"))
 
 # Probe every 1 s, 3 misses per pgw, 2 pgws per site, plus slack.
 FAILOVER_TIMEOUT = int(os.environ.get("FAILOVER_TIMEOUT", "120"))
@@ -673,14 +685,55 @@ def pgw_routes(gw, net):
     return [line for line in out.splitlines() if line.startswith(net.split("/")[0])]
 
 
-def t_pgw_failure(c):
-    """One pgw of the primary site fails. The AP moves the tunnel to the
-    other pgw of the same site after 3 s. The prefix stays preferred all the
-    time. After the handshake the AP reports the switch, and the broker makes
-    the old pgw drop the /63 at once. Client traffic is measured.
-    Home 2 (VIE): the broker is on gw01, so it stays reachable."""
+def set_plane(ctr, state):
+    """Cut or restore the DC LAN link of a broker plane container."""
+    dx(ctr, f"ip link set eth1 {state}")
+
+
+def plane_health():
+    """Health of the broker plane, seen from the internet node and EMQX."""
+    _, out = dx("emqx-muc-1", "emqx ctl cluster status")
+    running = sorted(set(re.findall(r"emqx@[0-9.]+", out.split("stopped_nodes")[0])))
+    probes = " ; ".join(
+        f"echo {n} $(curl -s -o /dev/null -m 2 -w '%{{http_code}}' http://{ip}:5000/api/v3/lab/health)"
+        for n, ip in PLANE["brokers"].items())
+    probes += f" ; echo broker.lab $(curl -s -o /dev/null -m 2 -w '%{{http_code}}' http://{BROKER_LAB}/haproxy-health)"
+    _, out = run(inet_argv(probes), 60)
+    http = dict(line.split() for line in out.splitlines() if len(line.split()) == 2)
+    return running, http
+
+
+def reporters(since):
+    """The brokers that logged a switch report since the time stamp."""
+    names = []
+    for n in PLANE["brokers"]:
+        _, out = run(["sudo", "docker", "logs", "--since", since, f"clab-{LAB}-{n}"])
+        names += [n] * out.count("lab switch:")
+    return names
+
+
+def t_plane(c):
+    """The broker plane is complete: 4 EMQX nodes in one cluster, 4 healthy
+    brokers, broker.lab answers, and each gateway reaches mqtt.lab over the
+    gateway VPN (not over its uplink)."""
+    running, http = plane_health()
+    c.expect(len(running) == 4, f"EMQX cluster running nodes: {running}")
+    for n in list(PLANE["brokers"]) + ["broker.lab"]:
+        c.expect(http.get(n) == "200", f"{n} health: {http.get(n)}")
+    for gw in SITES["muc"]["gws"] + SITES["vie"]["gws"]:
+        _, out = vm(f"gateway-{gw}", f"ip route get {MQTT_LAB}", 20)
+        c.expect("dev vpn" in out, f"{gw} reaches mqtt.lab: {last(out)}")
+
+
+def pgw_switch(c, home_key, case):
+    """One pgw of the primary site of a home fails. The AP moves the tunnel to
+    the other pgw of the same site after 3 s. The prefix stays preferred all
+    the time. After the handshake the AP reports the switch through
+    broker.lab, and the old pgw drops the /63 at once. Client traffic is
+    measured. The cut pgw comes back at the end."""
     settle(c)
-    home, other = HOMES["home2"], HOMES["home1"]
+    home = HOMES[home_key]
+    other = next(h for k, h in HOMES.items() if k != home_key)
     ap, cl, site = home["ap"], home["clients"][0], home["primary"]
     st = ap_status(ap)
     old = st["sites"][site].get("pgw")
@@ -691,6 +744,7 @@ def t_pgw_failure(c):
     c.log(f"{old} routes {net}: {pgw_routes(old, net)}")
     clients = home["clients"] + other["clients"]
     mon_start(clients)
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     c.log(f"cut the uplink of {old} at {time.strftime('%H:%M:%S')}")
     set_link(old, "down")
     t0 = time.time()
@@ -712,6 +766,9 @@ def t_pgw_failure(c):
         ap_metric(c, "old_pgw_unroute_s", unroute)
         c.expect(gone is not None and unroute is not None and unroute <= UNROUTE_TIMEOUT,
                  f"{old} dropped {net} {unroute} s after the switch (limit {UNROUTE_TIMEOUT} s)")
+        st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", UNROUTE_TIMEOUT)
+        c.expect(st is not None, f"{ap} report to broker.lab done: {(st or ap_status(ap))['raw']}")
+        c.log(f"brokers that took the report: {reporters(since)}")
         if new:
             c.log(f"{new} routes {net}: {pgw_routes(new, net)}")
         a = client_addrs(cl)[site][0]
@@ -722,9 +779,9 @@ def t_pgw_failure(c):
             if not preferred(client_addrs(x), site):
                 not_preferred.add(x)
         time.sleep(5)
-        result = mon_stop(c, "pgw-switch", clients, t0)
-        expect_traffic(c, "pgw-switch", {x: result[x] for x in home["clients"]}, GAP_PGW)
-        expect_traffic(c, "pgw-switch other home", {x: result[x] for x in other["clients"]}, GAP_BACK)
+        result = mon_stop(c, case, clients, t0)
+        expect_traffic(c, case, {x: result[x] for x in home["clients"]}, GAP_PGW)
+        expect_traffic(c, f"{case} other home", {x: result[x] for x in other["clients"]}, GAP_BACK)
         c.expect(not not_preferred, f"{site} prefix stayed preferred and the site stayed up {sorted(not_preferred)}")
         check_source(c, home, site)
     finally:
@@ -732,15 +789,39 @@ def t_pgw_failure(c):
         c.log(f"restored the uplink of {old}")
 
 
+def t_pgw_failure(c, home_key):
+    pgw_switch(c, home_key, "pgw-switch")
+
+
+def t_plane_failure(c, ctr, home_key="home1"):
+    """One part of the broker plane fails (a broker, an EMQX node or the
+    haproxy of a site). Then a pgw fails: the report still reaches a broker,
+    and the old pgw drops the /63 within the normal limit."""
+    c.log(f"cut {ctr} at {time.strftime('%H:%M:%S')}")
+    set_plane(ctr, "down")
+    try:
+        time.sleep(PLANE_SETTLE)
+        running, http = plane_health()
+        c.log(f"plane after the cut: EMQX {running}, health {http}")
+        c.expect(http.get("broker.lab") == "200", f"broker.lab still answers with {ctr} down")
+        pgw_switch(c, home_key, f"plane-{ctr}")
+    finally:
+        set_plane(ctr, "up")
+        ok = wait_for(lambda: (lambda r, h: len(r) == 4 and all(v == "200" for v in h.values())
+                               and len(h) == 5)(*plane_health()), 120, step=5)
+        c.log(f"{ctr} restored, plane complete: {bool(ok)}")
+
+
 def t_broker_down_pgw(c):
-    """The broker is down and a pgw fails. The node still moves to the other
-    pgw of the site: every pgw has the peer already. The report to the broker
-    waits; the old pgw drops the route after the 180 s handshake age."""
+    """All brokers are down and a pgw fails. The node still moves to the
+    other pgw of the site: every pgw has the peer already. The report waits
+    until a broker is back."""
     settle(c)
     home = HOMES["home2"]
     ap, site = home["ap"], home["primary"]
-    _, out = vm("gateway-gw01", "systemctl stop wgkex-broker; systemctl is-active wgkex-broker", 40)
-    c.log(f"gw01 wgkex-broker: {out.strip()}")
+    for n in PLANE["brokers"]:
+        set_plane(n, "down")
+    c.log(f"all brokers cut, plane health: {plane_health()[1]}")
     try:
         old = ap_status(ap)["sites"][site].get("pgw")
         if not c.expect(old in SITES[site]["gws"], f"{ap} uses pgw {old} for {site}"):
@@ -751,7 +832,7 @@ def t_broker_down_pgw(c):
         st = wait_status(ap, lambda s: s["sites"][site].get("pgw") not in (old, "?") and
                          s["sites"][site].get("fresh") == "true", FAILOVER_TIMEOUT)
         ap_metric(c, "intra_site_switch_s", round(time.time() - t0, 1) if st else None)
-        c.expect(st is not None, f"{ap} moved {site} away from {old} with the broker down "
+        c.expect(st is not None, f"{ap} moved {site} away from {old} with the brokers down "
                                  f"after {int(time.time() - t0)} s")
         st = st or ap_status(ap)
         c.log(f"{ap} status: {st['raw']}")
@@ -767,10 +848,11 @@ def t_broker_down_pgw(c):
     finally:
         for gw in SITES[site]["gws"]:
             set_link(gw, "up")
-        _, out = vm("gateway-gw01", "systemctl start wgkex-broker; systemctl is-active wgkex-broker", 40)
-        c.log(f"gw01 wgkex-broker: {out.strip()}")
+        for n in PLANE["brokers"]:
+            set_plane(n, "up")
+        c.log("brokers restored")
     st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", 60)
-    c.expect(st is not None, f"{ap} sent the report when the broker came back")
+    c.expect(st is not None, f"{ap} sent the report when the brokers came back")
 
 
 def t_flapping(c):
@@ -900,7 +982,12 @@ TESTS = [
     ("pmtu", t_pmtu),
     ("old-firmware", t_old_firmware),
     ("roam", t_roam),
-    ("pgw-failure", t_pgw_failure),
+    ("plane", t_plane),
+    ("pgw-failure", lambda c: t_pgw_failure(c, "home2")),
+    ("pgw-failure-home1", lambda c: t_pgw_failure(c, "home1")),
+    ("plane-broker-down", lambda c: t_plane_failure(c, "broker-muc-1")),
+    ("plane-emqx-down", lambda c: t_plane_failure(c, "emqx-muc-1")),
+    ("plane-haproxy-down", lambda c: t_plane_failure(c, "lb-muc")),
     ("broker-down-pgw", t_broker_down_pgw),
     ("site-failure-vie", lambda c: t_site_failure(c, "vie")),
     ("recovery-vie", lambda c: t_recovery(c, "vie")),
@@ -944,6 +1031,8 @@ def main():
         all_ok = all_ok and c.ok
     for site in SITES:  # leave the links up whatever happened
         set_site_links(site, "up")
+    for ctr in list(PLANE["brokers"]) + PLANE["emqx"] + PLANE["lbs"]:
+        set_plane(ctr, "up")
     mon_server(start=False)
     return 0 if all_ok else 1
 

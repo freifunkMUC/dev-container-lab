@@ -1,0 +1,82 @@
+# wgkex config of the lab brokers (broker-muc-1/2, broker-vie-1/2).
+# LAB PROTOTYPE. broker.sh fills in @MQTT@ (the EMQX node next to the
+# broker) and @SIGNING_KEY@ (from ffbs-ansible/files/lab-node-config.sec).
+# Keep the workers and lab_multipop in sync with gateway/packer/multipop/vars.yml
+# and the ffbs-ansible host_vars.
+domains: []
+domain_prefixes: []
+
+workers:
+  parker-gw01: {id: 1, weight: 1, pop: muc, endpoint_name: gw1.lab}
+  parker-gw02: {id: 2, weight: 1, pop: muc, endpoint_name: gw2.lab}
+  parker-gw03: {id: 3, weight: 1, pop: vie, endpoint_name: gw3.lab}
+  parker-gw04: {id: 4, weight: 1, pop: vie, endpoint_name: gw4.lab}
+sticky_worker_tolerance: 15
+
+parker:
+  enabled: True
+  464xlat: True
+  retry_interval: 120
+  wg_keepalive: 25
+  # Not used: lab_multipop.stateless_ipam replaces it.
+  ipam: json
+  prefixes:
+    ipv4:
+      clat_subnet: 10.0.4.0/22
+    ipv6:
+      length: 63
+
+cleanup:
+  interval: 300
+  parker_stale_timeout: 864000
+  initial_handshake_grace: 600
+
+mqtt:
+  broker_url: '@MQTT@'
+  broker_port: 1883
+  username: ''
+  password: ''
+  keepalive: 5
+  tls: False
+
+broker_signing_key: '@SIGNING_KEY@'
+broker_listen:
+  host: 0.0.0.0
+  port: 5000
+
+lab_multipop:
+  home_site: muc
+  default_primary: muc
+  primary_site_by_source:
+    203.0.113.1: muc
+    203.0.113.5: vie
+  sites:
+    muc:
+      parker_prefix: 2001:db8:100:4000::/50
+      dns64: 2001:db8:100::53
+      tunnel_id: 1
+    vie:
+      parker_prefix: 2001:db8:200:4000::/50
+      dns64: 2001:db8:200::53
+      tunnel_id: 3
+  gate:
+    handshake_max_age: 180
+    interval: 1
+  # Every broker gives a node the same answer, see lab_multipop.py.
+  stateless_ipam: true
+  # The haproxy of each site; the brokers use their X-Forwarded-For.
+  trusted_proxies: [198.51.100.66, 198.51.100.82]
+
+logging_config:
+  formatters:
+    standard:
+      format: '%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s'
+  handlers:
+    console:
+      class: logging.StreamHandler
+      formatter: standard
+  root:
+    handlers:
+      - console
+    level: INFO
+  version: 1

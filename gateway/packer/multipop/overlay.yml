@@ -6,15 +6,13 @@
 - hosts: all
   become: true
   vars:
-    dns64_here: "{{ lab_sites[lab_site].dns64_host == inventory_hostname }}"
     dns64_addr: "{{ lab_sites[lab_site].dns64 }}"
   tasks:
-    # --- DNS64: one resolver per site, on the first gateway of the site ---
+    # --- DNS64: every gateway answers on the site DNS64 address (anycast) ---
     - name: Install unbound
       ansible.builtin.apt:
         name: unbound
         state: present
-      when: dns64_here
 
     - name: Put the site DNS64 address on lo at boot
       ansible.builtin.copy:
@@ -30,14 +28,12 @@
           ExecStart=/usr/sbin/ip -6 addr replace {{ dns64_addr }}/128 dev lo
           [Install]
           WantedBy=multi-user.target
-      when: dns64_here
 
     - name: Enable the DNS64 address unit
       ansible.builtin.systemd_service:
         name: lab-dns64-addr.service
         enabled: true
         daemon_reload: true
-      when: dns64_here
 
     - name: Zone for the lab names
       ansible.builtin.copy:
@@ -50,7 +46,6 @@
           ns.lab.       IN AAAA {{ dns64_addr }}
           internet.lab. IN A    203.0.113.42
           v6.lab.       IN AAAA 2001:db8:cafe::1
-      when: dns64_here
 
     - name: Configure unbound as DNS64
       ansible.builtin.copy:
@@ -73,14 +68,12 @@
             for-upstream: yes
             for-downstream: no
             fallback-enabled: no
-      when: dns64_here
 
     - name: Announce the DNS64 address by BGP
       ansible.builtin.lineinfile:
         path: /etc/frr/frr.conf
         insertafter: '^\s+network {{ wg_gateway_v6 }}/128'
         line: "    network {{ dns64_addr }}/128"
-      when: dns64_here
 
     - name: Let DNS in through the gateway firewall
       ansible.builtin.lineinfile:
@@ -88,24 +81,53 @@
         insertbefore: '^\s+tcp dport \{ 80, 443 \} counter accept'
         firstmatch: true
         line: "        meta l4proto {tcp, udp} th dport 53 counter accept"
-      when: dns64_here
 
-    # --- Broker: per-site prefixes and primary_site ---
-    - name: Stop the broker while its state changes
+    # --- Broker plane: the brokers and EMQX run in multipop/brokers/ ---
+    # ffbs-ansible puts a broker and mosquitto on gw01 (groups Brokers and
+    # MQTT). This lab uses the stateless brokers behind haproxy instead.
+    - name: Disable the gateway broker and mosquitto
       ansible.builtin.systemd_service:
-        name: wgkex-broker.service
+        name: "{{ item }}"
         state: stopped
-      when: inventory_hostname in groups['Brokers']
+        enabled: false
+      loop: [wgkex-broker.service, mosquitto.service]
+      when: inventory_hostname in groups['Brokers'] or inventory_hostname in groups['MQTT']
+      failed_when: false
 
-    - name: Allocate the node /63s from the Parker prefix of the home site
-      ansible.builtin.copy:
-        dest: "{{ wgkex_ipam_file }}"
-        mode: '0640'
-        content: |
-          {"parent_prefix": "{{ lab_sites[lab_default_primary].parker_prefix }}", "ranges": {}, "concentrators": {}}
-      when: inventory_hostname in groups['Brokers']
+    - name: Remove the gateway /config location
+      ansible.builtin.file:
+        path: /etc/nginx/site-default.d/50-wgkex.conf
+        state: absent
 
-    - name: Add the lab_multipop block to the wgkex config (broker and workers)
+    - name: Resolve the MQTT cluster name
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "198.51.100.101 mqtt.lab"
+
+    # The site DC routers announce mqtt.lab over the gateway VPN. Take only
+    # that route from them and give them nothing.
+    - name: BGP over the gateway VPN for mqtt.lab
+      ansible.builtin.blockinfile:
+        path: /etc/frr/frr.conf
+        marker: "! {mark} LAB PROTOTYPE broker plane"
+        block: |
+          ip prefix-list mqtt seq 5 permit 198.51.100.101/32
+          route-map from-dc permit 10
+            match ip address prefix-list mqtt
+          route-map to-dc deny 10
+          !
+          router bgp {{ asn }}
+            neighbor DC peer-group
+            neighbor DC remote-as external
+            neighbor 172.16.0.65 peer-group DC
+            neighbor 172.16.0.81 peer-group DC
+            address-family ipv4 unicast
+              neighbor DC activate
+              neighbor DC route-map from-dc in
+              neighbor DC route-map to-dc out
+            exit-address-family
+
+    - name: Add the lab_multipop block to the wgkex config (workers)
       ansible.builtin.blockinfile:
         path: "{{ wgkex_config }}"
         marker: "# {mark} LAB PROTOTYPE multi-PoP active/standby"
@@ -135,16 +157,3 @@
         path: "{{ wgkex_config }}"
         regexp: '^(\s+parker_stale_timeout:) \d+$'
         replace: '\1 864000'
-
-    # A node reports a pgw switch here; the broker then tells the old pgw to
-    # remove the node /63 at once (lab_gate.unroute).
-    - name: Let the nodes reach the lab switch endpoint
-      ansible.builtin.copy:
-        dest: /etc/nginx/site-default.d/51-lab-multipop.conf
-        mode: '0644'
-        content: |
-          location = /api/v3/lab/switch {
-          	proxy_pass http://127.0.0.1:5000;
-          	proxy_set_header X-Real-IP $remote_addr;
-          }
-      when: inventory_hostname in groups['Brokers']

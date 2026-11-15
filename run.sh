@@ -147,6 +147,13 @@ collect_logs() {
 	done
 	sudo docker exec "clab-${LAB}-internet" vtysh -c 'show bgp summary' -c 'show ip bgp' -c 'show bgp ipv6' \
 		> "${d}/internet.bgp.txt" 2>&1
+	{
+		sudo docker exec "clab-${LAB}-emqx-muc-1" emqx ctl cluster status
+		for dc in dc-muc dc-vie; do
+			echo "== ${dc}"
+			sudo docker exec "clab-${LAB}-${dc}" sh -c 'ip route; vtysh -c "show bgp summary"'
+		done
+	} > "${d}/broker-plane.txt" 2>&1
 }
 
 write_summary() {
