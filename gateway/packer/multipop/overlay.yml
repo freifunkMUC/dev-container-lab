@@ -126,7 +126,7 @@
           {% endfor %}
             gate:
               handshake_max_age: 180
-              interval: 10
+              interval: 1
 
     # The broker adds a node to all pgws of a site. A pgw keeps the peer and
     # the lab gate announces the /63 only while the handshake is fresh.
@@ -135,3 +135,16 @@
         path: "{{ wgkex_config }}"
         regexp: '^(\s+parker_stale_timeout:) \d+$'
         replace: '\1 864000'
+
+    # A node reports a pgw switch here; the broker then tells the old pgw to
+    # remove the node /63 at once (lab_gate.unroute).
+    - name: Let the nodes reach the lab switch endpoint
+      ansible.builtin.copy:
+        dest: /etc/nginx/site-default.d/51-lab-multipop.conf
+        mode: '0644'
+        content: |
+          location = /api/v3/lab/switch {
+          	proxy_pass http://127.0.0.1:5000;
+          	proxy_set_header X-Real-IP $remote_addr;
+          }
+      when: inventory_hostname in groups['Brokers']

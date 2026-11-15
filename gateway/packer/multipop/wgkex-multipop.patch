@@ -1,5 +1,5 @@
 diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
-index 86a22d1..ad01121 100644
+index 86a22d1..418c124 100644
 --- a/wgkex/broker/app.py
 +++ b/wgkex/broker/app.py
 @@ -18,6 +18,7 @@ from flask.app import Flask as Flask_app
@@ -117,11 +117,50 @@ index 86a22d1..ad01121 100644
      if config.get_config().broker_signing_key is None:
          logger.error(
              "Parker is enabled, but no broker_signing_key is set in the config file. Can't respond to key exchange."
+@@ -458,6 +515,38 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+     )
+ 
+ 
++@app.route("/api/v3/lab/switch", methods=["GET"])
++def wg_api_v3_lab_switch() -> Tuple[Response | Dict, int]:
++    """LAB PROTOTYPE (multi-PoP): a node moved to another pgw of a site.
++
++    The node calls this after a fresh handshake with the new pgw. The other
++    pgws of the site remove the node /63 at once and keep the peer.
++    """
++    lab = lab_multipop.settings(config.get_config().get("lab_multipop"))
++    if not lab:
++        return {"error": {"message": "lab_multipop is not enabled"}}, 400
++    pubkey = str(request.args.get("pubkey", ""))
++    site = str(request.args.get("site", ""))
++    pgw = str(request.args.get("pgw", ""))
++    if not lab_multipop.valid_pubkey(pubkey) or site not in lab["sites"]:
++        return {"error": {"message": "Invalid data received."}}, 400
++    others = lab_multipop.unroute_targets(
++        {
++            name: cfg.pop
++            for name in parker_worker_data
++            if (cfg := config.get_config().workers.get(name)) is not None
++        },
++        site,
++        pgw,
++    )
++    for name in others:
++        mqtt.publish(
++            f"parker/wireguard/{name}",
++            json.dumps({"PublicKey": pubkey, "LabUnroute": True}).encode("utf-8"),
++        )
++    logger.info("lab switch: %s site=%s pgw=%s unroute=%s", pubkey, site, pgw, others)
++    return {"unroute": others}, 200
++
+ @mqtt.on_connect()
+ def handle_mqtt_connect(
+     client: mqtt_client.Client, userdata: bytes, flags: Any, rc: Any
 diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
-index ec49134..4a999a6 100644
+index ec49134..66fd713 100644
 --- a/wgkex/broker/app_test.py
 +++ b/wgkex/broker/app_test.py
-@@ -593,6 +593,117 @@ class TestBrokerApp(unittest.TestCase):
+@@ -593,6 +593,157 @@ class TestBrokerApp(unittest.TestCase):
              self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
              self.assertEqual(payload["Range6"], "2001:db8:42::/63")
  
@@ -236,15 +275,55 @@ index ec49134..4a999a6 100644
 +        self.assertEqual(body["range6"], "2001:db8:200:4002::/64")
 +        self.assertEqual(sorted(c["id"] for c in body["concentrators"]), [3, 4])
 +
++    def test_lab_switch_unroutes_other_pgws_of_the_site(self):
++        cfg = _parker_config()
++        cfg.workers = config.Workers.from_dict(
++            {
++                "gw01": {"id": 1, "pop": "muc"},
++                "gw02": {"id": 2, "pop": "muc"},
++                "gw03": {"id": 3, "pop": "vie"},
++            },
++            10,
++        )
++        cfg.raw["lab_multipop"] = {
++            "home_site": "muc",
++            "sites": {"muc": {"parker_prefix": "2001:db8:100:4000::/50"}},
++        }
++        for name in ("gw01", "gw02", "gw03"):
++            self.broker_app.parker_worker_data[name] = {}
++        with (
++            mock.patch.object(self.broker_app.config, "get_config", return_value=cfg),
++            mock.patch.object(self.broker_app, "mqtt") as mqtt,
++        ):
++            client = self.broker_app.app.test_client()
++            bad = client.get(
++                "/api/v3/lab/switch",
++                query_string={"pubkey": "x", "site": "muc", "pgw": "gw02"},
++            )
++            response = client.get(
++                "/api/v3/lab/switch",
++                query_string={"pubkey": _PUBLIC_KEY, "site": "muc", "pgw": "gw02"},
++            )
++        self.assertEqual(bad.status_code, 400)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(
++            [call.args[0] for call in mqtt.publish.call_args_list],
++            ["parker/wireguard/gw01"],
++        )
++        self.assertEqual(
++            json.loads(mqtt.publish.call_args.args[1]),
++            {"PublicKey": _PUBLIC_KEY, "LabUnroute": True},
++        )
++
      def test_parker_exchange_removes_peer_from_deselected_workers(self):
          cfg = _parker_config()
          cfg.workers = config.Workers.from_dict(
 diff --git a/wgkex/broker/lab_multipop.py b/wgkex/broker/lab_multipop.py
 new file mode 100644
-index 0000000..fcf71a3
+index 0000000..445283d
 --- /dev/null
 +++ b/wgkex/broker/lab_multipop.py
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,136 @@
 +"""LAB PROTOTYPE: multi-PoP active/standby fields for the Parker config.
 +
 +Only used by dev-container-lab (branch multipop-active-standby). It reads the
@@ -266,6 +345,8 @@ index 0000000..fcf71a3
 +site. Other nodes get only their primary site, as stock Parker config.
 +"""
 +
++import base64
++import binascii
 +import ipaddress
 +from typing import Any, Callable, Dict, List, Optional, Tuple
 +
@@ -367,6 +448,18 @@ index 0000000..fcf71a3
 +        "keep": {w[0] for w in workers},
 +        "fields": fields,
 +    }
++
++
++def valid_pubkey(pubkey: str) -> bool:
++    try:
++        return len(base64.b64decode(pubkey, validate=True)) == 32
++    except (binascii.Error, ValueError):
++        return False
++
++
++def unroute_targets(worker_sites: Dict[str, Any], site: str, pgw: str) -> List[str]:
++    """All pgws of `site` except the one the node uses now."""
++    return sorted(n for n, s in worker_sites.items() if s == site and n != pgw)
 diff --git a/wgkex/worker/app.py b/wgkex/worker/app.py
 index da74438..f4c4400 100644
 --- a/wgkex/worker/app.py
@@ -394,10 +487,10 @@ index da74438..f4c4400 100644
          exit_event,
 diff --git a/wgkex/worker/lab_gate.py b/wgkex/worker/lab_gate.py
 new file mode 100644
-index 0000000..8332135
+index 0000000..33b3821
 --- /dev/null
 +++ b/wgkex/worker/lab_gate.py
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,161 @@
 +"""LAB PROTOTYPE: announce a node /63 only while its tunnel is fresh.
 +
 +Only used by dev-container-lab (branch multipop-active-standby). With
@@ -405,6 +498,12 @@ index 0000000..8332135
 +a site. Each pgw then keeps the peer, but installs the /63 route (and so the
 +BGP announcement) only while the last handshake is younger than
 +`handshake_max_age` seconds. The sync runs every `interval` seconds.
++
++When a node moves to another pgw of the same site, it reports the switch to
++the broker. The broker sends `LabUnroute` to the other pgws of the site, and
++unroute() removes the /63 at once. The route comes back only after a handshake
++that is newer than the unroute. The max age is only a safety net for a lost
++report.
 +"""
 +
 +import ipaddress
@@ -421,6 +520,11 @@ index 0000000..8332135
 +
 +_IFACE = "wg-nodes"
 +
++# pubkey -> time of the last LabUnroute. Written by the MQTT thread.
++_held: Dict[str, float] = {}
++_lock = threading.Lock()
++_prefix_length = 63
++
 +
 +def settings() -> Optional[Dict[str, Any]]:
 +    lab = config.get_config().get("lab_multipop") or {}
@@ -429,7 +533,7 @@ index 0000000..8332135
 +        return None
 +    return {
 +        "handshake_max_age": float(gate.get("handshake_max_age", 180)),
-+        "interval": float(gate.get("interval", 10)),
++        "interval": float(gate.get("interval", 1)),
 +    }
 +
 +
@@ -440,12 +544,23 @@ index 0000000..8332135
 +        return False
 +
 +
-+def wanted_routes(peers: list, now: float, max_age: float, prefix_length: int) -> Set[str]:
-+    """Return the /63 of every peer with a fresh handshake."""
++def wanted_routes(
++    peers: list,
++    now: float,
++    max_age: float,
++    prefix_length: int,
++    held: Optional[Dict[str, float]] = None,
++) -> Set[str]:
++    """Return the /63 of every peer with a fresh handshake.
++
++    A peer in `held` needs a handshake newer than its unroute time.
++    """
 +    result = set()
 +    for peer in peers:
 +        handshake = (peer.get("handshake") or 0)
 +        if handshake <= 0 or now - handshake >= max_age:
++            continue
++        if handshake <= (held or {}).get(peer.get("pubkey") or "", 0):
 +            continue
 +        for addr in peer.get("allowed_ips", []):
 +            net = ipaddress.ip_network(addr, strict=False)
@@ -461,8 +576,12 @@ index 0000000..8332135
 +    for message in messages:
 +        for peer in message.get_attr("WGDEVICE_A_PEERS") or []:
 +            hs = peer.get_attr("WGPEER_A_LAST_HANDSHAKE_TIME") or {}
++            pubkey = peer.get_attr("WGPEER_A_PUBLIC_KEY") or b""
++            if isinstance(pubkey, bytes):
++                pubkey = pubkey.decode("ascii")
 +            peers.append(
 +                {
++                    "pubkey": pubkey,
 +                    "handshake": hs.get("tv_sec", 0) if isinstance(hs, dict) else 0,
 +                    "allowed_ips": [
 +                        a.get("addr")
@@ -475,7 +594,18 @@ index 0000000..8332135
 +
 +
 +def sync_once(prefix_length: int, max_age: float) -> Dict[str, Set[str]]:
-+    wanted = wanted_routes(_peers(), time.time(), max_age, prefix_length)
++    with _lock:
++        return _sync(prefix_length, max_age)
++
++
++def _sync(prefix_length: int, max_age: float) -> Dict[str, Set[str]]:
++    now = time.time()
++    peers = _peers()
++    # Forget a hold once the peer handshakes again or is gone.
++    by_key = {p["pubkey"]: p.get("handshake") or 0 for p in peers}
++    for key in [k for k, t in _held.items() if by_key.get(k, now) > t]:
++        del _held[key]
++    wanted = wanted_routes(peers, now, max_age, prefix_length, _held)
 +    with pyroute2.IPRoute() as ip:
 +        oif = ip.link_lookup(ifname=_IFACE)[0]
 +        current = {
@@ -493,10 +623,23 @@ index 0000000..8332135
 +    return {"add": wanted - current, "del": current - wanted}
 +
 +
++def unroute(pubkey: str) -> None:
++    """Remove the /63 of this peer now and keep the peer (LabUnroute)."""
++    gate = settings()
++    if gate is None or not pubkey:
++        return
++    with _lock:
++        _held[pubkey] = time.time()
++        result = _sync(_prefix_length, gate["handshake_max_age"])
++    logger.info("lab gate: unroute %s del=%s", pubkey, sorted(result["del"]))
++
++
 +def start(exit_event: threading.Event, prefix_length: int) -> Optional[threading.Thread]:
++    global _prefix_length
 +    gate = settings()
 +    if gate is None:
 +        return None
++    _prefix_length = prefix_length
 +
 +    def run() -> None:
 +        while not exit_event.is_set():
@@ -511,10 +654,10 @@ index 0000000..8332135
 +    return thread
 diff --git a/wgkex/worker/lab_gate_test.py b/wgkex/worker/lab_gate_test.py
 new file mode 100644
-index 0000000..d828b9e
+index 0000000..a267073
 --- /dev/null
 +++ b/wgkex/worker/lab_gate_test.py
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,31 @@
 +"""Tests for the lab gate (LAB PROTOTYPE)."""
 +
 +import unittest
@@ -533,9 +676,51 @@ index 0000000..d828b9e
 +            lab_gate.wanted_routes(peers, 1100, 180, 63), {"2001:db8:100:4002::/63"}
 +        )
 +
++    def test_unrouted_peer_needs_a_newer_handshake(self):
++        peers = [
++            {"pubkey": "A", "handshake": 1000, "allowed_ips": ["2001:db8:100:4002::/63"]},
++            {"pubkey": "B", "handshake": 1050, "allowed_ips": ["2001:db8:100:4004::/63"]},
++        ]
++        held = {"A": 1010, "B": 1010}
++        self.assertEqual(
++            lab_gate.wanted_routes(peers, 1100, 180, 63, held), {"2001:db8:100:4004::/63"}
++        )
++
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/wgkex/worker/mqtt.py b/wgkex/worker/mqtt.py
+index 45b85c0..7c103df 100644
+--- a/wgkex/worker/mqtt.py
++++ b/wgkex/worker/mqtt.py
+@@ -15,6 +15,7 @@ import pyroute2.netlink.exceptions
+ from wgkex.common import logger
+ from wgkex.common.mqtt import MQTTTopics
+ from wgkex.config.config import get_config
++from wgkex.worker import lab_gate
+ from wgkex.worker.msg_queue import q
+ from wgkex.worker.netlink import (
+     get_connected_peers_count,
+@@ -313,8 +314,18 @@ def on_message_parker(
+             _HOSTNAME,
+         )
+         return
++    payload = str(message.payload.decode("utf-8"))
++    # LAB PROTOTYPE (multi-PoP): the node moved to another pgw of this site.
++    if '"LabUnroute"' in payload:
++        try:
++            data = json.loads(payload)
++        except ValueError:
++            data = {}
++        if data.get("LabUnroute"):
++            lab_gate.unroute(str(data.get("PublicKey", "")))
++            return
+     # TODO: ensure payload is a dict mathing a TBD shared data class
+-    q.put(str(message.payload.decode("utf-8")))
++    q.put(payload)
+ 
+ 
+ def publish_metrics_loop(
 diff --git a/wgkex/worker/netlink.py b/wgkex/worker/netlink.py
 index 378558d..c503330 100644
 --- a/wgkex/worker/netlink.py

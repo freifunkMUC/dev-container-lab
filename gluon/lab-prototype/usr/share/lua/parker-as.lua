@@ -1,7 +1,8 @@
 -- LAB PROTOTYPE: multi-PoP active/standby on the node.
 -- Not upstream firmware. dev-container-lab branch multipop-active-standby.
 --
--- parker-as.sh runs this every 10 s, next to the stock noderoute. It reads
+-- parker-as.sh starts this as a daemon ("loop"), next to the stock
+-- noderoute. One tick is 1 s. It reads
 -- the extra fields the lab broker adds to noderoute.json:
 --   primary_site = "muc"
 --   sites = { muc = { range6, xlat_range6, address6, dns64, concentrator,
@@ -9,18 +10,26 @@
 --             vie = {...} }
 -- Tunnel wg_c<concentrator> goes to one pgw of the site at a time.
 --
--- Health (per site, every 10 s): one ICMPv6 echo to the link-local address
--- of the pgw, sent out of wg_cX.
---   * 3 misses in a row: switch wg_cX to the next pgw of the same site. The
---     site stays up and its prefix stays preferred.
+-- Health (per site, every tick): one ICMPv6 echo (1 s timeout) to the
+-- link-local address of the pgw, sent out of wg_cX. All sites are probed at
+-- the same time.
+--   * 3 misses in a row (about 3 s): switch wg_cX to the next pgw of the
+--     same site. The site stays up and its prefix stays preferred. After a
+--     fresh handshake with the new pgw, the node reports the switch to the
+--     broker (/api/v3/lab/switch). The broker tells the old pgw to remove
+--     the node /63 at once.
 --   * the site is down when every pgw of the site missed 3 times in a row.
 --     Going down is never delayed.
---   * the site is up again after 3 hits in a row, a handshake younger than
---     180 s and at least DWELL s in the down state.
---   * more than 3 up/down changes in 10 min: the site stays down for
---     PENALTY s.
---   * the active site is the primary site while it is up. After a failover
---     the node goes back to the primary only after it is up for HOLD_DOWN s.
+--   * the site is up again after 3 hits in a row and a handshake younger
+--     than 180 s, and when this stays true for DWELL s (10 s).
+--   * more than 3 up/down changes in 10 min: the site stays down for a
+--     penalty. The penalty starts at PENALTY s and doubles for each new
+--     penalty, up to PENALTY_MAX s. A quiet FLAP_WINDOW resets it.
+--   * the active site is the primary site while it is up, else the first up
+--     site. There is no hold-down.
+--
+-- A tick only probes. The full apply below runs when a state, the active
+-- site, a pgw or the config changes, and every 10 s.
 --
 -- What it sets:
 --   * address6 of every site on br-client and (as /128) on wg_cX
@@ -58,11 +67,13 @@ local T = {
   handshake_max_age = 180,
   misses_down = 3,
   hits_up = 3,
-  dwell = 60,
-  hold_down = 120,
+  dwell = 10,
   flap_window = 600,
   flap_max = 3,
-  penalty = 600,
+  penalty = 60,
+  penalty_max = 600,
+  full_every = 10,
+  report_retry = 3,
   preferred = 300,
   valid = 600,
   dead_keep = 180,
@@ -146,15 +157,47 @@ local function pin(path)
   if changed then write(path, json.stringify(conf)) end
 end
 
-local function handshake_age(iface)
-  local ts = tonumber(output("wg show " .. iface .. " latest-handshakes"):match("(%d+)%s*$") or "")
-  if not ts or ts == 0 then return nil end
-  return os.time() - ts
+local function is_link(iface)
+  return iface ~= nil and read("/sys/class/net/" .. iface .. "/ifindex") ~= nil
 end
 
-local function probe(iface, ll)
-  if not ll then return false end
-  return sh("ping -c 1 -W 2 -I " .. iface .. " " .. ll)
+-- One tick of 1 s: probe all tunnels at the same time and read the
+-- handshakes. Returns ok[iface] = true and wg[iface] = {peer, ts}.
+local function probe_all(targets)
+  local parts = { "sleep 1 &" }
+  for iface, ll in pairs(targets) do
+    table.insert(parts, "(ping -c 1 -W 1 -I " .. iface .. " " .. ll
+      .. " >/dev/null 2>&1 && echo ok " .. iface .. ") &")
+  end
+  table.insert(parts, "wg show all latest-handshakes; wait")
+  local ok, wg = {}, {}
+  for line in output(table.concat(parts, " ")):gmatch("[^\n]+") do
+    local i = line:match("^ok (%S+)$")
+    if i then
+      ok[i] = true
+    else
+      local w, peer, ts = line:match("^(%S+)%s+(%S+)%s+(%d+)$")
+      if w and not wg[w] then wg[w] = { peer = peer, ts = tonumber(ts) } end
+    end
+  end
+  return ok, wg
+end
+
+local function urlencode(v)
+  return (tostring(v):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end))
+end
+
+-- Tell the broker that the site now uses pgw (in the background).
+local function report_switch(name, iface, pgw)
+  local server = output("uci -q get parker.nodeconfig.config_server"):match("%S+")
+  local key = output("wg show " .. iface .. " public-key"):match("%S+")
+  if not server or not key then return end
+  if not server:find("://", 1, true) then server = "http://" .. server end
+  local url = server .. "/api/v3/lab/switch?pubkey=" .. urlencode(key)
+    .. "&site=" .. urlencode(name) .. "&pgw=" .. urlencode(pgw)
+  local done = STATE .. "/report." .. name
+  os.execute("(wget -q -T 3 -O /dev/null '" .. url .. "' && echo " .. pgw .. " > " .. done
+    .. ") >/dev/null 2>&1 &")
 end
 
 local function resolve(endpoint)
@@ -215,23 +258,20 @@ local function uradvd_pid()
 end
 
 -- One step of the health state machine of a site. st is changed in place.
-local function health(name, site, iface, st, now)
+-- ok: the probe of this tick answered. wg: {peer, ts} of the tunnel.
+local function health(name, site, iface, st, now, ok, wg)
   local pgws = site.pgws or {}
-  local current = output("wg show " .. iface .. " peers"):match("%S+")
+  local current = wg and wg.peer
   local pgw = current and find_by(pgws, "pubkey", current)
-  local ll = pgw and pgw.address6 or nil
-  if not ll then
-    local conc = find_by(st.conf.concentrators, "id", site.concentrator)
-    ll = conc and conc.address6
-  end
-  local age = handshake_age(iface)
-  local fresh = age ~= nil and age < T.handshake_max_age
-  if probe(iface, ll) then
+  local fresh = wg ~= nil and wg.ts > 0 and now - wg.ts < T.handshake_max_age
+  if ok then
     st.hits, st.misses = st.hits + 1, 0
   else
     st.hits, st.misses = 0, st.misses + 1
   end
-  if st.hits >= T.hits_up and fresh then st.tried = 0 end
+  local good = st.hits >= T.hits_up and fresh
+  if good then st.tried = 0 end
+  st.good_since = good and (st.good_since or now) or nil
 
   -- 3 misses on this pgw: try the next pgw of the site.
   if st.misses >= T.misses_down then
@@ -240,7 +280,25 @@ local function health(name, site, iface, st, now)
     if #pgws > 1 then
       local _, i = find_by(pgws, "pubkey", current or "")
       local next_pgw = pgws[((i or 0) % #pgws) + 1]
-      if switch_pgw(name, site, iface, next_pgw) then pgw = next_pgw end
+      if switch_pgw(name, site, iface, next_pgw) then
+        pgw = next_pgw
+        st.switched = true
+        st.report = { pgw = next_pgw.name, since = now, last = 0 }
+        os.remove(STATE .. "/report." .. name)
+      end
+    end
+  end
+
+  -- Report the switch after a handshake with the new pgw.
+  if st.report then
+    if (read(STATE .. "/report." .. name) or ""):match("%S+") == st.report.pgw then
+      log("site " .. name .. ": broker knows pgw " .. st.report.pgw .. " ("
+        .. (now - st.report.since) .. " s)")
+      st.report = nil
+    elseif wg and pgw and pgw.name == st.report.pgw and wg.ts >= st.report.since
+        and now - st.report.last >= T.report_retry then
+      st.report.last = now
+      report_switch(name, iface, st.report.pgw)
     end
   end
 
@@ -254,14 +312,18 @@ local function health(name, site, iface, st, now)
     if now - t < T.flap_window then table.insert(recent, t) end
   end
   st.changes = recent
+  if #recent == 0 and now >= st.penalty_until then st.penalties = 0 end
 
   if st.state == "up" and st.tried >= math.max(#pgws, 1) then
     change("down")
-  elseif st.state == "down" and st.hits >= T.hits_up and fresh
-      and now - st.since >= T.dwell and now >= st.penalty_until then
+  elseif st.state == "down" and st.good_since and now - st.good_since >= T.dwell
+      and now >= st.penalty_until then
     if #st.changes >= T.flap_max then
-      st.penalty_until = now + T.penalty
-      log("site " .. name .. " flaps: held down for " .. T.penalty .. " s")
+      local hold = math.min(T.penalty * 2 ^ st.penalties, T.penalty_max)
+      st.penalties = st.penalties + 1
+      st.penalty_until = now + hold
+      st.changes = {}
+      log("site " .. name .. " flaps: held down for " .. hold .. " s")
     else
       change("up")
     end
@@ -323,22 +385,25 @@ local function apply_firewall(conf, names, up)
   end
 end
 
-local function main()
+local apply
+
+-- One tick. db is kept in memory by the loop (and in state.json).
+local function tick(db)
   sh("mkdir -p " .. STATE)
   local tune = json.parse(read("/etc/parker-as.tune") or "") or {}
   for k, v in pairs(tune) do if T[k] ~= nil then T[k] = tonumber(v) end end
 
-  local conf = json.parse(read(CONF) or "")
+  local raw = read(CONF) or ""
+  local conf = json.parse(raw)
   if not conf or type(conf.sites) ~= "table" or not conf.primary_site then
     write(STATE .. "/status", "no multipop config\n")
+    sh("sleep 1")
     return
   end
   local names = site_names(conf)
-  local now = os.time()
-  local db = json.parse(read(STATE .. "/state.json") or "") or {}
   db.sites = db.sites or {}
 
-  local iface, tbl, up = {}, {}, {}
+  local iface, tbl, up, targets = {}, {}, {}, {}
   for i, name in ipairs(names) do
     local site = conf.sites[name]
     tbl[name] = TABLE_BASE + i
@@ -347,30 +412,39 @@ local function main()
     st.since = st.since or 0
     st.hits, st.misses, st.tried = st.hits or 0, st.misses or 0, st.tried or 0
     st.changes, st.penalty_until = st.changes or {}, st.penalty_until or 0
+    st.penalties = st.penalties or 0
     db.sites[name] = st
-    if site.concentrator then
-      iface[name] = "wg_c" .. tostring(site.concentrator)
-      if sh("ip link show " .. iface[name]) then
-        -- The site address as /128 on the tunnel: the probe source.
-        sh("ip -6 addr replace " .. site.address6 .. "/128 dev " .. iface[name])
-        sh("ip -6 route replace fe80::/64 dev " .. iface[name])
-        st.conf = conf
-        health(name, site, iface[name], st, now)
-        st.conf = nil
-      else
-        iface[name] = nil
-        if st.state == "up" then st.state, st.since = "down", now end
-      end
+    local i_name = site.concentrator and ("wg_c" .. tostring(site.concentrator))
+    if is_link(i_name) then
+      iface[name] = i_name
+      local current = output("wg show " .. i_name .. " peers"):match("%S+")
+      local pgw = current and find_by(site.pgws, "pubkey", current)
+      local conc = find_by(conf.concentrators, "id", site.concentrator)
+      targets[i_name] = (pgw and pgw.address6) or (conc and conc.address6) or nil
     end
+  end
+
+  local ok, wg = probe_all(targets)
+  local now = os.time()
+  local changed = raw ~= db.raw or now - (db.full or 0) >= T.full_every
+  for _, name in ipairs(names) do
+    local st = db.sites[name]
+    local before = st.state .. (st.pgw or "")
+    if iface[name] then
+      health(name, conf.sites[name], iface[name], st, now, ok[iface[name]], wg[iface[name]])
+    elseif st.state == "up" then
+      st.state, st.since = "down", now
+      log("site " .. name .. " is down (no tunnel)")
+    end
+    if st.switched or before ~= st.state .. (st.pgw or "") then changed = true end
+    st.switched = nil
     up[name] = st.state == "up"
   end
 
-  -- The active site: the primary while it is up (after HOLD_DOWN when the
-  -- node comes back to it), else the active one, else the first up site.
+  -- The active site: the primary while it is up, else the active one, else
+  -- the first up site.
   local active = db.active
-  local p = db.sites[conf.primary_site]
-  if up[conf.primary_site] and (active == conf.primary_site or not up[active or ""]
-      or now - p.since >= T.hold_down) then
+  if up[conf.primary_site] then
     active = conf.primary_site
   elseif not up[active or ""] then
     active = nil
@@ -381,7 +455,30 @@ local function main()
   if active ~= db.active then
     log("active site: " .. tostring(db.active) .. " -> " .. tostring(active))
     db.active = active
+    changed = true
   end
+
+  if changed then
+    db.raw, db.full = raw, now
+    apply(conf, names, db, iface, tbl, up, active, now)
+  end
+  local status = { "primary_site=" .. conf.primary_site, "active=" .. tostring(active) }
+  local ra_state = read(STATE .. "/ra-state") or ""
+  for _, name in ipairs(names) do
+    local st = db.sites[name]
+    table.insert(status, "site " .. name .. " " .. st.state .. " iface=" .. tostring(iface[name])
+      .. " pgw=" .. tostring(st.pgw) .. " hits=" .. st.hits .. " misses=" .. st.misses
+      .. " tried=" .. st.tried .. " fresh=" .. tostring(st.fresh)
+      .. " penalty=" .. tostring(st.penalty_until > now)
+      .. " report=" .. (st.report and "pending" or "none")
+      .. " range6=" .. conf.sites[name].range6
+      .. " ra=" .. (ra_state:find(conf.sites[name].range6 .. ",", 1, true) and "on" or "off"))
+  end
+  update_file(STATE .. "/status", table.concat(status, "\n") .. "\n")
+end
+
+-- Addresses, rules, firewall, routes, CLAT, RA and DNS for the current state.
+apply = function(conf, names, db, iface, tbl, up, active, now)
 
   -- Addresses, rules and site tables.
   local rules = { "pref 1000 lookup main suppress_prefixlength 0" }
@@ -389,6 +486,9 @@ local function main()
     local site = conf.sites[name]
     sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF)
     if iface[name] then
+      -- The site address as /128 on the tunnel: the probe source.
+      sh("ip -6 addr replace " .. site.address6 .. "/128 dev " .. iface[name])
+      sh("ip -6 route replace fe80::/64 dev " .. iface[name])
       sh("ip -6 route replace default dev " .. iface[name] .. " src " .. site.address6
         .. " table " .. tbl[name])
       if site.dns64 then
@@ -479,21 +579,19 @@ local function main()
   end
 
   write(STATE .. "/state.json", json.stringify(db))
-  local status = { "primary_site=" .. conf.primary_site, "active=" .. tostring(active) }
-  for _, name in ipairs(names) do
-    local st = db.sites[name]
-    table.insert(status, "site " .. name .. " " .. st.state .. " iface=" .. tostring(iface[name])
-      .. " pgw=" .. tostring(st.pgw) .. " hits=" .. st.hits .. " misses=" .. st.misses
-      .. " tried=" .. st.tried .. " fresh=" .. tostring(st.fresh)
-      .. " penalty=" .. tostring(st.penalty_until > now)
-      .. " range6=" .. conf.sites[name].range6
-      .. " ra=" .. (ra_state:find(conf.sites[name].range6 .. ",", 1, true) and "on" or "off"))
-  end
-  write(STATE .. "/status", table.concat(status, "\n") .. "\n")
 end
 
 if arg[1] == "pin" then
   pin(arg[2])
 else
-  main()
+  -- "loop": the daemon (parker-as.sh). Without an argument: one tick.
+  local db = json.parse(read(STATE .. "/state.json") or "") or {}
+  db.raw, db.full = nil, nil
+  repeat
+    local okay, err = pcall(tick, db)
+    if not okay then
+      log("tick failed: " .. tostring(err))
+      sh("sleep 1")
+    end
+  until arg[1] ~= "loop"
 end

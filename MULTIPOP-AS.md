@@ -43,7 +43,12 @@ flowchart LR
   (203.0.113.5) gets VIE. A node without `caps` gets one site only.
 - The broker adds the node peer to all pgws of a site over MQTT. A pgw
   keeps the peer. It installs and announces the node /63 only while the
-  handshake is fresh (less than 180 s).
+  handshake is fresh (less than 180 s). The worker checks this every 1 s.
+- After a pgw switch, the AP reports the new pgw to the broker
+  (`GET /api/v3/lab/switch`). The broker tells the other pgws of that site
+  over MQTT (`LabUnroute`) to remove the node /63 at once. They keep the
+  peer. The route comes back only after a new handshake. The 180 s limit
+  is only a safety net, for example when the broker is down.
 
 ## How the AP works
 
@@ -57,12 +62,14 @@ flowchart LR
    Each site table has `default dev wg_cX`.
 3. The IPv4 default route is on the tunnel of the active site. That
    selects the CLAT of that site.
-4. Every 10 s the AP sends an ICMPv6 echo to the link-local address of the
+4. Every 1 s the AP sends an ICMPv6 echo to the link-local address of the
    pgw, through wg_cX.
-5. When a pgw misses 3 probes, the AP moves the tunnel to the next pgw of
-   the same site. The prefix stays preferred. The AP routes through the new
-   pgw only after a fresh handshake.
-6. When no pgw of a site works, the site is down. Then the AP:
+5. When a pgw misses 3 probes (about 3 s), the AP moves the tunnel to the
+   next pgw of the same site. The prefix stays preferred. The AP routes
+   through the new pgw only after a fresh handshake. Then it reports the
+   switch to the broker (again every 3 s until the broker answers).
+6. When no pgw of a site works, the site is down. This takes about 3 s for
+   each pgw of the site (about 6 s for 2 pgws). Then the AP at once:
    - makes the other site active and sets the dead prefix to preferred
      lifetime 0;
    - rejects traffic from the dead /63 with ICMPv6 type 1 code 5 (chain
@@ -70,12 +77,17 @@ flowchart LR
      node prefixes are also rejected. Outer WireGuard UDP is not affected;
    - moves the IPv4 default route to the other tunnel (IPv4 flows restart);
    - writes the DNS servers of the up sites for dnsmasq;
-   - stops sending the dead prefix after 180 s more. The clients remove
-     the address when the valid lifetime ends (600 s).
-7. A site is up again after 3 probe hits, a fresh handshake and 60 s dwell.
-   The AP goes back to the primary site after 120 s more (hold-down).
+   - sends 3 RAs with the new lifetimes.
+
+   180 s later, the AP stops sending the dead prefix. The clients remove
+   the address when the valid lifetime ends (600 s).
+7. A site is up again after 3 probe hits, a fresh handshake and 10 s dwell.
+   The AP then goes back to the primary site at once (no hold-down).
+   Existing client flows on the other prefix continue. New flows use the
+   primary prefix.
 8. When a site changes state more than 3 times in 10 min, the AP holds it
-   down for 600 s (penalty).
+   down for a penalty. The penalty is 60 s and doubles for each new
+   penalty, up to 600 s. 10 min without changes resets it.
 
 ## Lab prototypes
 
@@ -84,7 +96,8 @@ LAB PROTOTYPE files in `gluon/lab-prototype/`. `gluon/launch.py` writes the
 files into the AP at the first boot.
 
 - `parker-as.lua`: probe, damping, pgw switch, site state, routing, reject
-  rule, RA state, DNS servers, IPv4 default route. It runs every 10 s.
+  rule, RA state, DNS servers, IPv4 default route. It runs as a loop with
+  a 1 s tick. It applies the full state after a change and every 10 s.
   `/etc/parker-as.tune` (JSON) can change the timers for tests.
 - `nodeconfig.sh` hooks: send `caps=multiprefix`, and keep the pgw that
   the AP selected when a new config comes (`parker-as.lua pin`).
@@ -102,10 +115,14 @@ client-2 and client-4 use dhcpcd for IPv6.
 
 ## Known differences from the design
 
-- A site goes down without delay. Dwell, hold-down and penalty delay only
-  the way back.
-- After a pgw switch, the old pgw can announce the node /63 for up to
-  180 s more. In this time, inbound traffic can go to the old pgw.
+- A site goes down without delay. Dwell and penalty delay only the way
+  back.
+- The broker runs on gw01, and the AP reaches it through the gw01 uplink.
+  When gw01 fails, the report cannot go out. The old pgw then removes the
+  /63 after the 180 s safety net. In this time, inbound traffic can go to
+  the old pgw.
+- `/api/v3/lab/switch` has no authentication (lab prototype). A false call
+  removes the route of a node only until its next handshake.
 - The probe is ICMPv6 only. The AP does not use BFD.
 
 ## Run it
@@ -122,6 +139,27 @@ mkdir -p artifacts && cp <gluon-ffmuc-...-x86-64.img.gz> artifacts/
 tests, collects the logs and destroys the lab. The results go to
 `results/summary.json`. The exit code is 0 only when all tests pass.
 The tests take about 1.5 h.
+
+`summary.json` has the measured downtimes in `downtime`:
+
+- `ap`: seconds until the AP status shows the change: `intra_site_switch_s`,
+  `old_pgw_unroute_s` (after the switch), `site_down_s`, `clients_swapped_s`,
+  `site_up_s`, `switch_back_s`, `inbound_after_switch_s`, `penalty_hold_s`.
+- `clients`: the outage as each client sees it, for each case (pgw switch,
+  site failover, switch-back, broker down, flapping). During the case each
+  client sends ping6 and ping4 every 100 ms, keeps one TCP stream open for
+  IPv6 and IPv4, and opens a new HTTP connection every 1 s for IPv6 and
+  IPv4 (`tests/clientmon.sh`, server `tests/monsrv.py` on the internet
+  node). Values: the longest gap with no ping reply (`ping6_max_gap_ms`,
+  `ping4_max_gap_ms`), lost pings, if the TCP stream survived
+  (`tcp6_survived`, `tcp4_survived`), and the time from the failure until a
+  new connection works (`new_conn6_s`, `new_conn4_s`, 0 when no connection
+  failed). The raw logs are in `results/mon-*.log`.
+
+Each ping runs for 1 s and then starts again, so a new ping selects the
+source address again, like a new application. After a site failover, an
+old TCP stream on the dead prefix stops (ICMPv6 code 5). The IPv4 TCP
+stream stops after each pgw change, because the NAT64 address changes.
 
 To run the tests on a deployed lab:
 
@@ -140,12 +178,12 @@ tests/multipop_as.py normal       # one test
 | pmtu | DF packets through the tunnel of each site get the correct PMTU. |
 | old-firmware | AP 4 gets one site. IPv6 and IPv4 work. |
 | roam | client-1 moves from AP 1 to AP 3. It gets the AP 3 prefixes. Its old source gets ICMPv6 code 5. |
-| pgw-failure | One pgw fails. The AP moves to the other pgw. The prefix stays preferred. IPv6 and IPv4 times are measured. |
-| broker-down-pgw | The broker is stopped and a pgw fails. The AP still moves. |
-| site-failure-vie | Deprecation, source swap, ICMPv6 code 5, IPv4 failover, prefix removal. |
-| recovery-vie | The AP goes back to its primary site after dwell and hold-down. |
+| pgw-failure | One VIE pgw fails. The AP moves to the other pgw. The prefix stays preferred. The old pgw removes the /63 in less than 15 s. Client outage is measured. |
+| broker-down-pgw | The broker is stopped and a pgw fails. The AP still moves. The report waits for the broker. |
+| site-failure-vie | Deprecation, source swap, ICMPv6 code 5, IPv4 failover, prefix removal. Client outage is measured. |
+| recovery-vie | The AP goes back to its primary site after dwell, with no hold-down. Client traffic does not stop. |
 | site-failure-long-muc | As above, and the dead address expires on the clients. |
 | recovery-long-muc | Recovery after the long outage. |
-| flapping | A flapping site is held down (penalty 180 s in the test). |
+| flapping | A flapping site is held down for the penalty (60 s). |
 
 A failure is made on the internet node: `ip link set gwXX down`.

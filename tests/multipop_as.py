@@ -5,7 +5,10 @@ Usage: tests/multipop_as.py [--results DIR] [TEST ...]
 Tests: see TESTS at the end, in that order. Without TEST: all.
 
 Each test prints its evidence and writes DIR/test-NN-<test>.json with
-{"name", "pass", "evidence": [...]}. Exit 0 only when all selected tests pass.
+{"name", "pass", "evidence": [...], "metrics": {...}}. The metrics hold the
+measured downtimes: "ap" (seconds, seen on the AP status) and "clients"
+(per client, seen in the client traffic, see tests/clientmon.sh).
+Exit 0 only when all selected tests pass.
 """
 
 import argparse
@@ -44,15 +47,23 @@ AP3 = {"ap": "ap-3", "clients": ["client-5"], "primary": "muc"}
 OLD = {"ap": "ap-4", "clients": ["client-6"], "site": "vie"}
 OTHER = {"muc": "vie", "vie": "muc"}
 
-# Probe every 10 s, 3 misses per pgw, 2 pgws per site, plus slack.
-FAILOVER_TIMEOUT = int(os.environ.get("FAILOVER_TIMEOUT", "300"))
-# 3 hits, a fresh handshake, 60 s dwell, 120 s hold-down, plus slack.
-RECOVERY_TIMEOUT = int(os.environ.get("RECOVERY_TIMEOUT", "600"))
+# Probe every 1 s, 3 misses per pgw, 2 pgws per site, plus slack.
+FAILOVER_TIMEOUT = int(os.environ.get("FAILOVER_TIMEOUT", "120"))
+# 3 hits, a fresh handshake, 10 s dwell, plus slack.
+RECOVERY_TIMEOUT = int(os.environ.get("RECOVERY_TIMEOUT", "300"))
 # DEAD_KEEP (180 s) in parker-as.lua plus slack.
 WITHDRAW_TIMEOUT = int(os.environ.get("WITHDRAW_TIMEOUT", "300"))
 # The last RA with the dead prefix had valid lifetime 600 s.
 EXPIRE_TIMEOUT = int(os.environ.get("EXPIRE_TIMEOUT", "900"))
 READY_TIMEOUT = int(os.environ.get("READY_TIMEOUT", "1800"))
+# The old pgw drops the /63 of the node this many s after the switch.
+UNROUTE_TIMEOUT = int(os.environ.get("UNROUTE_TIMEOUT", "15"))
+# Upper limits for the longest gap in the client traffic (s). They catch a
+# return to slow failover; the measured values are in the metrics.
+GAP_PGW = float(os.environ.get("GAP_PGW", "30"))
+GAP_SITE = float(os.environ.get("GAP_SITE", "60"))
+GAP_BACK = float(os.environ.get("GAP_BACK", "10"))
+RESULTS = None
 
 
 class Check:
@@ -60,6 +71,7 @@ class Check:
         self.name = name
         self.ok = True
         self.evidence = []
+        self.metrics = {}
 
     def log(self, msg):
         print(f"[{self.name}] {msg}", flush=True)
@@ -152,11 +164,11 @@ def net63(range6):
     return range6.replace("/64", "/63") if range6 else None
 
 
-def wait_status(ap, pred, timeout):
+def wait_status(ap, pred, timeout, step=1):
     def poll():
         st = ap_status(ap)
         return st if pred(st) else None
-    return wait_for(poll, timeout)
+    return wait_for(poll, timeout, step)
 
 
 def client_addrs(client):
@@ -408,6 +420,144 @@ def time_to(fn, timeout, step=2):
     return int(time.time() - t0) if wait_for(fn, timeout, step) else None
 
 
+# ------------------------------------------------- client traffic monitor
+
+MONSRV = f"{LAB}-monsrv"
+
+
+def mon_server(start=True):
+    """The stream and HTTP server of the monitor, in the internet netns."""
+    run(["sudo", "docker", "rm", "-f", MONSRV])
+    if start:
+        rc, out = run(["sudo", "docker", "run", "-d", "--rm", "--name", MONSRV,
+                       "--net", f"container:clab-{LAB}-internet",
+                       "-v", f"{ROOT}/tests/monsrv.py:/monsrv.py:ro",
+                       "--entrypoint", "python3", "ffmuc-lab:toolbox", "/monsrv.py"])
+        print(f"monitor server: rc={rc} {out.strip()}", flush=True)
+
+
+def mon_start(clients):
+    """Start the traffic monitor on each client, then wait for a baseline."""
+    for cl in clients:
+        run(["sudo", "docker", "cp", os.path.join(ROOT, "tests", "clientmon.sh"),
+             f"clab-{LAB}-{cl}:/tmp/clientmon.sh"])
+        run(["sudo", "docker", "exec", "-d", f"clab-{LAB}-{cl}",
+             "sh", "/tmp/clientmon.sh", "start", TARGET6, TARGET4])
+    time.sleep(5)
+
+
+def _sections(out):
+    sec, cur = {}, None
+    for line in out.splitlines():
+        if line.startswith("=== "):
+            cur = sec.setdefault(line[4:].strip(), [])
+        elif cur is not None:
+            cur.append(line)
+    return sec
+
+
+def _float(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _max_gap(times, start, stop):
+    """The longest time with no data between start and stop, in ms."""
+    if not times:
+        return round((stop - start) * 1000)
+    edges = sorted(times) + [stop]
+    return round(max(b - a for a, b in zip(edges, edges[1:])) * 1000)
+
+
+def mon_parse(out, event):
+    """Metrics of one client: the longest gap with no ping replies (ms), the
+    lost pings, if the long TCP stream survived, and the time from the event
+    until a new connection works (s, 0 when no connection failed)."""
+    sec = _sections(out)
+    start = _float((sec.get("start") or [""])[0])
+    stop = _float((sec.get("stop") or [""])[0])
+    if start is None or stop is None:
+        return {"error": "no monitor data"}
+    m = {"seconds": round(stop - start, 1)}
+    for f in ("6", "4"):
+        replies, sent, got = [], 0, 0
+        for line in sec.get(f"ping{f}.log", []):
+            r = re.match(r"\[(\d+\.\d+)\] \d+ bytes from", line)
+            if r:
+                replies.append(float(r.group(1)))
+            r = re.match(r"(\d+) packets transmitted, (\d+) received", line)
+            if r:
+                sent, got = sent + int(r.group(1)), got + int(r.group(2))
+        m[f"ping{f}_max_gap_ms"] = _max_gap([t for t in replies if t >= start + 2], start + 2, stop)
+        m[f"ping{f}_sent"] = sent
+        m[f"ping{f}_lost"] = sent - got
+        m[f"ping{f}_back"] = any(t > event for t in replies)
+        data, end = [], None
+        for line in sec.get(f"tcp{f}.log", []):
+            parts = line.split(None, 1)
+            t = _float(parts[0]) if parts else None
+            if t is None:
+                continue
+            if len(parts) > 1 and parts[1].startswith("END"):
+                end = end or t
+            elif len(parts) > 1 and _float(parts[1]) is not None:
+                data.append(t)
+        m[f"tcp{f}_survived"] = bool(data) and (end is None or end >= stop) and max(data) > stop - 2
+        m[f"tcp{f}_max_gap_ms"] = _max_gap(data, data[0] if data else start, min(end or stop, stop))
+        fail_at, back = None, None
+        for line in sec.get(f"curl{f}.log", []):
+            parts = line.split()
+            t = _float(parts[0]) if parts else None
+            if t is None or t < event or len(parts) < 2:
+                continue
+            if parts[1] == "fail" and fail_at is None:
+                fail_at = t
+            elif parts[1] == "ok" and fail_at is not None and back is None:
+                back = t + 1  # the curl was ok within its 1 s limit
+        m[f"new_conn{f}_s"] = 0 if fail_at is None else (round(back - event, 1) if back else None)
+    return m
+
+
+def mon_stop(c, case, clients, event):
+    """Stop the monitor, keep the raw logs, and add the metrics to c."""
+    result = {}
+    for cl in clients:
+        _, out = dx(cl, "sh /tmp/clientmon.sh stop", timeout=60)
+        if RESULTS:
+            with open(os.path.join(RESULTS, f"mon-{c.name}-{case}-{cl}.log"), "w") as f:
+                f.write(out)
+        m = mon_parse(out, event)
+        result[cl] = m
+        c.log(f"{case} {cl} client traffic: {m}")
+    c.metrics.setdefault("clients", {})[case] = result
+    return result
+
+
+def expect_traffic(c, case, result, max_gap=None, families=("6", "4")):
+    """Traffic came back for every client; optionally the longest ping gap
+    is below max_gap s."""
+    for cl, m in result.items():
+        for f in families:
+            ip = "IPv6" if f == "6" else "IPv4"
+            c.expect(m.get(f"ping{f}_back") and m.get(f"new_conn{f}_s") is not None,
+                     f"{case} {cl} {ip}: traffic back, longest gap {m.get(f'ping{f}_max_gap_ms')} ms, "
+                     f"new connection after {m.get(f'new_conn{f}_s')} s")
+            if max_gap is not None and m.get(f"ping{f}_max_gap_ms") is not None:
+                c.expect(m[f"ping{f}_max_gap_ms"] <= max_gap * 1000,
+                         f"{case} {cl} {ip}: longest gap {m[f'ping{f}_max_gap_ms']} ms <= {max_gap} s")
+
+
+def ap_metric(c, key, value):
+    c.metrics.setdefault("ap", {})[key] = value
+
+
+def inbound_time(addr, timeout=60):
+    """Seconds until the internet reaches addr with ping, or None."""
+    return time_to(lambda: run(inet_argv(f"ping -6 -c 1 -W 1 {addr}"), 20)[0] == 0, timeout, step=1)
+
+
 def t_site_failure(c, site, long_outage=False):
     """All pgws of the primary site of a home fail. The AP swaps the prefix
     states, rejects the dead prefix with ICMPv6 code 5, moves IPv4, and
@@ -420,6 +570,8 @@ def t_site_failure(c, site, long_outage=False):
     before = client_addrs(cl)
     c.log(f"{cl} addresses before: {before}")
     c.log(f"{ap} IPv4 default before: dev {route4_dev(ap)}")
+    clients = home["clients"] + other_home["clients"]
+    mon_start(clients)
 
     c.log(f"cut the uplinks of {SITES[site]['gws']} on the internet node at {time.strftime('%H:%M:%S')}")
     set_site_links(site, "down")
@@ -427,6 +579,7 @@ def t_site_failure(c, site, long_outage=False):
 
     st = wait_status(ap, lambda s: s.get("active") == backup and
                      s["sites"].get(site, {}).get("state") == "down", FAILOVER_TIMEOUT)
+    ap_metric(c, "site_down_s", round(time.time() - t0, 1) if st else None)
     c.expect(st is not None, f"{ap} marked {site} down after {int(time.time() - t0)} s")
     st = st or ap_status(ap)
     c.log(f"{ap} status: {st['raw']}")
@@ -435,13 +588,22 @@ def t_site_failure(c, site, long_outage=False):
 
     ok = wait_for(lambda: all(preferred(a, backup) and deprecated_or_gone(a, site)
                               for a in map(client_addrs, home["clients"])), 120, step=5)
+    ap_metric(c, "clients_swapped_s", round(time.time() - t0, 1) if ok else None)
     c.expect(ok, f"clients of {ap} deprecated {site} and prefer {backup} after {int(time.time() - t0)} s")
-    check_source(c, home, backup)
 
-    t6 = time_to(lambda: ping(cl, TARGET6, count=1)[0], 60)
+    t6 = time_to(lambda: ping(cl, TARGET6, count=1)[0], 60, step=1)
     c.expect(t6 is not None, f"{cl} IPv6 through {backup} works (after {t6} s more)")
-    t4 = time_to(lambda: ping(cl, TARGET4, count=1)[0], 60)
+    t4 = time_to(lambda: ping(cl, TARGET4, count=1)[0], 60, step=1)
     c.expect(t4 is not None, f"{cl} IPv4 through the CLAT of {backup} works (after {t4} s more)")
+    addr = client_addrs(cl).get(backup, (None,))[0]
+    ti = inbound_time(addr) if addr else None
+    ap_metric(c, "inbound_after_switch_s", None if ti is None else round(time.time() - t0, 1))
+    c.expect(ti is not None, f"internet -> {cl} [{addr}] ({backup}) works after the switch")
+    time.sleep(5)
+    result = mon_stop(c, "site-failover", clients, t0)
+    expect_traffic(c, "site-failover", {x: result[x] for x in home["clients"]}, GAP_SITE)
+    expect_traffic(c, "site-failover other home", {x: result[x] for x in other_home["clients"]}, GAP_BACK)
+    check_source(c, home, backup)
     dev = route4_dev(ap)
     c.expect(dev == live_iface, f"{ap} IPv4 default via {dev} (want {live_iface}, dead tunnel {dead_iface})")
 
@@ -471,24 +633,32 @@ def t_site_failure(c, site, long_outage=False):
 
 def t_recovery(c, site):
     """The failed site comes back. The AP returns to the configured primary
-    after dwell and hold-down. The clients get the prefix back, also after
-    a long outage in which the address expired."""
+    after 3 hits, a fresh handshake and the dwell (no hold-down). The clients
+    get the prefix back, also after a long outage in which the address
+    expired. The switch-back does not stop client traffic."""
     home = home_with_primary(site)
     ap = home["ap"]
+    mon_start(home["clients"])
     c.log(f"restore the uplinks of {SITES[site]['gws']} at {time.strftime('%H:%M:%S')}")
     set_site_links(site, "up")
     t0 = time.time()
     st = wait_status(ap, lambda s: s["sites"].get(site, {}).get("state") == "up", RECOVERY_TIMEOUT)
-    t_up = int(time.time() - t0)
+    t_up = round(time.time() - t0, 1)
     c.expect(st is not None, f"{ap} marked {site} up after {t_up} s (3 hits, fresh handshake, dwell)")
     st = wait_status(ap, lambda s: all_up(s, site), RECOVERY_TIMEOUT)
-    t_back = int(time.time() - t0)
+    t_back = round(time.time() - t0, 1)
+    ap_metric(c, "site_up_s", t_up)
+    ap_metric(c, "switch_back_s", t_back if st else None)
     c.expect(st is not None, f"{ap} back on primary {site} after {t_back} s")
-    c.expect(t_back - t_up >= 100, f"hold-down before swap-back: {t_back - t_up} s (want about 120 s)")
+    c.expect(t_back - t_up < 15, f"no hold-down before the switch-back: {round(t_back - t_up, 1)} s")
     c.log(f"{ap} status: {(st or ap_status(ap))['raw']}")
     ok = wait_for(lambda: all(preferred(a, site) and deprecated_or_gone(a, OTHER[site]) and OTHER[site] in a
-                              for a in map(client_addrs, home["clients"])), 180, step=5)
+                              for a in map(client_addrs, home["clients"])), 180, step=2)
+    ap_metric(c, "clients_swapped_s", round(time.time() - t0, 1) if ok else None)
     c.expect(ok, f"clients of {ap} prefer {site} and have {OTHER[site]} as standby after {int(time.time() - t0)} s")
+    time.sleep(10)
+    result = mon_stop(c, "switch-back", home["clients"], t0)
+    expect_traffic(c, "switch-back", result, GAP_BACK)
     check_source(c, home, site)
     _, out = vm(ap, "ip6tables -S parker_src")
     c.expect(f"-s {net63(st and st['sites'][site]['range6'])} -j RETURN" in out,
@@ -497,56 +667,66 @@ def t_recovery(c, site):
     c.expect(ok, f"{home['clients'][0]} IPv4 after recovery: {last(out)}")
 
 
+def pgw_routes(gw, net):
+    """Lines of the /63 route of a node on a pgw."""
+    _, out = vm(f"gateway-{gw}", f"ip -6 route show {net}", 20)
+    return [line for line in out.splitlines() if line.startswith(net.split("/")[0])]
+
+
 def t_pgw_failure(c):
     """One pgw of the primary site fails. The AP moves the tunnel to the
-    other pgw of the same site. The prefix stays preferred all the time.
-    IPv6 and IPv4 come back; the time of each is measured."""
+    other pgw of the same site after 3 s. The prefix stays preferred all the
+    time. After the handshake the AP reports the switch, and the broker makes
+    the old pgw drop the /63 at once. Client traffic is measured.
+    Home 2 (VIE): the broker is on gw01, so it stays reachable."""
     settle(c)
-    home = HOMES["home1"]
+    home, other = HOMES["home2"], HOMES["home1"]
     ap, cl, site = home["ap"], home["clients"][0], home["primary"]
     st = ap_status(ap)
     old = st["sites"][site].get("pgw")
+    net = net63(st["sites"][site].get("range6"))
     c.log(f"{ap} status: {st['raw']}")
     if not c.expect(old in SITES[site]["gws"], f"{ap} uses pgw {old} for {site}"):
         return
+    c.log(f"{old} routes {net}: {pgw_routes(old, net)}")
+    clients = home["clients"] + other["clients"]
+    mon_start(clients)
     c.log(f"cut the uplink of {old} at {time.strftime('%H:%M:%S')}")
     set_link(old, "down")
     t0 = time.time()
-    lost6 = lost4 = None
-    t6 = t4 = None
     not_preferred = set()
-    switched = None
+    switched = new = None
     try:
-        while time.time() - t0 < FAILOVER_TIMEOUT and (t6 is None or t4 is None or switched is None):
-            for x in home["clients"]:
-                if not preferred(client_addrs(x), site):
-                    not_preferred.add(f"{x} at {int(time.time() - t0)} s")
+        while time.time() - t0 < FAILOVER_TIMEOUT and switched is None:
             s = ap_status(ap)
             if s["sites"][site]["state"] != "up":
                 not_preferred.add(f"{ap} marked {site} {s['sites'][site]['state']}")
-            if switched is None and s["sites"][site].get("pgw") not in (old, "?") and \
-                    s["sites"][site].get("fresh") == "true":
-                switched = int(time.time() - t0)
-                c.log(f"{ap} switched to {s['sites'][site].get('pgw')} after {switched} s: {s['raw']}")
-            ok6 = ping(cl, TARGET6, count=1)[0]
-            ok4 = ping(cl, TARGET4, count=1)[0]
-            if not ok6 and lost6 is None:
-                lost6 = int(time.time() - t0)
-            if not ok4 and lost4 is None:
-                lost4 = int(time.time() - t0)
-            if ok6 and lost6 is not None and t6 is None:
-                t6 = int(time.time() - t0)
-            if ok4 and lost4 is not None and t4 is None:
-                t4 = int(time.time() - t0)
-            time.sleep(3)
+            if s["sites"][site].get("pgw") not in (old, "?") and s["sites"][site].get("fresh") == "true":
+                switched, new = round(time.time() - t0, 1), s["sites"][site].get("pgw")
+                c.log(f"{ap} switched to {new} after {switched} s: {s['raw']}")
+            time.sleep(0.5)
+        ap_metric(c, "intra_site_switch_s", switched)
         c.expect(switched is not None, f"{ap} moved wg tunnel of {site} to the other pgw ({switched} s)")
-        c.expect(not not_preferred, f"{site} prefix stayed preferred and the site stayed up {sorted(not_preferred)}")
-        c.expect(t6 is not None, f"IPv6 lost at {lost6} s, back at {t6} s")
-        c.expect(t4 is not None, f"IPv4 (CLAT) lost at {lost4} s, back at {t4} s")
-        check_source(c, home, site)
+        gone = time_to(lambda: not pgw_routes(old, net), UNROUTE_TIMEOUT + 30, step=1)
+        unroute = None if gone is None else round(time.time() - t0 - switched, 1) if switched else None
+        ap_metric(c, "old_pgw_unroute_s", unroute)
+        c.expect(gone is not None and unroute is not None and unroute <= UNROUTE_TIMEOUT,
+                 f"{old} dropped {net} {unroute} s after the switch (limit {UNROUTE_TIMEOUT} s)")
+        if new:
+            c.log(f"{new} routes {net}: {pgw_routes(new, net)}")
         a = client_addrs(cl)[site][0]
-        rc, out = run(inet_argv(f"ping -6 -c 3 -W 2 {a}"), 40)
-        c.expect(rc == 0, f"internet -> {cl} [{a}] through the new pgw: {last(out)}")
+        ti = inbound_time(a)
+        ap_metric(c, "inbound_after_switch_s", None if ti is None else round(time.time() - t0, 1))
+        c.expect(ti is not None, f"internet -> {cl} [{a}] through the new pgw")
+        for x in home["clients"]:
+            if not preferred(client_addrs(x), site):
+                not_preferred.add(x)
+        time.sleep(5)
+        result = mon_stop(c, "pgw-switch", clients, t0)
+        expect_traffic(c, "pgw-switch", {x: result[x] for x in home["clients"]}, GAP_PGW)
+        expect_traffic(c, "pgw-switch other home", {x: result[x] for x in other["clients"]}, GAP_BACK)
+        c.expect(not not_preferred, f"{site} prefix stayed preferred and the site stayed up {sorted(not_preferred)}")
+        check_source(c, home, site)
     finally:
         set_link(old, "up")
         c.log(f"restored the uplink of {old}")
@@ -554,45 +734,56 @@ def t_pgw_failure(c):
 
 def t_broker_down_pgw(c):
     """The broker is down and a pgw fails. The node still moves to the other
-    pgw of the site: every pgw has the peer already."""
+    pgw of the site: every pgw has the peer already. The report to the broker
+    waits; the old pgw drops the route after the 180 s handshake age."""
     settle(c)
     home = HOMES["home2"]
-    ap, cl, site = home["ap"], home["clients"][0], home["primary"]
+    ap, site = home["ap"], home["primary"]
     _, out = vm("gateway-gw01", "systemctl stop wgkex-broker; systemctl is-active wgkex-broker", 40)
     c.log(f"gw01 wgkex-broker: {out.strip()}")
     try:
         old = ap_status(ap)["sites"][site].get("pgw")
         if not c.expect(old in SITES[site]["gws"], f"{ap} uses pgw {old} for {site}"):
             return
+        mon_start(home["clients"])
         set_link(old, "down")
         t0 = time.time()
         st = wait_status(ap, lambda s: s["sites"][site].get("pgw") not in (old, "?") and
                          s["sites"][site].get("fresh") == "true", FAILOVER_TIMEOUT)
+        ap_metric(c, "intra_site_switch_s", round(time.time() - t0, 1) if st else None)
         c.expect(st is not None, f"{ap} moved {site} away from {old} with the broker down "
                                  f"after {int(time.time() - t0)} s")
-        c.log(f"{ap} status: {(st or ap_status(ap))['raw']}")
-        c.expect((st or ap_status(ap))["sites"][site]["state"] == "up", f"{site} stayed up")
-        t6 = time_to(lambda: ping(cl, TARGET6, count=1)[0], 120)
-        c.expect(t6 is not None, f"{cl} IPv6 works ({t6} s more)")
-        t4 = time_to(lambda: ping(cl, TARGET4, count=1)[0], 120)
-        c.expect(t4 is not None, f"{cl} IPv4 works ({t4} s more)")
-        c.expect(preferred(client_addrs(cl), site), f"{cl} {site} address still preferred")
+        st = st or ap_status(ap)
+        c.log(f"{ap} status: {st['raw']}")
+        c.expect(st["sites"][site]["state"] == "up", f"{site} stayed up")
+        c.expect(st["sites"][site].get("report") == "pending", f"the report to the broker waits: "
+                 f"report={st['sites'][site].get('report')}")
+        time.sleep(15)
+        result = mon_stop(c, "broker-down", home["clients"], t0)
+        expect_traffic(c, "broker-down", result, GAP_PGW)
+        for cl in home["clients"]:
+            c.expect(preferred(client_addrs(cl), site), f"{cl} {site} address still preferred")
         set_link(old, "up")
     finally:
         for gw in SITES[site]["gws"]:
             set_link(gw, "up")
         _, out = vm("gateway-gw01", "systemctl start wgkex-broker; systemctl is-active wgkex-broker", 40)
         c.log(f"gw01 wgkex-broker: {out.strip()}")
+    st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", 60)
+    c.expect(st is not None, f"{ap} sent the report when the broker came back")
 
 
 def t_flapping(c):
     """The primary site of home 2 flaps. After more than 3 changes in 10 min
-    the AP holds the site down for the penalty time, even when the site works.
-    The penalty is set to 180 s for this test (default 600 s)."""
+    the AP holds the site down for the penalty, even when the site works.
+    The penalty is set to 60 s for this test (default 60 s, doubles per new
+    penalty up to 600 s). Client traffic is measured during the flaps."""
     settle(c)
     home = HOMES["home2"]
     ap, site = home["ap"], home["primary"]
-    vm(ap, "echo '{\"penalty\":180}' > /etc/parker-as.tune")
+    vm(ap, "echo '{\"penalty\":60}' > /etc/parker-as.tune")
+    mon_start(home["clients"])
+    t0 = time.time()
     try:
         for n in range(2):
             set_site_links(site, "down")
@@ -604,12 +795,17 @@ def t_flapping(c):
                 c.expect(st is not None, f"flap {n + 1}: {site} up")
         st = wait_status(ap, lambda s: s["sites"][site].get("penalty") == "true", RECOVERY_TIMEOUT)
         c.expect(st is not None, f"{ap} holds {site} down with a penalty: {(st or ap_status(ap))['raw']}")
-        t0 = time.time()
-        held = wait_for(lambda: ap_status(ap)["sites"][site]["state"] == "up", 120)
-        c.expect(not held, f"{site} stays down for 120 s while its pgws work")
+        tp = time.time()
+        held = wait_for(lambda: ap_status(ap)["sites"][site]["state"] == "up", 45, step=2)
+        c.expect(not held, f"{site} stays down for 45 s while its pgws work")
         c.expect(ap_status(ap).get("active") == OTHER[site], f"{ap} stays on {OTHER[site]}")
-        st = wait_status(ap, lambda s: all_up(s, site), 180 + RECOVERY_TIMEOUT)
-        c.expect(st is not None, f"{ap} back on {site} {int(time.time() - t0)} s after the penalty started")
+        st = wait_status(ap, lambda s: all_up(s, site), RECOVERY_TIMEOUT)
+        hold = round(time.time() - tp, 1)
+        ap_metric(c, "penalty_hold_s", hold if st else None)
+        c.expect(st is not None and hold < 60 + 30, f"{ap} back on {site} {hold} s after the penalty started")
+        time.sleep(10)
+        result = mon_stop(c, "flapping", home["clients"], t0)
+        expect_traffic(c, "flapping", result)
     finally:
         vm(ap, "rm -f /etc/parker-as.tune")
         set_site_links(site, "up")
@@ -725,6 +921,9 @@ def main():
     if unknown:
         parser.error(f"unknown test(s): {unknown}")
     os.makedirs(args.results, exist_ok=True)
+    global RESULTS
+    RESULTS = args.results
+    mon_server()
 
     all_ok = True
     skip = None
@@ -740,11 +939,12 @@ def main():
             if name == "ready" and not c.ok:
                 skip = "lab not ready"
         with open(os.path.join(args.results, f"test-{i:02d}-{name}.json"), "w") as f:
-            json.dump({"name": name, "pass": c.ok, "evidence": c.evidence}, f, indent=2)
+            json.dump({"name": name, "pass": c.ok, "evidence": c.evidence, "metrics": c.metrics}, f, indent=2)
         print(f"== {name}: {'PASS' if c.ok else 'FAIL'}", flush=True)
         all_ok = all_ok and c.ok
     for site in SITES:  # leave the links up whatever happened
         set_site_links(site, "up")
+    mon_server(start=False)
     return 0 if all_ok else 1
 
 

@@ -169,7 +169,11 @@ summary = {
     "lab": "ffmuc-mp-as (multi-PoP active/standby)",
     "pass": ok,
     "steps": steps,
-    "tests": [{"name": t.get("name"), "pass": t.get("pass"), "evidence": t.get("evidence")} for t in tests],
+    "tests": [{"name": t.get("name"), "pass": t.get("pass"), "evidence": t.get("evidence"),
+               "metrics": t.get("metrics", {})} for t in tests],
+    # Downtime per case: "ap" in s (AP status), "clients" per client
+    # (longest gap in ms, lost pings, TCP stream survived, new connection in s).
+    "downtime": {t.get("name"): t["metrics"] for t in tests if t.get("metrics")},
 }
 json.dump(summary, open(os.path.join(results, "summary.json"), "w"), indent=2)
 print(json.dumps({"pass": ok, "tests": {t.get("name"): t.get("pass") for t in tests},
@@ -184,6 +188,7 @@ finish() {
 		FAILED=0
 		step collect-logs collect_logs || true
 		log "destroy"
+		sudo docker rm -f ffmuc-mp-as-monsrv > /dev/null 2>&1
 		sudo containerlab destroy -t ffmuc.clab.yml --cleanup > "${RESULTS}/destroy.log" 2>&1
 	fi
 	sudo chown -R "$(id -u):$(id -g)" "${RESULTS}" 2>/dev/null
