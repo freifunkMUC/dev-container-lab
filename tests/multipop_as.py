@@ -975,40 +975,55 @@ def t_flapping(c):
 
 
 def t_roam(c):
-    """client-1 roams from AP-1 to AP-3 (both meshed in home 1). It gets the
-    prefixes of AP-3. A packet with its old AP-1 source gets ICMPv6 code 5
-    from AP-3, so the client does not wait for a time-out."""
+    """client-1 roams from AP-1 to AP-3 (both meshed in home 1) with no link
+    bounce, as a real roam. br-client bridges bat0 and Gluon keeps RAs off
+    bat0, so AP-1 stays a router of the client until its router lifetime
+    (30 s) ends. Then the client sends through AP-3 with the AP-3 prefixes.
+    A packet with a source of no mesh node gets rejected by AP-3."""
     cl, port = "client-1", "client1"
     old = client_addrs(cl)
     c.log(f"{cl} on ap-1: {old}")
     ap3 = ap_status("ap-3")
     c.log(f"ap-3 status: {ap3['raw']}")
-    dx(cl, "ip link set lan down")
+    nets = {s: ipaddress.ip_network(ap3["sites"][s]["range6"]) for s in ("muc", "vie")}
+
+    def ap3_addr(site):
+        _, out = dx(cl, "ip -6 -o addr show dev lan scope global")
+        for m in re.finditer(r"inet6 ([0-9a-f:]+)/64", out):
+            if ipaddress.ip_address(m.group(1)) in nets[site]:
+                return m.group(1)
+        return None
+
     run(["sudo", "ip", "link", "set", port, "nomaster"])
     run(["sudo", "ip", "link", "set", port, "master", "as-ap3-lan"])
-    dx(cl, "ip link set lan up")
+    t0 = time.time()
     try:
-        def on_ap3():
-            a = client_addrs(cl)
-            return all(s in a and ipaddress.ip_address(a[s][0]) in ipaddress.ip_network(ap3["sites"][s]["range6"])
-                       for s in ("muc", "vie")) and preferred(a, "muc")
-        c.expect(wait_for(on_ap3, 120, step=5), f"{cl} has the ap-3 prefixes: {client_addrs(cl)}")
+        c.expect(wait_for(lambda: all(ap3_addr(s) for s in nets), 60, step=2),
+                 f"{cl} has the ap-3 prefixes: {client_addrs(cl)}")
+        # The old router expires after its lifetime (30 s) plus one RA
+        # interval. With the stock 180 s this check fails.
+        src = ap3_addr("muc")
+        works = wait_for(lambda: ping(cl, TARGET6, extra=f"-I {src}", count=2)[0], 75, step=3)
+        took = round(time.time() - t0, 1)
+        _, routes = dx(cl, "ip -6 route show default")
+        c.log(f"{cl} default routes: {' | '.join(routes.strip().splitlines())}")
+        c.expect(works, f"{cl} ping6 from the ap-3 source {src} works {took} s after the roam")
+        ap_metric(c, "roam_ap3_source_s", took if works else None)
         ok, out = ping(cl, TARGET6)
-        c.expect(ok, f"{cl} ping6 through ap-3: {last(out)}")
+        c.expect(ok, f"{cl} ping6 after the roam: {last(out)}")
         ok, out = ping(cl, TARGET4)
         c.expect(ok, f"{cl} ping IPv4 through ap-3: {last(out)}")
         if old.get("muc"):
             # AP-3 has a mesh route to the AP-1 /63, so the old address can
             # still work through AP-1. Else AP-3 must reject it with code 5.
             # It must not time out.
+            # The roam does not remove the old address (no link bounce).
             addr = old["muc"][0]
-            dx(cl, f"ip -6 addr add {addr}/128 dev lan nodad preferred_lft 0")
             ok, out = ping(cl, TARGET6, extra=f"-I {addr}", count=3)
             if ok:
                 c.expect(True, f"{cl} old AP-1 source {addr} works through the mesh: {last(out)}")
             else:
                 code5_from(c, cl, addr)
-            dx(cl, f"ip -6 addr del {addr}/128 dev lan")
         # A source of no node in the mesh: AP-3 must not send it into a
         # tunnel. The REJECT rule of parker_src counts it. The ICMPv6 error
         # goes to the off-link source, so it cannot reach the client: the
@@ -1024,6 +1039,7 @@ def t_roam(c):
                  f"ap-3 parker_src rejected the foreign source (REJECT packets {before} -> {after})")
         dx(cl, f"ip -6 addr del {foreign}/128 dev lan")
     finally:
+        # Bounce the link on the way back to get a clean state for the next tests.
         dx(cl, "ip link set lan down")
         run(["sudo", "ip", "link", "set", port, "nomaster"])
         run(["sudo", "ip", "link", "set", port, "master", "as-ap1-lan"])
@@ -1071,16 +1087,14 @@ def t_pmtu(c):
         c.expect(ok or (mtu is not None and mtu < 1500),
                  f"{cl} IPv4 DF 1500 through the CLAT: {'ok' if ok else f'frag needed, mtu {mtu}'}")
         # The echo reply of a Linux host has DF=0. Jool fragments a DF=0
-        # packet whose IPv6 form is larger than lowest-ipv6-mtu (default
-        # 1280), and the CLAT drops IPv6 fragments. So a DF ping of the full
-        # PMTU only shows if that limit applies; it is not a pass condition.
-        # A reply of 1260 bytes (1280 in IPv6) is not fragmented.
+        # packet whose IPv6 form is larger than lowest-ipv6-mtu, and the CLAT
+        # drops IPv6 fragments. The pgws set lowest-ipv6-mtu to the tunnel
+        # MTU, so the replies of both pings are not fragmented.
         ok, _, out = pmtu_ping(cl, TARGET4, None, 1260 - 28)
         c.expect(ok, f"{cl} IPv4 DF ping of 1260 bytes (1280 in IPv6) goes through: {last(out)}")
         if mtu:
             ok, _, out = pmtu_ping(cl, TARGET4, None, mtu - 28)
-            c.log(f"{cl} IPv4 DF ping of {mtu} bytes (DF=0 reply, fragmented by Jool): "
-                  f"{'goes through' if ok else 'lost'}: {last(out)}")
+            c.expect(ok, f"{cl} IPv4 DF ping of {mtu} bytes goes through: {last(out)}")
         # TCP sends DF=1 packets of full size: PMTU discovery through NAT64
         # and the CLAT must work for a bulk transfer.
         _, out = dx(cl, f"curl -4 -s -m 20 -o /dev/null -w '%{{size_download}}' http://{TARGET4}:8081/big",

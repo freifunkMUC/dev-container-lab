@@ -46,7 +46,7 @@
 --   * RA (one patched uradvd, reads ra-state on SIGHUP and then sends 3 RAs):
 --     active site 300/600, other up site 0/600, down site 0/600 for
 --     DEAD_KEEP s, then not sent. RDNSS: the node addresses, active first.
---     PREF64 while a site is up.
+--     PREF64 while a site is up. Router lifetime 30 s, an RA every 5-10 s.
 --   * dnsmasq upstream servers: DNS64 of the up sites, active first.
 --
 -- "lua parker-as.lua pin <config.json>" (from nodeconfig.sh, before
@@ -568,7 +568,12 @@ apply = function(conf, names, db, iface, tbl, up, active, now)
   for _, r in ipairs(rdnss) do table.insert(lines, r) end
   local ra_state = table.concat(lines, "\n") .. "\n"
   local stock = stock_radvd_args()
+  -- Router lifetime 30 s, an RA every 5-10 s: br-client bridges bat0, and
+  -- Gluon keeps RAs off bat0. So after a roam the old node stays the router
+  -- of the client (through the mesh) until the router lifetime ends, and its
+  -- parker_src rejects the prefixes of the new node.
   local ra_args = "-i " .. CLIENT_IF .. (stock ~= "" and (" " .. stock) or "")
+    .. " --default-lifetime 30 --max-router-adv-interval 10 --min-router-adv-interval 5"
   if active then ra_args = ra_args .. " --pref64 " .. NAT64_PREFIX end
   local restart = update_file(STATE .. "/ra-args", ra_args .. "\n")
   local pid = uradvd_pid()

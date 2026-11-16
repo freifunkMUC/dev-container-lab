@@ -241,9 +241,9 @@ tests/multipop_as.py normal       # one test
 | ra-single | One uradvd per AP. Each RA has both prefixes, the standby with preferred lifetime 0. |
 | source-prefix | Clients use the primary prefix. The internet sees it. |
 | inbound-standby | The internet reaches clients on the standby prefix (ICMP, TCP). |
-| pmtu | DF packets through the tunnel of each site get the correct PMTU. An IPv4 TCP bulk transfer through the CLAT works. |
+| pmtu | DF packets through the tunnel of each site get the correct PMTU. IPv4 DF pings of 1260 bytes and of the full PMTU (1347) go through the CLAT. An IPv4 TCP bulk transfer works. |
 | old-firmware | AP 4 gets one site. IPv6 and IPv4 work. |
-| roam | client-1 moves from AP 1 to AP 3. It gets the AP 3 prefixes. Its old source works through the mesh or gets ICMPv6 code 5. AP 3 rejects a foreign source. |
+| roam | client-1 moves from AP 1 to AP 3 with no link bounce. It gets the AP 3 prefixes. Its AP 3 source works in less than 75 s (router lifetime 30 s). Its old source works through the mesh or gets ICMPv6 code 5. AP 3 rejects a foreign source. |
 | plane | The EMQX cluster has 4 nodes. All brokers and `broker.lab` are healthy. The gateways reach `mqtt.lab` over the VPN. |
 | pgw-failure | One VIE pgw fails (home 2). The AP moves to the other pgw. The prefix stays preferred. The old pgw removes the /63 in less than 15 s. Client outage is measured. |
 | pgw-failure-home1 | As above, for gw01 (home 1, MUC). |
@@ -259,9 +259,12 @@ tests/multipop_as.py normal       # one test
 
 A failure is made on the internet node: `ip link set gwXX down`.
 
-Known limit of the CLAT: the echo reply of a Linux host has DF=0. Jool
-fragments a DF=0 packet when its IPv6 form is larger than
-`lowest-ipv6-mtu` (default 1280). The CLAT drops IPv6 fragments. Thus an
-IPv4 ping larger than 1260 bytes gets no reply. TCP uses DF=1 and is not
-affected. To remove this limit, set `lowest-ipv6-mtu` on the gateways to
-the tunnel MTU (1375).
+CLAT and MTU: the echo reply of a Linux host has DF=0. Jool fragments a
+DF=0 packet when its IPv6 form is larger than `lowest-ipv6-mtu`. The CLAT
+drops IPv6 fragments. Thus the gateways set `lowest-ipv6-mtu` to the tunnel
+MTU (1375).
+
+Roam: `br-client` bridges `bat0`, and Gluon keeps RAs off `bat0`. After a
+roam, the old AP stays a router of the client through the mesh until the
+router lifetime ends. The old AP rejects the sources of the new AP. Thus
+the AP sends RAs every 5 to 10 s with a router lifetime of 30 s.

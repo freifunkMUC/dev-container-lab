@@ -82,6 +82,14 @@
         firstmatch: true
         line: "        meta l4proto {tcp, udp} th dport 53 counter accept"
 
+    # --- NAT64: fragment translated DF=0 packets only above the tunnel MTU.
+    # The node CLAT drops IPv6 fragments (Jool default: 1280). ---
+    - name: Set the Jool lowest-ipv6-mtu to the tunnel MTU
+      ansible.builtin.lineinfile:
+        path: /usr/local/sbin/setup-jool.sh
+        line: "ip netns exec jool jool global update lowest-ipv6-mtu {{ wg_mtu }}"
+        insertafter: EOF
+
     # --- Broker plane: the brokers and EMQX run in multipop/brokers/ ---
     # ffbs-ansible puts a broker and mosquitto on gw01 (groups Brokers and
     # MQTT). This lab uses the stateless brokers behind haproxy instead.
