@@ -320,8 +320,8 @@ def home_with_primary(site):
 # ---------------------------------------------------------------- tests
 
 def t_ready(c):
-    """The lab is up: each AP has two live sites and the right primary, and
-    each client has an address from both sites and a DHCPv4 lease. noderoute
+    """The lab is up: the broker plane is complete, each AP has two live
+    sites and the right primary, and each client has an address from both sites and a DHCPv4 lease. noderoute
     starts DHCPv4 only after the IPv4 route of the AP is up, so tests that
     start before that see no IPv4 at all."""
     def ready():
@@ -338,10 +338,14 @@ def t_ready(c):
             if not client_v4(cl):
                 renew_stale_v4(c, cl)
                 return False
-        return all(set(client_addrs(cl)) == {OLD["site"]} for cl in OLD["clients"])
+        if not all(set(client_addrs(cl)) == {OLD["site"]} for cl in OLD["clients"]):
+            return False
+        return plane_complete()
 
     t0 = time.time()
     c.expect(wait_for(ready, READY_TIMEOUT, step=20), f"lab ready after {int(time.time() - t0)} s")
+    running, http = plane_health()
+    c.log(f"broker plane: EMQX {running}, health {http}")
     for home in list(HOMES.values()) + [AP3]:
         st = ap_status(home["ap"])
         c.log(f"{home['ap']} status: {st['raw']}")

@@ -236,7 +236,7 @@ tests/multipop_as.py normal       # one test
 
 | Test | Shows |
 |---|---|
-| ready | All APs are up and on their primary site. |
+| ready | The broker plane is complete. All APs are up and on their primary site. |
 | normal | IPv6, IPv4 through the CLAT, and DNS64 work. |
 | ra-single | One uradvd per AP. Each RA has both prefixes, the standby with preferred lifetime 0. |
 | source-prefix | Clients use the primary prefix. The internet sees it. |
