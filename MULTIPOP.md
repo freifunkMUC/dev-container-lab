@@ -141,6 +141,14 @@ the serial console. They are not production code.
    does not know them. Before a gateway change, the node resolves the name to
    an address and gives the address to `wg`. If no answer comes, the node
    uses the last good address.
+11. The probe does not use the client /64, so it can stay good while the
+   replies to the clients have no route. Example: a reload of the netifd
+   interface `client` removes the node address of a site from `br-client`
+   and with it the route to the client /64. The replies then go out of the
+   wrong tunnel and the gateway drops them with no error. On each cycle the
+   node looks up the route from the gateway to a client address of each
+   site. If the route does not use `br-client`, the node adds the address
+   again and writes the event `client_path_broken`.
 
 Set other times in `/etc/multipop.conf` on the node (see `mp-node.sh`).
 The node writes its events (site up or down, gateway change, report,

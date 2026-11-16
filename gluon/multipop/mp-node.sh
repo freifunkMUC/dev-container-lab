@@ -197,6 +197,11 @@ probe_all() {
 	[ -z "$pids" ] || wait $pids
 }
 
+client_addr() {
+	ip -6 addr add "$addr/64" dev br-client nodad 2>/dev/null ||
+		ip -6 addr add "$addr/64" dev br-client
+}
+
 tunnel() {
 	# Brings one tunnel ($1 = index in the concentrator list) in line.
 	i=$1
@@ -275,8 +280,22 @@ tunnel() {
 		ip -6 addr flush dev "$ifc" scope global
 		ip -6 addr add "$addr/128" peer "$gw" dev "$ifc" && put "$ifc.addr" "$addr $gw"
 	fi
-	ip -6 addr show dev br-client | grep -q "inet6 $addr/64" ||
-		ip -6 addr add "$addr/64" dev br-client
+	# The node address on br-client gives the main route for the client
+	# /64. A reload of the netifd interface "client" (noderoute does this
+	# on a config change) removes it. The tunnel probe does not use the
+	# client /64, so it stays fresh while the replies to the clients go
+	# out of the wrong tunnel. Check the reply path to a client address and
+	# repair it.
+	cl=$(ip -6 addr show dev br-client | grep "inet6 $addr/64 ")
+	case "$cl" in *dadfailed*) ip -6 addr del "$addr/64" dev br-client; cl= ;; esac
+	[ -n "$cl" ] || client_addr
+	rp=$(ip -6 route get "${addr%:*}:fffe" from "$gw" iif "$ifc" 2>/dev/null)
+	if [ -n "$rp" ] && ! echo "$rp" | grep -q "dev br-client"; then
+		log "$ifc ($site): client path broken (no route to the client /64 on br-client), repairing"
+		event "$ifc" client_path_broken "$site"
+		ip -6 addr del "$addr/64" dev br-client 2>/dev/null
+		client_addr
+	fi
 
 	# Source routing: one table per site with a default route without a
 	# next hop. Rule 1000 keeps all other routes (the client LAN) in main.

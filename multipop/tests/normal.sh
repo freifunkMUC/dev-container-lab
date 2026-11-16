@@ -45,5 +45,8 @@ done
 
 for ap in ${APS}; do
 	check "$ap status" ok "$(node "$ap" 'cat /tmp/multipop/status' | tr '\n' ';')"
+	# mp-node repairs a lost client /64 route on br-client (see MULTIPOP.md).
+	check "$ap client path repairs" ok "$(node "$ap" 'grep -c client_path_broken /tmp/multipop/events')"
+	node "$ap" 'ip -6 addr show dev br-client; ip -6 route show dev br-client; ip -6 rule' >> "${LOG}"
 done
 finish
