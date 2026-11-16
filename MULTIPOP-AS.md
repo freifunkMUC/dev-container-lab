@@ -217,9 +217,11 @@ Each ping runs for 1 s and then starts again, so a new ping selects the
 source address again, like a new application. After a site failover, an
 old TCP stream on the dead prefix stalls: the AP rejects its packets with
 ICMPv6 code 5, and Linux does not close an open stream for this. The
-monitor closes a stream after 3 s with no data and opens a new one, as an
-application with a keepalive does. The IPv4 TCP stream stops after each
-change of tunnel, because the NAT64 address changes.
+monitor closes a stream after 15 s with no data and opens a new one, as an
+application with a keepalive does. This limit is longer than the gap of a
+pgw switch (about 4 s), so `tcp6_survived` shows if an IPv6 stream lives
+through the switch. The IPv4 TCP stream stops after each change of pgw,
+because each pgw has its own NAT64 pool4 address.
 
 The Gluon AP boots first in setup mode, which gives clients a 192.168.1.x
 lease. The client link stays up when the AP reboots, so the `ready` test
@@ -239,16 +241,16 @@ tests/multipop_as.py normal       # one test
 | ra-single | One uradvd per AP. Each RA has both prefixes, the standby with preferred lifetime 0. |
 | source-prefix | Clients use the primary prefix. The internet sees it. |
 | inbound-standby | The internet reaches clients on the standby prefix (ICMP, TCP). |
-| pmtu | DF packets through the tunnel of each site get the correct PMTU. |
+| pmtu | DF packets through the tunnel of each site get the correct PMTU. An IPv4 TCP bulk transfer through the CLAT works. |
 | old-firmware | AP 4 gets one site. IPv6 and IPv4 work. |
-| roam | client-1 moves from AP 1 to AP 3. It gets the AP 3 prefixes. Its old source gets ICMPv6 code 5. |
+| roam | client-1 moves from AP 1 to AP 3. It gets the AP 3 prefixes. Its old source works through the mesh or gets ICMPv6 code 5. AP 3 rejects a foreign source. |
 | plane | The EMQX cluster has 4 nodes. All brokers and `broker.lab` are healthy. The gateways reach `mqtt.lab` over the VPN. |
 | pgw-failure | One VIE pgw fails (home 2). The AP moves to the other pgw. The prefix stays preferred. The old pgw removes the /63 in less than 15 s. Client outage is measured. |
 | pgw-failure-home1 | As above, for gw01 (home 1, MUC). |
-| plane-broker-down | broker-muc-1 is cut off. Then a pgw fails. The report goes through another broker. The old pgw removes the /63 in the normal limit. |
+| plane-broker-down | broker-muc-1 is cut off. Then a pgw fails. The report goes through another broker. The old pgw removes the /63 in the normal limit. The plane is complete again after the restore. |
 | plane-emqx-down | As above, with emqx-muc-1 cut off. |
 | plane-haproxy-down | As above, with the MUC haproxy cut off. `broker.lab` moves to VIE. |
-| broker-down-pgw | All brokers are cut off and a pgw fails. The AP still moves. The report waits for a broker. |
+| broker-down-pgw | All brokers are cut off and a pgw fails. The AP still moves. The report waits for a broker and is sent when the plane is back. |
 | site-failure-vie | Deprecation, source swap, ICMPv6 code 5, IPv4 failover, prefix removal. Client outage is measured. |
 | recovery-vie | The AP goes back to its primary site after dwell, with no hold-down. Client traffic does not stop. |
 | site-failure-long-muc | As above, and the dead address expires on the clients. |
@@ -256,3 +258,10 @@ tests/multipop_as.py normal       # one test
 | flapping | A flapping site is held down for the penalty (60 s). |
 
 A failure is made on the internet node: `ip link set gwXX down`.
+
+Known limit of the CLAT: the echo reply of a Linux host has DF=0. Jool
+fragments a DF=0 packet when its IPv6 form is larger than
+`lowest-ipv6-mtu` (default 1280). The CLAT drops IPv6 fragments. Thus an
+IPv4 ping larger than 1260 bytes gets no reply. TCP uses DF=1 and is not
+affected. To remove this limit, set `lowest-ipv6-mtu` on the gateways to
+the tunnel MTU (1375).

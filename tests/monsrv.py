@@ -2,7 +2,8 @@
 """Servers for the client traffic monitor (tests/clientmon.sh). Runs in the
 netns of the internet node. Both listen on IPv6 and IPv4.
   port 9000: a long-lived stream, one line every 100 ms.
-  port 8081: HTTP, answers "ok"."""
+  port 8081: HTTP, answers "ok". /big answers BIG bytes (a bulk transfer
+             with full-size DF packets, for the PMTU test)."""
 
 import http.server
 import socket
@@ -10,6 +11,7 @@ import socketserver
 import threading
 import time
 
+BIG = 256 * 1024
 
 class Dual:
     address_family = socket.AF_INET6
@@ -37,10 +39,11 @@ class StreamServer(Dual, socketserver.ThreadingTCPServer):
 
 class Ok(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        body = b"x" * BIG if self.path == "/big" else b"ok\n"
         self.send_response(200)
-        self.send_header("Content-Length", "3")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"ok\n")
+        self.wfile.write(body)
 
     def log_message(self, *args):
         pass

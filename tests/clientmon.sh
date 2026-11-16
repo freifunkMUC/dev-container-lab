@@ -8,11 +8,14 @@
 #                 kernel selects the source address again (as a new app does).
 #   tcp<f>.log    one long-lived TCP stream (port 9000). The server sends a
 #                 line every 100 ms; each line gets the receive time. "END"
-#                 means the stream closed (or had no data for 3 s); then a
-#                 new stream starts.
+#                 means the stream closed (or had no data for IDLE s); then
+#                 a new stream starts.
 #   curl<f>.log   one new HTTP connection (port 8081) every 1 s: "<time> ok|fail".
 # All times are epoch seconds with fractions (the host clock).
 D=/tmp/mon
+# Longer than the gap of a pgw switch (about 4 s), so a stream that stalls
+# but lives through the switch is not closed by the monitor.
+IDLE=15
 
 now() { date +%s.%N; }
 
@@ -26,11 +29,11 @@ pinger() { # family target
 }
 
 stream() { # family host
-	# A stream from a dead source stalls and does not close. socat -T 3
-	# closes it after 3 s with no data, and a new stream starts at once,
+	# A stream from a dead source stalls and does not close. socat -T
+	# closes it after IDLE s with no data, and a new stream starts at once,
 	# as an app with a keepalive does.
 	while [ ! -e "$D/stop" ]; do
-		socat -u -T 3 "TCP$1:$2:9000" STDOUT 2>&1
+		socat -u -T "${IDLE}" "TCP$1:$2:9000" STDOUT 2>&1
 		echo "END rc=$?"
 		sleep 0.2
 	done |
@@ -61,7 +64,7 @@ start)
 stop)
 	now > "$D/stop"
 	while read -r p; do kill "$p" 2>/dev/null; done < "$D/pids"
-	pkill -f "socat -u -T 3 TCP" 2>/dev/null
+	pkill -f "socat -u -T ${IDLE} TCP" 2>/dev/null
 	sleep 2
 	pkill -f "ping -[46] -D" 2>/dev/null
 	for f in start stop ping6.log ping4.log tcp6.log tcp4.log curl6.log curl4.log; do

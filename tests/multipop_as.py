@@ -476,6 +476,16 @@ def code5_from(c, cl, addr, extra_cmd=None):
     c.log(f"tcpdump: {' | '.join(out.strip().splitlines())}")
 
 
+def src_rejects(ap):
+    """Packets counted by the REJECT rule of the parker_src chain of an AP."""
+    _, out = vm(ap, "ip6tables -vnxL parker_src", 20)
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) > 2 and f[2] == "REJECT" and f[0].isdigit():
+            return int(f[0])
+    return None
+
+
 def time_to(fn, timeout, step=2):
     """Seconds until fn() is true, or None."""
     t0 = time.time()
@@ -556,7 +566,7 @@ def mon_parse(out, event):
         m[f"ping{f}_sent"] = sent
         m[f"ping{f}_lost"] = sent - got
         m[f"ping{f}_back"] = any(t > event for t in replies)
-        # A stream that ends (or stalls 3 s) is replaced by a new one. The
+        # A stream that ends (or stalls 15 s) is replaced by a new one. The
         # gap covers the stall and the reconnect; reconnect_s is the time
         # from the event until the new stream has data.
         data, ends = [], []
@@ -747,8 +757,17 @@ def pgw_routes(gw, net):
 
 
 def set_plane(ctr, state):
-    """Cut or restore the DC LAN link of a broker plane container."""
-    dx(ctr, f"ip link set eth1 {state}")
+    """Cut or restore the DC LAN link of a broker plane container. A link
+    down flushes the default route, so put it back (GW is in the env)."""
+    cmd = f"ip link set eth1 {state}"
+    if state == "up":
+        cmd += ' && ip route replace default via "$GW"'
+    dx(ctr, cmd)
+
+
+def plane_complete():
+    running, http = plane_health()
+    return len(running) == 4 and len(http) == 5 and all(v == "200" for v in http.values())
 
 
 def plane_health():
@@ -868,9 +887,8 @@ def t_plane_failure(c, ctr, home_key="home1"):
         pgw_switch(c, home_key, f"plane-{ctr}")
     finally:
         set_plane(ctr, "up")
-        ok = wait_for(lambda: (lambda r, h: len(r) == 4 and all(v == "200" for v in h.values())
-                               and len(h) == 5)(*plane_health()), 120, step=5)
-        c.log(f"{ctr} restored, plane complete: {bool(ok)}")
+        ok = wait_for(plane_complete, 180, step=5)
+        c.expect(bool(ok), f"{ctr} restored, plane complete again")
 
 
 def t_broker_down_pgw(c):
@@ -912,7 +930,9 @@ def t_broker_down_pgw(c):
         for n in PLANE["brokers"]:
             set_plane(n, "up")
         c.log("brokers restored")
-    st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", 60)
+    ok = wait_for(plane_complete, 180, step=5)
+    c.expect(bool(ok), "broker plane complete again")
+    st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", UNROUTE_TIMEOUT + 60)
     c.expect(st is not None, f"{ap} sent the report when the brokers came back")
 
 
@@ -989,11 +1009,19 @@ def t_roam(c):
             else:
                 code5_from(c, cl, addr)
             dx(cl, f"ip -6 addr del {addr}/128 dev lan")
-        # A source of no node in the mesh: AP-3 rejects it with code 5.
+        # A source of no node in the mesh: AP-3 must not send it into a
+        # tunnel. The REJECT rule of parker_src counts it. The ICMPv6 error
+        # goes to the off-link source, so it cannot reach the client: the
+        # AP routes it by its destination (into the tunnel), not to the LAN.
         # (2001:db8:100:ffff::/64 is outside the Parker /50 of MUC.)
         foreign = "2001:db8:100:ffff::1234"
         dx(cl, f"ip -6 addr add {foreign}/128 dev lan nodad preferred_lft 0")
-        code5_from(c, cl, foreign)
+        before = src_rejects("ap-3")
+        ok, out = ping(cl, TARGET6, extra=f"-I {foreign}", count=3)
+        after = src_rejects("ap-3")
+        c.expect(not ok, f"{cl} ping from foreign source {foreign} does not pass: {last(out)}")
+        c.expect(before is not None and after is not None and after >= before + 3,
+                 f"ap-3 parker_src rejected the foreign source (REJECT packets {before} -> {after})")
         dx(cl, f"ip -6 addr del {foreign}/128 dev lan")
     finally:
         dx(cl, "ip link set lan down")
@@ -1042,9 +1070,23 @@ def t_pmtu(c):
             ok, mtu, out = pmtu_ping(cl, TARGET4, None, 1472)
         c.expect(ok or (mtu is not None and mtu < 1500),
                  f"{cl} IPv4 DF 1500 through the CLAT: {'ok' if ok else f'frag needed, mtu {mtu}'}")
-        if not ok and mtu:
+        # The echo reply of a Linux host has DF=0. Jool fragments a DF=0
+        # packet whose IPv6 form is larger than lowest-ipv6-mtu (default
+        # 1280), and the CLAT drops IPv6 fragments. So a DF ping of the full
+        # PMTU only shows if that limit applies; it is not a pass condition.
+        # A reply of 1260 bytes (1280 in IPv6) is not fragmented.
+        ok, _, out = pmtu_ping(cl, TARGET4, None, 1260 - 28)
+        c.expect(ok, f"{cl} IPv4 DF ping of 1260 bytes (1280 in IPv6) goes through: {last(out)}")
+        if mtu:
             ok, _, out = pmtu_ping(cl, TARGET4, None, mtu - 28)
-            c.expect(ok, f"{cl} IPv4 DF ping of {mtu} bytes goes through: {last(out)}")
+            c.log(f"{cl} IPv4 DF ping of {mtu} bytes (DF=0 reply, fragmented by Jool): "
+                  f"{'goes through' if ok else 'lost'}: {last(out)}")
+        # TCP sends DF=1 packets of full size: PMTU discovery through NAT64
+        # and the CLAT must work for a bulk transfer.
+        _, out = dx(cl, f"curl -4 -s -m 20 -o /dev/null -w '%{{size_download}}' http://{TARGET4}:8081/big",
+                    timeout=40)
+        got = out.strip().splitlines()[-1] if out.strip() else ""
+        c.expect(got == str(256 * 1024), f"{cl} IPv4 TCP bulk transfer through the CLAT: {got or out} bytes")
 
 
 TESTS = [
