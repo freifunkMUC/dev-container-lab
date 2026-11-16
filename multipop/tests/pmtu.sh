@@ -2,7 +2,10 @@
 # Path MTU per site. A packet of the tunnel MTU with the source of a site
 # must arrive. A packet that is 1 byte larger must not, and the client must
 # learn the smaller MTU (ICMPv6 packet too big is not rejected). IPv4 goes
-# through the CLAT, which adds 20 bytes.
+# through the CLAT, which adds 20 bytes. The echo reply of the server has
+# DF=0: Jool on the pgw must not fragment it (lowest-ipv6-mtu 1375), because
+# the CLAT drops IPv6 fragments. A TCP download (DF=1) through the CLAT must
+# also work.
 . "$(dirname "$0")/common.sh"
 
 declare -A MTU MTU4
@@ -47,6 +50,14 @@ for c in ${CLIENTS}; do
 	echo "$out" | grep -qE ' [123] received' &&
 		check "$c IPv4: $m4 byte packets arrive through the CLAT" ok "$(echo "$out" | grep received)" ||
 		check "$c IPv4: $m4 byte packets arrive through the CLAT" fail "$(echo "$out" | tail -n 2 | tr '\n' ';')"
+	out=$(dx "$c" ping -4 -c 3 -i 0.5 -W 2 -M "do" -s 1232 "${SERVER4}" 2>&1)
+	echo "$out" | grep -qE ' [123] received' &&
+		check "$c IPv4: 1260 byte packets arrive through the CLAT" ok "$(echo "$out" | grep received)" ||
+		check "$c IPv4: 1260 byte packets arrive through the CLAT" fail "$(echo "$out" | tail -n 2 | tr '\n' ';')"
+	n=$(dx "$c" curl -4 -s -m 20 -o /dev/null -w '%{size_download}' "http://${SERVER4}:8082/" 2>&1 | tr -d '\r')
+	[ "$n" -ge 262144 ] 2>/dev/null &&
+		check "$c IPv4: TCP download of 256 KiB through the CLAT" ok "${n} bytes" ||
+		check "$c IPv4: TCP download of 256 KiB through the CLAT" fail "got '${n}'"
 	out=$(dx "$c" ping -4 -c 3 -i 0.5 -W 2 -M "do" -s $((m4 - 27)) "${SERVER4}" 2>&1)
 	echo "$out" | grep -qE ' [123] received' &&
 		check "$c IPv4: $((m4 + 1)) byte packets do not pass" fail "$(echo "$out" | grep received)" ||

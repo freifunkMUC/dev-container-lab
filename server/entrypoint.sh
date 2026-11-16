@@ -3,6 +3,7 @@
 # port 8080, so a test can see which prefix or NAT64 address a client used.
 # Port 8081 sends one line every 100 ms for as long as the connection stays
 # open: the failover tests use it as a long-lived TCP stream.
+# Port 8082 sends 256 KiB (full-size TCP segments, DF=1) for the PMTU test.
 
 until [ -e /sys/class/net/eth1 ]; do sleep 1; done
 
@@ -33,10 +34,17 @@ cat > /tmp/stream.sh <<'SH'
 /tmp/peer.sh; echo
 while echo x; do sleep 0.1; done
 SH
-chmod +x /tmp/peer.sh /tmp/echo.sh /tmp/stream.sh
+cat > /tmp/bulk.sh <<'SH'
+#!/bin/sh
+printf 'HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n'
+head -c 262144 /dev/zero
+SH
+chmod +x /tmp/peer.sh /tmp/echo.sh /tmp/stream.sh /tmp/bulk.sh
 socat TCP4-LISTEN:8080,fork,reuseaddr EXEC:/tmp/echo.sh &
 socat TCP6-LISTEN:8080,ipv6only=1,fork,reuseaddr EXEC:/tmp/echo.sh &
 socat TCP4-LISTEN:8081,fork,reuseaddr EXEC:/tmp/stream.sh &
 socat TCP6-LISTEN:8081,ipv6only=1,fork,reuseaddr EXEC:/tmp/stream.sh &
+socat TCP4-LISTEN:8082,fork,reuseaddr EXEC:/tmp/bulk.sh &
+socat TCP6-LISTEN:8082,ipv6only=1,fork,reuseaddr EXEC:/tmp/bulk.sh &
 
 exec sleep infinity

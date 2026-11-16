@@ -36,14 +36,16 @@ for p in "A ${new64_a}" "B ${new64_b}"; do
 	set -- $p
 	src=$(dx "$C" ip -6 -o addr show dev lan scope global | grep -v tentative |
 		awk -v p="$2:" '$4 ~ "^"p {sub("/.*", "", $4); print $4; exit}')
-	# The client can still use the router of ap-1 for some seconds, until
-	# neighbor unreachability detection finds that it is gone.
+	# br-client bridges bat0, so the router of ap-1 stays reachable through
+	# the mesh. ap-1 rejects the ap-2 prefixes. The client drops that router
+	# when its router lifetime (30 s) ends, because ap-1 RAs do not cross the
+	# mesh.
 	works() { [ -n "$src" ] && [ "$(echo_src "$C" -m 3 --interface "$src" "http://[${SERVER6}]:8080/")" = "$src" ]; }
 	t1=${SECONDS}
-	if wait_for 30 works; then
+	if wait_for 60 works; then
 		check "$C IPv6 from the ap-2 site $1 prefix" ok "$src after $((SECONDS - t1)) s"
 	else
-		check "$C IPv6 from the ap-2 site $1 prefix" fail "server saw '$(echo_src "$C" -m 3 --interface "$src" "http://[${SERVER6}]:8080/")' for '$src'"
+		check "$C IPv6 from the ap-2 site $1 prefix" fail "server saw '$(echo_src "$C" -m 3 --interface "$src" "http://[${SERVER6}]:8080/")' for '$src'; $(dx "$C" sh -c "ip -6 route show default; ip -6 route get ${SERVER6} from $src; ip -6 neigh show dev lan" 2>&1 | tr '\n' ';')"
 	fi
 done
 got=$(echo_src "$C" -4 "http://${SERVER4}:8080/")

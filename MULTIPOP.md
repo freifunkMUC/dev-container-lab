@@ -131,7 +131,10 @@ the serial console. They are not production code.
 9. One uradvd sends one RA with the prefixes of both sites (preferred 300 s,
    valid 600 s), RDNSS with the node address of each site, and PREF64 while
    a tunnel is up. On a change, the node sends SIGHUP 3 times, 3 s apart.
-   The patch is `multipop/patches/uradvd.patch`.
+   The patch is `multipop/patches/uradvd.patch`. The router lifetime is
+   30 s and the RA interval is 5-10 s. Reason: `br-client` bridges the
+   mesh, so after a roam the old node stays reachable as a router. It
+   rejects the prefixes of the new node. The client drops it after 30 s.
 10. dnsmasq gets the DNS64 server of the live sites, the active site first,
    on each change. The node resolves the `.lab` names (gateways and broker)
    through the WAN resolver (`gluon-wan-dnsmasq`, port 54), because the DNS64
@@ -149,6 +152,10 @@ the node site address to the gateway tunnel address. The chain lets this
 probe pass also when the site is down.
 
 IPv4 flows restart after a failover, because the NAT64 pool changes.
+
+Jool on each pgw uses `lowest-ipv6-mtu 1375` (the tunnel MTU). With the
+default of 1280, Jool fragments IPv4 packets with DF=0 (for example echo
+replies), and the CLAT drops IPv6 fragments.
 
 ## Run
 
@@ -174,7 +181,7 @@ set `FIRMWARE=<path>`.
 | `ra-single.sh` | The node sends one RA with both prefixes. No client address becomes deprecated. client-2 and client-4 use dhcpcd for IPv6, the other clients use the kernel. |
 | `source-prefix.sh` | The source prefix that each client uses by default. |
 | `rule8-tie.sh` | To the DNS64 of a site, the client uses the address of that site. To other destinations (a tie in RFC 6724 rule 8), the source is in one site, stays the same, and works. |
-| `pmtu.sh` | Per site: a packet of the tunnel MTU arrives, 1 byte more gives "packet too big". The same for IPv4 through the CLAT. |
+| `pmtu.sh` | Per site: a packet of the tunnel MTU arrives, 1 byte more gives "packet too big". The same for IPv4 through the CLAT, plus a 1260 byte ping and a 256 KiB TCP download. |
 | `roam.sh` | client-1 moves from ap-1 to ap-2. It gets the ap-2 prefixes and uses them. An old ap-1 source works or fails fast. |
 | `pgw-failure.sh` | One site B gateway fails (the internet drops its WireGuard packets; BGP and MQTT stay up). The node changes to the other gateway of site B. Site B stays up and preferred: no client address becomes deprecated. IPv6 (same address) and IPv4 are checked separately. The old gateway removes the node /63 a few seconds after the report. |
 | `broker-kill.sh` | One broker fails, then a gateway fails. The report goes through another broker. The old gateway removes the route within 10 s after the report. |

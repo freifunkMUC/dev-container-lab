@@ -223,6 +223,18 @@ index 0000000..21d522f
 +    for-downstream: no
 +    for-upstream: yes
 +    fallback-enabled: no
+diff --git a/roles/jool/templates/setup-jool.sh.j2 b/roles/jool/templates/setup-jool.sh.j2
+index 255c511..914bdf0 100755
+--- a/roles/jool/templates/setup-jool.sh.j2
++++ b/roles/jool/templates/setup-jool.sh.j2
+@@ -34,3 +34,7 @@ ip netns exec jool jool instance add --netfilter --pool6 64:ff9b::/96
+ ip netns exec jool jool pool4 add {{ nat64_ipv4 }} 2000-64999 --tcp
+ ip netns exec jool jool pool4 add {{ nat64_ipv4 }} 2000-64999 --udp
+ ip netns exec jool jool pool4 add {{ nat64_ipv4 }} 2000-64999 --icmp
++
++# Multi-PoP lab: fragment translated IPv4 packets (DF=0) only above the
++# tunnel MTU. The node CLAT drops IPv6 fragments.
++ip netns exec jool jool global update lowest-ipv6-mtu 1375
 diff --git a/roles/lab-net/templates/frr.conf.j2 b/roles/lab-net/templates/frr.conf.j2
 index c0b1db7..d289403 100644
 --- a/roles/lab-net/templates/frr.conf.j2
