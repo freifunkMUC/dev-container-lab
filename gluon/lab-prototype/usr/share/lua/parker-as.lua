@@ -30,7 +30,10 @@
 --     site. There is no hold-down.
 --
 -- A tick only probes. The full apply below runs when a state, the active
--- site, a pgw or the config changes, and every 10 s.
+-- site, a pgw or the config changes, and every 10 s. Each tick also checks
+-- the client path of each site (route get from the pgw into br-client). A
+-- netifd reload removes the site addresses; the tick adds them again and
+-- logs client_path_broken.
 --
 -- What it sets:
 --   * address6 of every site on br-client and (as /128) on wg_cX
@@ -474,11 +477,32 @@ local function tick(db)
     changed = true
   end
 
+  -- A netifd reload of the client interface removes the site addresses on
+  -- br-client. Then replies to clients go out of the wrong tunnel, while the
+  -- probe (from the /128 on wg_cX) still works. Check the client path every
+  -- cycle and add the address again.
+  db.path_broken = db.path_broken or 0
+  for _, name in ipairs(names) do
+    local site, i_name = conf.sites[name], iface[name]
+    local base = site.range6:match("^(.*::)/64$")
+    if i_name and targets[i_name] and base then
+      local route = output("ip -6 route get " .. base .. "5a5a:1234 from " .. targets[i_name]
+        .. " iif " .. i_name .. " 2>&1")
+      if not route:find("dev " .. CLIENT_IF .. " ", 1, true) then
+        sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF .. " nodad")
+        db.path_broken = db.path_broken + 1
+        log("client_path_broken site " .. name .. ": " .. route:gsub("\n", " "))
+        changed = true
+      end
+    end
+  end
+
   if changed then
     db.raw, db.full = raw, now
     apply(conf, names, db, iface, tbl, up, active, now)
   end
-  local status = { "primary_site=" .. conf.primary_site, "active=" .. tostring(active) }
+  local status = { "primary_site=" .. conf.primary_site, "active=" .. tostring(active),
+    "path_broken=" .. db.path_broken }
   local ra_state = read(STATE .. "/ra-state") or ""
   for _, name in ipairs(names) do
     local st = db.sites[name]
@@ -500,7 +524,7 @@ apply = function(conf, names, db, iface, tbl, up, active, now)
   local rules = { "pref 1000 lookup main suppress_prefixlength 0" }
   for i, name in ipairs(names) do
     local site = conf.sites[name]
-    sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF)
+    sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF .. " nodad")
     if iface[name] then
       -- The site address as /128 on the tunnel: the probe source.
       sh("ip -6 addr replace " .. site.address6 .. "/128 dev " .. iface[name])

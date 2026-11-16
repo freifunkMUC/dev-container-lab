@@ -467,6 +467,47 @@ def t_inbound_standby(c):
             c.expect("hello-from-standby" in out, f"internet -> {cl} [{addr}]:8080 TCP: {out.strip()!r}")
 
 
+def t_client_path(c):
+    """A netifd reload of the client interface removes the site addresses on
+    br-client. The AP finds the broken client path in one cycle (route get
+    from the pgw into br-client), adds the address again and logs
+    client_path_broken. Inbound traffic to the standby address works again."""
+    home = HOMES["home1"]
+    ap, cl, standby = home["ap"], home["clients"][0], OTHER[home["primary"]]
+    addr = client_addrs(cl).get(standby, (None,))[0]
+    if not c.expect(addr is not None, f"{cl} has a {standby} (standby) address"):
+        return
+    net = ipaddress.ip_network(ap_status(ap)["sites"][standby]["range6"])
+
+    def count():
+        _, out = vm(ap, "cat /tmp/parker-as/status")
+        m = re.search(r"path_broken=(\d+)", out)
+        return int(m.group(1)) if m else None
+
+    def node_addrs():
+        _, out = vm(ap, "ip -6 -o addr show dev br-client scope global")
+        return [a for a in re.findall(r"inet6 ([0-9a-f:]+)/64", out) if ipaddress.ip_address(a) in net]
+
+    for how, cmd in (("ifup client", "ifup client"),
+                     ("address removed", "; ".join(f"ip -6 addr del {a}/64 dev br-client" for a in node_addrs()))):
+        before = count()
+        vm(ap, cmd)
+        t0 = time.time()
+        back = wait_for(lambda: node_addrs() and count() is not None, 15, step=1)
+        took = round(time.time() - t0, 1)
+        after = count()
+        c.log(f"{ap} after {how}: path_broken {before} -> {after}, {standby} address {node_addrs()}")
+        c.expect(back, f"{ap} has its {standby} address on br-client {took} s after {how}")
+        if how == "address removed":
+            c.expect(after is not None and before is not None and after > before,
+                     f"{ap} counted client_path_broken ({before} -> {after})")
+            ap_metric(c, "client_path_repair_s", took if back else None)
+        rc, out = run(inet_argv(f"ping -6 -c 3 -W 2 {addr}"), 40)
+        c.expect(rc == 0, f"internet -> {cl} [{addr}] ping after {how}: {last(out)}")
+    _, out = vm(ap, "logread | grep client_path_broken | tail -3")
+    c.log(f"{ap} log: {' | '.join(out.strip().splitlines())}")
+
+
 def code5_from(c, cl, addr, extra_cmd=None):
     """Ping TARGET6 from addr on cl. Expect ICMPv6 type 1 code 5 back."""
     p = subprocess.Popen(["sudo", "docker", "exec", f"clab-{LAB}-{cl}", "sh", "-c",
@@ -1113,6 +1154,7 @@ TESTS = [
     ("ra-single", t_ra_single),
     ("source-prefix", t_source_prefix),
     ("inbound-standby", t_inbound_standby),
+    ("client-path", t_client_path),
     ("pmtu", t_pmtu),
     ("old-firmware", t_old_firmware),
     ("roam", t_roam),
