@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One pgw of site B fails (the internet loses its link). The nodes that use
+# One pgw of site B fails. The nodes that use
 # it must change to the other pgw of site B. IPv6 and IPv4 are checked
 # separately: the site B /63 stays the same and works again through the new
 # pgw; IPv4 keeps working (on the active tunnel, or again after the change).
@@ -7,6 +7,10 @@
 # and preferred on the nodes, and the clients keep a preferred site B address.
 # The node reports the change to the broker, and the old pgw must remove the
 # route of the /63 within a few seconds (without the broker: after 180 s).
+# The failure: the internet drops the WireGuard packets of the pgw (wg_cut).
+# The pgw keeps BGP and MQTT, so it announces the /63 until it removes the
+# route. With all-brokers, the internet loses the link to the pgw: then BGP
+# withdraws its routes, and only the 180 s safety net removes the route.
 # Metrics: the outage that the clients see (see meas_start in common.sh),
 # the detection time on the node, and the time until the old route is gone.
 #
@@ -105,7 +109,12 @@ meas_start "${CASE}" client-1 "${SRC_B[client-1]}"
 log "cutting $gw"
 meas_event "${CASE}"
 cut_at=$(date +%s)
-dx internet ip link set "$gw" down
+if [ "${FAIL}" = all-brokers ]; then
+	cut() { dx internet ip link set "$gw" "$1"; }
+else
+	cut() { if [ "$1" = down ]; then wg_cut "$gw"; else wg_restore "$gw"; fi; }
+fi
+cut down
 t0=${SECONDS}
 watch &
 watcher=$!
@@ -211,7 +220,7 @@ else
 fi
 
 log "restoring $gw"
-dx internet ip link set "$gw" up
+cut up
 for k in ${KILLED}; do svc_restore "$k" >> "${LOG}" 2>&1; done
 if [ -n "${KILLED}" ]; then
 	if wait_for 120 control_plane_ok; then

@@ -96,7 +96,25 @@ finish() {
 }
 
 # The global address of a client in a prefix, and whether it is deprecated.
-addr_in() { dx "$1" ip -6 -o addr show dev lan scope global | awk -v p="$2" '$4 ~ "^"p {sub("/.*", "", $4); print $4; exit}'; }
+# The AP of a client (roam.sh moves client-1 for a short time only).
+ap_of() { case "$1" in client-1 | client-2) echo ap-1 ;; *) echo ap-2 ;; esac; }
+# ap64 <ap> <site prefix>: the client /64 of the AP in that site, for
+# example 2001:db8:b:588. The prefixes do not change, so it is cached.
+ap64() {
+	local f="${RESULTS}/.prefixes-$1"
+	[ -s "$f" ] || node "$1" "cat /tmp/multipop/status" | awk '{print $4}' | grep '::/64$' > "$f"
+	awk -v p="$2" 'index($0, p) == 1 {sub("::/64", ""); print; exit}' "$f"
+}
+# addr_in <client> <site prefix>: an address of the client in the /64 of its
+# AP in that site. A client can still have an address of another AP (after
+# a roam); that address does not work through its AP.
+addr_in() {
+	local n
+	n=$(ap64 "$(ap_of "$1")" "$2")
+	n=${n:+$n:}
+	dx "$1" ip -6 -o addr show dev lan scope global | grep -v tentative |
+		awk -v p="${n:-$2}" '$4 ~ "^"p {sub("/.*", "", $4); print $4; exit}'
+}
 deprecated() { dx "$1" ip -6 -o addr show dev lan scope global | grep "inet6 $2/" | grep -q deprecated; }
 
 # The source address the test server sees. Extra arguments go to curl.
@@ -125,6 +143,23 @@ clear_damping() {
 	local ap
 	for ap in ${APS}; do node "$ap" 'rm -f /tmp/multipop/*.changes /tmp/multipop/*.penalty /tmp/multipop/*.penalties'; done
 }
+
+# wg_cut <gw> / wg_restore <gw>: the internet drops the WireGuard packets
+# (UDP port 10000) of one pgw. BGP and MQTT of the pgw stay up, so the pgw
+# still announces the /63 routes of its nodes: only the drop-route request
+# of the broker removes a route at once. The internet image has no
+# iptables, so this uses tc.
+WG_PORT=10000
+wg_cut() {
+	local p n
+	dx internet tc qdisc add dev "$1" clsact
+	for p in ip ipv6; do
+		n=$([ "$p" = ip ] && echo 10 || echo 11)
+		dx internet tc filter add dev "$1" egress protocol "$p" pref "$n" flower ip_proto udp dst_port "${WG_PORT}" action drop
+		dx internet tc filter add dev "$1" ingress protocol "$p" pref "$n" flower ip_proto udp src_port "${WG_PORT}" action drop
+	done
+}
+wg_restore() { dx internet tc qdisc del dev "$1" clsact; }
 
 # The /64 of an address.
 p64() { echo "$1" | cut -d: -f1-4; }
@@ -176,7 +211,10 @@ now() { date +%s.%N; }
 # survived, and the time until a new connection works. The case also gets
 # "downtime_s" (seconds, the worst client): ipv6_a and ipv6_b (ping from the
 # site A and site B address), ipv4, new_conn_ipv6 and new_conn_ipv4 (curl),
-# and inbound (the server pings a client address).
+# and inbound (the server pings a client address). meas_stop <case> <a|b>:
+# that site is down for the whole case, so its address cannot work; its
+# ping is not a downtime and gets "site down". The failover time of IPv6
+# is new_conn_ipv6 (a new connection from the other site).
 OUTAGE_SH="$(cat "${ROOT}/multipop/tests/outage-client.sh")"
 declare -A MEAS_EVENT
 meas_start() {
@@ -205,13 +243,14 @@ meas_stop() {
 		fi
 	done
 	# The worst client; null if a client never got a reply or a connection.
-	worst=$(jq --arg k "$1" 'def worst(f): [.clients[] | f] |
+	worst=$(jq --arg k "$1" --arg dead "${2:-}" 'def worst(f): [.clients[] | f] |
 			if length == 0 or any(. == null) then null else max / 1000 end;
 		.[$k] | {
 		ipv6_a: worst(.ping6a.max_gap_ms), ipv6_b: worst(.ping6b.max_gap_ms),
 		ipv4: worst(.ping4.max_gap_ms),
 		new_conn_ipv6: worst(.curl6.new_conn_ms), new_conn_ipv4: worst(.curl4.new_conn_ms),
-		inbound: (if .inbound.ping6 then .inbound.ping6.max_gap_ms / 1000 else null end)}' "${METRICS}")
+		inbound: (if .inbound.ping6 then .inbound.ping6.max_gap_ms / 1000 else null end)} |
+		if $dead != "" then .["ipv6_" + $dead] = "site down" else . end' "${METRICS}")
 	metric ".\"$1\".downtime_s" "${worst}"
 	log "$1: downtime ${worst//[$'\n' ]/}"
 }

@@ -1,5 +1,5 @@
 diff --git a/wgkex/broker/app.py b/wgkex/broker/app.py
-index 86a22d1..336b3dd 100644
+index 86a22d1..03cbe74 100644
 --- a/wgkex/broker/app.py
 +++ b/wgkex/broker/app.py
 @@ -2,6 +2,7 @@
@@ -37,7 +37,7 @@ index 86a22d1..336b3dd 100644
  # Track active brokers announced over MQTT
  active_brokers: set[str] = set()
  parker_active_brokers: set[str] = set()
-@@ -365,27 +379,44 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -365,27 +379,48 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
              f"Chose worker {worker.name} with {worker.peers} connected clients ({worker.diff})"
          )
  
@@ -75,11 +75,14 @@ index 86a22d1..336b3dd 100644
 +    )
 +    if site_prefixes:
 +        pgws: Dict[str, list] = {}
++        online = set()
 +        for name in sorted(parker_worker_data):
 +            worker_cfg = config.get_config().workers.get(name)
 +            entry = concentrator_entry(name, worker_cfg.id) if worker_cfg else None
-+            if entry is not None and parker_worker_metrics.get(name).online:
++            if entry is not None:
 +                pgws.setdefault(worker_cfg.pop, []).append((name, entry))
++                if parker_worker_metrics.get(name).online:
++                    online.add(name)
 +        preferred = {
 +            config.get_config().workers.get(worker.name).pop: worker.name
 +            for worker in selected_workers
@@ -90,6 +93,7 @@ index 86a22d1..336b3dd 100644
 +            pgws,
 +            preferred,
 +            "multiprefix" in req_data.caps.split(","),
++            online,
          )
 +        if built is not None:
 +            concentrators, provisioned, top, primary_site = built
@@ -100,7 +104,7 @@ index 86a22d1..336b3dd 100644
  
      # Provision the peer only on the workers this node was assigned to. A
      # broadcast here would (re-)install the peer and its prefix routes on
-@@ -396,10 +427,10 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -396,10 +431,10 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          "Range6": str(full_range6),
          "Keepalive": None,  # TODO make configurable
      }
@@ -114,7 +118,7 @@ index 86a22d1..336b3dd 100644
          )
  
      # A de-selected worker would keep the node's peer and prefix route until
-@@ -407,13 +438,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -407,13 +442,17 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      # drop the peer right away instead. A worker that predates the Remove
      # flag reads this as the re-provisioning it always received - no worse
      # than before.
@@ -135,7 +139,7 @@ index 86a22d1..336b3dd 100644
          )
  
      ipam.update_prefix(
-@@ -434,7 +469,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -434,7 +473,9 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
          concentrators=concentrators,
      )
  
@@ -146,7 +150,7 @@ index 86a22d1..336b3dd 100644
          "utf-8"
      )
      if config.get_config().broker_signing_key is None:
-@@ -458,6 +495,60 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
+@@ -458,6 +499,60 @@ def wg_api_v3_key_exchange() -> Tuple[Response | Dict, int]:
      )
  
  
@@ -207,7 +211,7 @@ index 86a22d1..336b3dd 100644
  @mqtt.on_connect()
  def handle_mqtt_connect(
      client: mqtt_client.Client, userdata: bytes, flags: Any, rc: Any
-@@ -481,6 +572,10 @@ def handle_mqtt_connect(
+@@ -481,6 +576,10 @@ def handle_mqtt_connect(
              )
              return
  
@@ -218,7 +222,7 @@ index 86a22d1..336b3dd 100644
      mqtt.subscribe(MQTTTopics.TOPIC_CONNECTED_PEERS.format(worker="+", domain="+"))
      mqtt.subscribe(MQTTTopics.TOPIC_WORKER_STATUS.format(worker="+"))
      mqtt.subscribe(MQTTTopics.TOPIC_WORKER_WG_DATA.format(worker="+", domain="+"))
-@@ -518,6 +613,20 @@ def handle_mqtt_connect(
+@@ -518,6 +617,20 @@ def handle_mqtt_connect(
          )
  
  
@@ -239,7 +243,7 @@ index 86a22d1..336b3dd 100644
  @mqtt.on_topic("wireguard-metrics/#")
  def handle_mqtt_message_metrics(
      client: mqtt_client.Client, userdata: bytes, message: mqtt_client.MQTTMessage
-@@ -740,6 +849,26 @@ def handle_mqtt_message(
+@@ -740,6 +853,26 @@ def handle_mqtt_message(
      )
  
  
@@ -266,7 +270,7 @@ index 86a22d1..336b3dd 100644
  def join_host_port(host: str, port: str) -> str:
      """Concatenate a port string with a host string using a colon.
      The host may be either a hostname, IPv4 or IPv6 address.
-@@ -783,6 +912,10 @@ def _publish_offline_and_exit(signum, frame) -> None:
+@@ -783,6 +916,14 @@ def _publish_offline_and_exit(signum, frame) -> None:
  
  
  # Manually re-init the mqtt client due to https://github.com/stlehmann/Flask-MQTT/issues/190
@@ -274,11 +278,15 @@ index 86a22d1..336b3dd 100644
 +    _ipam.publish = lambda topic, payload: mqtt.publish(
 +        topic, payload, qos=1, retain=True
 +    )
++# LAB PROTOTYPE: reconnect within a few seconds when the local EMQX node comes
++# back (the paho default waits up to 120 s), like the worker does.
++if hasattr(mqtt, "client"):
++    mqtt.client.reconnect_delay_set(min_delay=1, max_delay=4)
  mqtt.init_app(app)
  
  # Mark broker as offline on shutdown
 diff --git a/wgkex/broker/app_test.py b/wgkex/broker/app_test.py
-index ec49134..41d411b 100644
+index ec49134..3e6e4f0 100644
 --- a/wgkex/broker/app_test.py
 +++ b/wgkex/broker/app_test.py
 @@ -1,7 +1,9 @@
@@ -309,11 +317,11 @@ index ec49134..41d411b 100644
      def subscribe(self, *args, **kwargs):
          return None
  
-@@ -593,6 +599,192 @@ class TestBrokerApp(unittest.TestCase):
+@@ -593,6 +599,218 @@ class TestBrokerApp(unittest.TestCase):
              self.assertEqual(payload["PublicKey"], _PUBLIC_KEY)
              self.assertEqual(payload["Range6"], "2001:db8:42::/63")
  
-+    def _multisite_exchange(self, caps):
++    def _multisite_exchange(self, caps, offline=()):
 +        cfg = _parker_config()
 +        cfg.workers = config.Workers.from_dict(
 +            {
@@ -338,7 +346,10 @@ index ec49134..41d411b 100644
 +                "Port": 10000,
 +                "PublicKey": f"{name}-key",
 +            }
-+            self.broker_app.parker_worker_metrics.set_online(name)
++            if name in offline:
++                self.broker_app.parker_worker_metrics.set_offline(name)
++            else:
++                self.broker_app.parker_worker_metrics.set_online(name)
 +        # get_best_workers picks worker2 in pop-a and worker3 in pop-b.
 +        workers = [
 +            self.broker_app.WorkerResult(
@@ -414,6 +425,29 @@ index ec49134..41d411b 100644
 +                "parker/wireguard/worker3": "2001:db8:b:2::/63",
 +                "parker/wireguard/worker4": "2001:db8:b:2::/63",
 +            },
++        )
++
++    def test_parker_exchange_keeps_offline_pgw_in_the_list(self):
++        # A config fetch during a pgw outage must not shrink the pgw list.
++        answer, _ = self._multisite_exchange("multiprefix", offline=("worker3",))
++
++        by_id = {c["id"]: c for c in answer["concentrators"]}
++        self.assertEqual(by_id[2]["pubkey"], "worker4-key")
++        self.assertEqual(
++            [(p["pubkey"], p["preferred"]) for p in by_id[2]["pgws"]],
++            [("worker4-key", True), ("worker3-key", False)],
++        )
++
++    def test_parker_exchange_keeps_a_site_with_no_online_pgw(self):
++        # A config fetch during a site outage must not remove the site: the
++        # node deprecates and withdraws the prefix itself.
++        answer, _ = self._multisite_exchange(
++            "multiprefix", offline=("worker3", "worker4")
++        )
++
++        self.assertEqual(answer["primary_site"], "muc01")
++        self.assertEqual(
++            sorted(c["site"] for c in answer["concentrators"]), ["muc01", "vie01"]
 +        )
 +
 +    def test_parker_exchange_gives_old_firmware_one_site(self):
@@ -733,10 +767,10 @@ index 0000000..3e1fb64
 +    unittest.main()
 diff --git a/wgkex/broker/multisite.py b/wgkex/broker/multisite.py
 new file mode 100644
-index 0000000..21eb459
+index 0000000..7474795
 --- /dev/null
 +++ b/wgkex/broker/multisite.py
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,216 @@
 +"""LAB PROTOTYPE: per-site prefixes for the Parker multi-PoP design.
 +
 +Each site (PoP) has its own IPv6 parent prefix. A node gets one /63 from each
@@ -763,7 +797,7 @@ index 0000000..21eb459
 +
 +import json
 +import os
-+from typing import Any, Dict, List, Optional, Tuple
++from typing import Any, Dict, List, Optional, Set, Tuple
 +
 +from wgkex.broker.ipam import ParkerIPAM
 +from wgkex.broker.ipam_json import JSONFileIPAM
@@ -858,26 +892,39 @@ index 0000000..21eb459
 +    pgws: Dict[str, List[Tuple[str, Dict[str, Any]]]],
 +    preferred: Dict[str, str],
 +    multiprefix: bool,
++    online: Optional[Set[str]] = None,
 +) -> Optional[Answer]:
 +    """Builds the concentrators of the answer.
 +
 +    Arguments:
 +        prefixes: the node prefixes per PoP, from site_prefixes().
-+        pgws: the online pgws per PoP as (worker name, concentrator entry).
++        pgws: the known pgws per PoP as (worker name, concentrator entry).
 +        preferred: the worker that get_best_workers() selected per PoP.
 +        multiprefix: True if the node can use more than one site.
++        online: the names of the online pgws (None: all are online). The
++            list of a site keeps its offline pgws after the online ones, so
++            a node that fetches its config during a pgw outage can still
++            switch to that pgw later. A site with no online pgw stays in
++            the answer for a multiprefix node; the node probes it.
 +
 +    Returns:
 +        (concentrators, {worker name: /63 to provision}, top-level prefixes,
 +        primary site name), or None if no site has an online pgw.
 +    """
-+    live = [pop for pop in sorted(prefixes) if pgws.get(pop)]
-+    if not live:
++    def is_online(name: str) -> bool:
++        return online is None or name in online
++
++    pgws = {
++        pop: sorted(entries, key=lambda item: (not is_online(item[0]), item[0]))
++        for pop, entries in pgws.items()
++    }
++    known = [pop for pop in sorted(prefixes) if pgws.get(pop)]
++    up = [pop for pop in known if any(is_online(name) for name, _ in pgws[pop])]
++    if not up:
 +        return None
 +    primary = primary_pop(sites)
-+    top_pop = primary if primary in live else live[0]
-+    if not multiprefix:
-+        live = [top_pop]
++    top_pop = primary if primary in up else up[0]
++    live = known if multiprefix else [top_pop]
 +    site_ids = {pop: index + 1 for index, pop in enumerate(sorted(sites))}
 +
 +    concentrators: List[Dict[str, Any]] = []
@@ -885,7 +932,7 @@ index 0000000..21eb459
 +    for pop in live:
 +        entries = dict(pgws[pop])
 +        best = preferred.get(pop)
-+        if best not in entries:
++        if best not in entries or not is_online(best):
 +            best = pgws[pop][0][0]
 +        full_range6 = prefixes[pop]["full_range6"]
 +        if not multiprefix:
@@ -1260,7 +1307,7 @@ index 0000000..557bc06
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/wgkex/worker/mqtt.py b/wgkex/worker/mqtt.py
-index 45b85c0..1f04fe0 100644
+index 45b85c0..bd06840 100644
 --- a/wgkex/worker/mqtt.py
 +++ b/wgkex/worker/mqtt.py
 @@ -15,6 +15,7 @@ import pyroute2.netlink.exceptions
@@ -1301,7 +1348,7 @@ index 45b85c0..1f04fe0 100644
              logger.info(f"Subscribing to topic {topic}")
              client.subscribe(topic)
  
-@@ -317,6 +327,40 @@ def on_message_parker(
+@@ -317,6 +327,43 @@ def on_message_parker(
      q.put(str(message.payload.decode("utf-8")))
  
  
@@ -1328,10 +1375,13 @@ index 45b85c0..1f04fe0 100644
 +        public_key = data["PublicKey"]
 +        if not isinstance(public_key, str) or not public_key:
 +            raise ValueError("no PublicKey")
++        # A live message: use the receive time, so a clock offset between
++        # broker and worker cannot keep the route. A retained message can be
++        # old: use the report time, so a newer handshake keeps the route.
 +        handshake_routes.drop_route(
 +            public_key,
 +            get_config().parker.prefixes.ipv6.length or 63,
-+            at=data.get("Time"),
++            at=data.get("Time") if message.retain else None,
 +        )
 +    except Exception as error:
 +        logger.warning("Ignoring drop-route message: %s", error)
@@ -1343,7 +1393,7 @@ index 45b85c0..1f04fe0 100644
      exit_event: threading.Event,
      client: mqtt.Client,
 diff --git a/wgkex/worker/mqtt_test.py b/wgkex/worker/mqtt_test.py
-index 09ac76e..46f8052 100644
+index 09ac76e..81c9429 100644
 --- a/wgkex/worker/mqtt_test.py
 +++ b/wgkex/worker/mqtt_test.py
 @@ -135,6 +135,8 @@ class MQTTTest(unittest.TestCase):
@@ -1378,7 +1428,7 @@ index 09ac76e..46f8052 100644
          )
          self.assertEqual(thread.call_count, 2)
          client.loop_forever.assert_called_once()
-@@ -420,6 +427,41 @@ class MQTTTest(unittest.TestCase):
+@@ -420,6 +427,48 @@ class MQTTTest(unittest.TestCase):
          mqtt.on_message_parker(None, None, message)
          self.assertEqual(mqtt.q.get_nowait(), '{"PublicKey":"key"}')
  
@@ -1402,6 +1452,13 @@ index 09ac76e..46f8052 100644
 +        message.payload = b'{"PublicKey":"key","Time":12.5}'
 +        message.topic = f"parker/drop-route/{socket.gethostname()}/a2V5".encode()
 +        with mock.patch.dict("os.environ", {"WGKEX_ROUTE_ON_HANDSHAKE": "180"}):
++            # Live: the receive time counts, not the broker clock.
++            mqtt.on_message_drop_route(client, None, message)
++            drop_mock.assert_called_once_with("key", 63, at=None)
++            drop_mock.reset_mock()
++            client.reset_mock()
++            # Retained (after a reconnect): the report time counts.
++            message.retain = True
 +            mqtt.on_message_drop_route(client, None, message)
 +            # The cleared message comes back empty and is ignored.
 +            message.payload = b""

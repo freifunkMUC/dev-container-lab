@@ -131,6 +131,19 @@ if ! sudo containerlab deploy -t ffmuc.clab.yml > "${RESULTS}/deploy.log" 2>&1; 
 fi
 trap cleanup EXIT
 
+# renew_lease <client>: a client can keep a 192.168.1.x lease from the
+# setup mode of the node for a long time. Release it, remove the old IPv4
+# address, routes and lease, and start the DHCP client again (the same way
+# as client/entrypoint.sh).
+renew_lease() {
+	sudo docker exec "clab-${LAB}-$1" sh -c '
+		dhcpcd -k lan >/dev/null 2>&1; sleep 1
+		ip -4 addr flush dev lan scope global; ip -4 route flush dev lan
+		rm -f /var/lib/dhcpcd/*lan*
+		if [ "${IPV6_CLIENT:-kernel}" = dhcpcd ]; then dhcpcd -t 0 -b lan; else dhcpcd -4 -t 0 -b lan; fi
+	' > /dev/null 2>&1
+}
+declare -A renewed
 start=${SECONDS}
 ready=0
 while [ $((SECONDS - start)) -lt "${READY_TIMEOUT}" ]; do
@@ -147,6 +160,15 @@ while [ $((SECONDS - start)) -lt "${READY_TIMEOUT}" ]; do
 		a4=$(sudo docker exec "clab-${LAB}-${c}" ip -4 -o addr show dev lan scope global 2>/dev/null)
 		echo "${a}" | grep -q '2001:db8:a:' && echo "${a}" | grep -q '2001:db8:b:' &&
 			echo "${a4}" | grep -q ' 10\.0\.' && clients=$((clients + 1))
+		# Only a lease from the node in normal mode (10/8) counts. When both
+		# nodes are up and a client has another IPv4 address (also next to a
+		# 10/8 one), renew the lease at once, then at most every 120 s.
+		if [ "${ok}" = 2 ] && echo "${a4}" | grep ' inet ' | grep -vq ' inet 10\.' &&
+			[ $((SECONDS - ${renewed[$c]:--999})) -ge 120 ]; then
+			echo "[$(date +%T)] ${c}: no 10/8 lease ($(echo "${a4}" | awk '{print $4}' | tr '\n' ' ')), renewing it"
+			renew_lease "${c}"
+			renewed[$c]=${SECONDS}
+		fi
 	done
 	echo "[$(date +%T)] waiting: ${ok}/2 APs with both sites up, ${clients}/4 clients with both prefixes and a DHCPv4 lease"
 	if [ "${ok}" = 2 ] && [ "${clients}" = 4 ]; then

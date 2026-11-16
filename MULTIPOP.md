@@ -117,10 +117,13 @@ the serial console. They are not production code.
      ICMPv6 type 1 code 5 (`icmp6-policy-fail`). The chain also rejects
      sources that are not the node prefixes. It does not touch the outer
      WireGuard UDP packets. FORWARD and OUTPUT jump to the chain for
-     `-o wg_c+`. A fw3 include adds the jumps again after a reload,
+     `-o wg_c+`. A fw3 include adds the jumps again after a reload. The
+     node removes type 1 from `net.ipv6.icmp.ratemask`, so the per-client
+     ICMPv6 rate limit does not drop the reject of a new connection,
    - the node sends the RA burst at once,
    - after `MP_WITHDRAW_AFTER` seconds (lab: 120 s), the node stops sending
-     that prefix.
+     that prefix. The broker keeps a site with no online pgw in its answer,
+     so a config fetch during the outage does not remove the tunnel.
 8. The active tunnel is the primary site while it is up. The IPv4 default
    route (with it the CLAT) and the main IPv6 default use the active tunnel.
    The node goes back to the primary site as soon as the site is up again
@@ -173,7 +176,7 @@ set `FIRMWARE=<path>`.
 | `rule8-tie.sh` | To the DNS64 of a site, the client uses the address of that site. To other destinations (a tie in RFC 6724 rule 8), the source is in one site, stays the same, and works. |
 | `pmtu.sh` | Per site: a packet of the tunnel MTU arrives, 1 byte more gives "packet too big". The same for IPv4 through the CLAT. |
 | `roam.sh` | client-1 moves from ap-1 to ap-2. It gets the ap-2 prefixes and uses them. An old ap-1 source works or fails fast. |
-| `pgw-failure.sh` | One site B gateway fails. The node changes to the other gateway of site B. Site B stays up and preferred: no client address becomes deprecated. IPv6 (same address) and IPv4 are checked separately. The old gateway removes the node /63 a few seconds after the report. |
+| `pgw-failure.sh` | One site B gateway fails (the internet drops its WireGuard packets; BGP and MQTT stay up). The node changes to the other gateway of site B. Site B stays up and preferred: no client address becomes deprecated. IPv6 (same address) and IPv4 are checked separately. The old gateway removes the node /63 a few seconds after the report. |
 | `broker-kill.sh` | One broker fails, then a gateway fails. The report goes through another broker. The old gateway removes the route within 10 s after the report. |
 | `emqx-kill.sh` | The EMQX node of the old gateway's worker fails. The worker connects to another node. Then the same as `broker-kill.sh`. |
 | `haproxy-kill.sh` | The haproxy that the home uses fails. BGP moves `broker.lab` to the other haproxy. Then the same as `broker-kill.sh`. |
@@ -206,7 +209,7 @@ of client-1 (inbound). `outage.py` reads the results. Each test JSON has
 | `clients.<client>.tcp6/tcp4` | `source`, `survived` (the stream was still open at the end), `max_gap_ms` |
 | `clients.<client>.curl6/curl4` | `new_conn_ms` (from the cut until a new connection works), `failed`, `slowest_ms` |
 | `inbound` | the server ping to the client: `max_gap_ms`, `lost` |
-| `downtime_s` | the worst client, in seconds: `ipv6_a`, `ipv6_b`, `ipv4`, `new_conn_ipv6`, `new_conn_ipv4`, `inbound` |
+| `downtime_s` | the worst client, in seconds: `ipv6_a`, `ipv6_b`, `ipv4`, `new_conn_ipv6`, `new_conn_ipv4`, `inbound`. In a site failover, the ping of the failed site is `"site down"` |
 | `node` | node times after the cut, in seconds: `detection_s`, `switch_reported_s`, `old_route_gone_s`, `active_change_s`, `penalty_s` |
 
 `summary.json` has `downtime`: `downtime_s` and `node` for each case. The

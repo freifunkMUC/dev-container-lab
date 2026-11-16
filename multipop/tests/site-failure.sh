@@ -60,7 +60,7 @@ for c in ${CLIENTS}; do
 		check "$c IPv4 fails over to site A" fail "server saw '${got}'"
 done
 
-meas_stop "${CASE}"
+meas_stop "${CASE}" b
 d=$(node_event ap-1 site_down . "${CASE}")
 metric ".${CASE}.node" "$(jq -n --arg d "$d" '{detection_s: ($d | tonumber? // null)}')"
 

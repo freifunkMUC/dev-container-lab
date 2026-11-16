@@ -50,7 +50,7 @@ for c in ${CLIENTS}; do
 	fi
 done
 sleep 5
-meas_stop "${CASE}"
+meas_stop "${CASE}" a
 node_times "${CASE}" site_down
 
 CASE=switch_back

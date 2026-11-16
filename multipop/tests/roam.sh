@@ -17,7 +17,8 @@ move() {
 	dx "$C" rdisc6 -1 -w 2000 lan > /dev/null 2>&1 || true
 }
 
-has_new() { dx "$C" ip -6 -o addr show dev lan scope global | grep -v deprecated | grep -q "$1:"; }
+# A usable address: not deprecated, and duplicate address detection is done.
+has_new() { dx "$C" ip -6 -o addr show dev lan scope global | grep -v -e deprecated -e tentative | grep -q "$1:"; }
 
 log "moving $C to ap-2"
 move ap-2
@@ -33,10 +34,17 @@ done
 
 for p in "A ${new64_a}" "B ${new64_b}"; do
 	set -- $p
-	src=$(dx "$C" ip -6 -o addr show dev lan scope global | awk -v p="$2:" '$4 ~ "^"p {sub("/.*", "", $4); print $4; exit}')
-	got=$(echo_src "$C" --interface "$src" "http://[${SERVER6}]:8080/")
-	[ -n "$src" ] && [ "${got}" = "$src" ] && check "$C IPv6 from the ap-2 site $1 prefix" ok "${got}" ||
-		check "$C IPv6 from the ap-2 site $1 prefix" fail "server saw '${got}' for '$src'"
+	src=$(dx "$C" ip -6 -o addr show dev lan scope global | grep -v tentative |
+		awk -v p="$2:" '$4 ~ "^"p {sub("/.*", "", $4); print $4; exit}')
+	# The client can still use the router of ap-1 for some seconds, until
+	# neighbor unreachability detection finds that it is gone.
+	works() { [ -n "$src" ] && [ "$(echo_src "$C" -m 3 --interface "$src" "http://[${SERVER6}]:8080/")" = "$src" ]; }
+	t1=${SECONDS}
+	if wait_for 30 works; then
+		check "$C IPv6 from the ap-2 site $1 prefix" ok "$src after $((SECONDS - t1)) s"
+	else
+		check "$C IPv6 from the ap-2 site $1 prefix" fail "server saw '$(echo_src "$C" -m 3 --interface "$src" "http://[${SERVER6}]:8080/")' for '$src'"
+	fi
 done
 got=$(echo_src "$C" -4 "http://${SERVER4}:8080/")
 in_list "${got}" "${POOL4_A} ${POOL4_B}" && check "$C IPv4 after the roam" ok "${got}" ||
@@ -55,5 +63,10 @@ fi
 
 log "moving $C back to ap-1"
 move ap-1
+# Remove the ap-2 addresses and routes, so the next tests use the ap-1
+# prefixes only (a real client keeps them until the valid lifetime ends).
+dx "$C" sh -c "ip -6 -o addr show dev lan scope global | awk '\$4 ~ \"^(${new64_a}|${new64_b}):\" {print \$4}' |
+	xargs -r -n 1 ip -6 addr del dev lan; ip -6 route flush dev lan proto ra"
+dx "$C" rdisc6 -1 -w 2000 lan > /dev/null 2>&1 || true
 wait_stable 600
 finish

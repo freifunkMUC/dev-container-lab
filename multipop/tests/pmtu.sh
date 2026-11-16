@@ -40,7 +40,7 @@ for c in ${CLIENTS}; do
 
 	# The client knows the IPv4 MTU from DHCP (the route MTU). Else the
 	# CLAT MTU is the tunnel MTU less 20 bytes.
-	m4=$(dx "$c" ip -4 route show default | grep -oE 'mtu [0-9]+' | cut -d' ' -f2)
+	m4=$(dx "$c" ip -4 route show default | grep -oE 'mtu [0-9]+' | cut -d' ' -f2 | head -n 1)
 	m4=${m4:-${MTU4[$ap]:-$((${MTU[${ap}_muc01]} - 20))}}
 	# 28 bytes: the IPv4 header and the ICMP echo header.
 	out=$(dx "$c" ping -4 -c 3 -i 0.5 -W 2 -M "do" -s $((m4 - 28)) "${SERVER4}" 2>&1)

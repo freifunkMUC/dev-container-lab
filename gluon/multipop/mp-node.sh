@@ -452,6 +452,16 @@ cycle() {
 }
 
 log "starting (lab prototype)"
+# The reject (destination unreachable, code 5) must reach each new connection
+# of a client at once. The kernel limits ICMPv6 errors per destination (1 per
+# second by default), so a client that sends more from a dead source gets no
+# reject for its SYN. Remove type 1 from the limited types (the default mask
+# is 0-1,3-127); the global limit net.ipv4.icmp_msgs_per_sec stays.
+if [ -w /proc/sys/net/ipv6/icmp/ratemask ]; then
+	echo 0,3-127 > /proc/sys/net/ipv6/icmp/ratemask
+else
+	echo 0 > /proc/sys/net/ipv6/icmp/ratelimit
+fi
 while true; do
 	# A cycle starts every INTERVAL s, or when the previous one ends.
 	sleep "$INTERVAL" &
