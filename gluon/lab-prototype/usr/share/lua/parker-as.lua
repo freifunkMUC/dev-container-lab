@@ -489,9 +489,11 @@ local function tick(db)
       local route = output("ip -6 route get " .. base .. "5a5a:1234 from " .. targets[i_name]
         .. " iif " .. i_name .. " 2>&1")
       if not route:find("dev " .. CLIENT_IF .. " ", 1, true) then
-        sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF .. " nodad")
+        -- No nodad: the stock firmware has the BusyBox ip, which rejects it.
+        local added = sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF)
         db.path_broken = db.path_broken + 1
-        log("client_path_broken site " .. name .. ": " .. route:gsub("\n", " "))
+        log("client_path_broken site " .. name .. (added and "" or " (repair failed)") .. ": "
+          .. route:gsub("\n", " "))
         changed = true
       end
     end
@@ -524,7 +526,7 @@ apply = function(conf, names, db, iface, tbl, up, active, now)
   local rules = { "pref 1000 lookup main suppress_prefixlength 0" }
   for i, name in ipairs(names) do
     local site = conf.sites[name]
-    sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF .. " nodad")
+    sh("ip -6 addr replace " .. site.address6 .. "/64 dev " .. CLIENT_IF)
     if iface[name] then
       -- The site address as /128 on the tunnel: the probe source.
       sh("ip -6 addr replace " .. site.address6 .. "/128 dev " .. iface[name])

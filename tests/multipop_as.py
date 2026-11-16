@@ -488,6 +488,12 @@ def t_client_path(c):
         _, out = vm(ap, "ip -6 -o addr show dev br-client scope global")
         return [a for a in re.findall(r"inet6 ([0-9a-f:]+)/64", out) if ipaddress.ip_address(a) in net]
 
+    # Steady state: the repair must not run all the time.
+    first = count()
+    time.sleep(10)
+    second = count()
+    c.expect(first is not None and first == second,
+             f"{ap} client path is stable, path_broken {first} -> {second} in 10 s")
     for how, cmd in (("ifup client", "ifup client"),
                      ("address removed", "; ".join(f"ip -6 addr del {a}/64 dev br-client" for a in node_addrs()))):
         before = count()
