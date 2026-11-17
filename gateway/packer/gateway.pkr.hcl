@@ -16,8 +16,8 @@ variable "hostname" {
 }
 
 source "qemu" "parker" {
-  iso_url           = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-  iso_checksum      = "file:https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+  iso_url           = "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+  iso_checksum      = "file:https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS"
   disk_image        = true
 
   output_directory  = "output-${var.hostname}"

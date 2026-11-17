@@ -29,7 +29,7 @@ See [LAB-WGKEX.md](LAB-WGKEX.md) for what the gateways run since the move from e
 The Gateways and APs are set up as VMs, while the other functions (internet, CPE, client) are pure containers.
 Since containerlab is built around containers, those VMs are packaged as a container as well.
 
-The AP image is an unmodified Gluon build, while the Gateway images are built using Packer by taking an official Ubuntu Cloud image and running Ansible on it.
+The AP image is an unmodified Gluon build, while the Gateway images are built using Packer by taking an official Ubuntu 26.04 Cloud image and running Ansible on it.
 
 For a real gateway setup, the "lab-net" role in Ansible should be adjusted/replaced. For example, the VPN would be an actual VPN there, not a Linux bridge,
 and the BGP peering would need to be adjusted for the actual peer router.
