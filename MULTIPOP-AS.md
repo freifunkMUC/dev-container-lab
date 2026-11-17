@@ -161,6 +161,7 @@ files into the AP at the first boot.
 
 The broker and worker change is `gateway/packer/multipop/wgkex-multipop.patch`.
 The gateway change is `gateway/packer/multipop/overlay.yml`.
+The gateway VMs use the Ubuntu 26.04 cloud image, like the production Parker gateways.
 
 Clients: client-1, client-3, client-5 and client-6 use kernel SLAAC.
 client-2 and client-4 use dhcpcd for IPv6.
