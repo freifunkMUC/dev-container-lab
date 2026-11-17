@@ -145,7 +145,7 @@ collect_logs() {
 			> "${d}/${ap}.state.txt" 2>&1
 	done
 	for gw in gw01 gw02 gw03 gw04; do
-		timeout 120 ./node-cmd.sh "gateway-${gw}" 'sudo vtysh -c "show bgp summary" -c "show ip bgp" -c "show bgp ipv6"; sudo wg show all; ip -6 route | head -50; sudo jool session display --numeric 2>/dev/null | head -20; sudo journalctl -n 300 --no-pager -u "wgkex*" -u unbound -u frr' 60 \
+		timeout 120 ./node-cmd.sh "gateway-${gw}" 'sudo vtysh -c "show bgp summary" -c "show ip bgp" -c "show bgp ipv6"; sudo wg show all; ip route; ip -6 route | head -50; sudo jool session display --numeric 2>/dev/null | head -20; sudo journalctl -n 300 --no-pager -u "wgkex*" -u unbound -u frr' 60 \
 			> "${d}/gateway-${gw}.state.txt" 2>&1
 	done
 	sudo docker exec "clab-${LAB}-internet" vtysh -c 'show bgp summary' -c 'show ip bgp' -c 'show bgp ipv6' \

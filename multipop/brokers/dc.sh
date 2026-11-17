@@ -60,7 +60,21 @@ $(for i in 1 2 3 4; do echo "  neighbor 172.16.0.${i} peer-group GW"; done)
 !
 CONF
 
-up() { wget -q -T 1 -O /dev/null "$1" 2>/dev/null; }
+# Like the haproxy "fall 3 rise 1" checks: a target goes down after 3 failed
+# checks in a row, and up after 1 good check. One slow answer does not
+# withdraw the route.
+fails_dir=/run/rhi
+mkdir -p "${fails_dir}"
+up() {
+	f="${fails_dir}/$(echo "$1" | tr -c 'a-zA-Z0-9' _)"
+	if wget -q -T 2 -O /dev/null "$1" 2>/dev/null; then
+		echo 0 > "${f}"
+		return 0
+	fi
+	n=$(( $(cat "${f}" 2>/dev/null || echo 3) + 1 ))
+	echo "${n}" > "${f}"
+	[ "${n}" -lt 3 ]
+}
 rhi() {
 	while true; do
 		if up "http://${lb}/haproxy-health"; then

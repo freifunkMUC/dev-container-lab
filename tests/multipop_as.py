@@ -852,8 +852,19 @@ def t_plane(c):
     for n in list(PLANE["brokers"]) + ["broker.lab"]:
         c.expect(http.get(n) == "200", f"{n} health: {http.get(n)}")
     for gw in SITES["muc"]["gws"] + SITES["vie"]["gws"]:
-        _, out = vm(f"gateway-{gw}", f"ip route get {MQTT_LAB}", 20)
-        c.expect("dev vpn" in out, f"{gw} reaches mqtt.lab: {last(out)}")
+        got = {}
+
+        def via_vpn():
+            got["out"] = vm(f"gateway-{gw}", f"ip route get {MQTT_LAB}", 20)[1]
+            return "dev vpn" in got["out"]
+        # The DC routers announce mqtt.lab only while an EMQX health check
+        # passes. Give a short withdraw time to recover.
+        ok = wait_for(via_vpn, 30, step=3)
+        first = got["out"].strip().splitlines()[0] if got["out"].strip() else ""
+        if not ok:
+            _, rib = vm(f"gateway-{gw}", f"ip route show {MQTT_LAB}; sudo vtysh -c 'show ip route {MQTT_LAB}'", 20)
+            c.log(f"{gw} route to mqtt.lab: {' | '.join(rib.strip().splitlines())}")
+        c.expect(ok, f"{gw} reaches mqtt.lab: {first}")
 
 
 def pgw_switch(c, home_key, case):
@@ -1082,12 +1093,17 @@ def t_roam(c):
         # (2001:db8:100:ffff::/64 is outside the Parker /50 of MUC.)
         foreign = "2001:db8:100:ffff::1234"
         dx(cl, f"ip -6 addr add {foreign}/128 dev lan nodad preferred_lft 0")
-        before = src_rejects("ap-3")
+        # The client can still have the AP-1 route (it expires with the
+        # router lifetime), so the packets can go to AP-1 or AP-3. Both are
+        # mesh nodes and must reject them: count the rejects of both.
+        meshed = ("ap-1", "ap-3")
+        before = {a: src_rejects(a) for a in meshed}
         ok, out = ping(cl, TARGET6, extra=f"-I {foreign}", count=3)
-        after = src_rejects("ap-3")
+        after = {a: src_rejects(a) for a in meshed}
         c.expect(not ok, f"{cl} ping from foreign source {foreign} does not pass: {last(out)}")
-        c.expect(before is not None and after is not None and after >= before + 3,
-                 f"ap-3 parker_src rejected the foreign source (REJECT packets {before} -> {after})")
+        known = all(v is not None for v in list(before.values()) + list(after.values()))
+        c.expect(known and sum(after.values()) - sum(before.values()) >= 3,
+                 f"ap-1/ap-3 parker_src rejected the foreign source (REJECT packets {before} -> {after})")
         dx(cl, f"ip -6 addr del {foreign}/128 dev lan")
     finally:
         # Bounce the link on the way back to get a clean state for the next tests.

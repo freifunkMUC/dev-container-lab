@@ -81,7 +81,8 @@ flowchart LR
   config file. Worker state comes from MQTT. Thus all brokers give the
   same answer.
 - `broker.lab` (198.51.100.100) is an anycast address. Each DC router
-  announces it over BGP while its haproxy is healthy (checked every 1 s).
+  announces it over BGP while its haproxy is healthy (checked every 1 s;
+  3 failed checks in a row withdraw the route, like haproxy `fall 3`).
   The haproxy backend is all 4 brokers, with health checks. haproxy sets
   `X-Forwarded-For`. The brokers trust it only from the haproxy addresses.
 - `mqtt.lab` (198.51.100.101) is an ECMP route on each DC router to the
