@@ -11,6 +11,7 @@ cmd="$2"
 timeout="${3:-15}"
 
 sudo docker exec -i "clab-${LAB:-ffmuc-mp-as}-${node}" python3 -W ignore::DeprecationWarning - "$cmd" "$timeout" <<'EOF'
+import re
 import sys
 import telnetlib  # removed in Python 3.13; fine on the lab node images
 
@@ -33,8 +34,16 @@ if idx == 0:
 tn.write(cmd.encode() + b"; echo @@DO''NE@@\r")
 out = tn.read_until(b"@@DONE@@", timeout)
 text = out.decode(errors="replace")
+# Ubuntu 26.04 adds terminal codes on the serial console: OSC 3008 shell
+# context, bracketed paste, and colors from ip. Remove them, and drop the
+# lines that held only such codes.
+esc = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]|\r")
+lines = []
+for raw in text.splitlines():
+    line = esc.sub("", raw)
+    if line or not raw:
+        lines.append(line)
 # Strip the echoed command line and the sentinel line.
-lines = text.splitlines()
 if len(lines) < 2:
     sys.stderr.write("command produced no output before the timeout: %r\n" % text)
     sys.exit(1)

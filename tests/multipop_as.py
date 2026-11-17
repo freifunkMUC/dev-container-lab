@@ -70,6 +70,9 @@ EXPIRE_TIMEOUT = int(os.environ.get("EXPIRE_TIMEOUT", "900"))
 READY_TIMEOUT = int(os.environ.get("READY_TIMEOUT", "1800"))
 # The old pgw drops the /63 of the node this many s after the switch.
 UNROUTE_TIMEOUT = int(os.environ.get("UNROUTE_TIMEOUT", "15"))
+# The node sends the switch report over its WAN after the switch. It tries
+# again every 3 s; one lost TCP SYN costs up to 31 s of back-off.
+REPORT_TIMEOUT = int(os.environ.get("REPORT_TIMEOUT", "45"))
 # Upper limits for the longest gap in the client traffic (s). They catch a
 # return to slow failover; the measured values are in the metrics.
 GAP_PGW = float(os.environ.get("GAP_PGW", "30"))
@@ -912,8 +915,15 @@ def pgw_switch(c, home_key, case):
         ap_metric(c, "old_pgw_unroute_s", unroute)
         c.expect(gone is not None and unroute is not None and unroute <= UNROUTE_TIMEOUT,
                  f"{old} dropped {net} {unroute} s after the switch (limit {UNROUTE_TIMEOUT} s)")
-        st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", UNROUTE_TIMEOUT)
-        c.expect(st is not None, f"{ap} report to broker.lab done: {(st or ap_status(ap))['raw']}")
+        left = REPORT_TIMEOUT - (time.time() - t0 - (switched or 0))
+        st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", max(left, 1))
+        report = round(time.time() - t0 - switched, 1) if st and switched else None
+        ap_metric(c, "report_s", report)
+        c.expect(st is not None, f"{ap} report to broker.lab done {report} s after the switch "
+                                 f"(limit {REPORT_TIMEOUT} s): {(st or ap_status(ap))['raw']}")
+        if report is None or report > UNROUTE_TIMEOUT:
+            _, out = vm(ap, "logread -e parker-as | tail -n 30", 20)
+            c.log(f"{ap} parker-as log: {' | '.join(out.strip().splitlines())}")
         c.log(f"brokers that took the report: {reporters(since)}")
         if new:
             c.log(f"{new} routes {net}: {pgw_routes(new, net)}")

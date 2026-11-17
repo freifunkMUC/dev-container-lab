@@ -203,7 +203,9 @@ local function report_switch(name, iface, pgw)
   -- As nodeconfig.sh: out over the WAN (packet mark 1), and the server name
   -- resolves through the WAN resolver (gluon-wan-dns), not the tunnel DNS64.
   os.execute("(LIBPACKETMARK_MARK=1 LD_PRELOAD=libpacketmark.so gluon-wan-dns wget -q -T 3"
-    .. " -O /dev/null '" .. url .. "' && echo " .. pgw .. " > " .. done .. ") >/dev/null 2>&1 &")
+    .. " -O /dev/null '" .. url .. "' && echo " .. pgw .. " > " .. done
+    .. " || logger -t parker-as 'site " .. name .. ": report of " .. pgw
+    .. " failed, exit '$?) >/dev/null 2>&1 &")
 end
 
 local function resolve(endpoint)
