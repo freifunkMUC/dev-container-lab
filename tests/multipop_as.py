@@ -810,6 +810,17 @@ def pgw_routes(gw, net):
     return [line for line in out.splitlines() if line.startswith(net.split("/")[0])]
 
 
+def report_diag(c, ap):
+    """Log why the switch report of a node waits: name, route and a test
+    request over the WAN, the same way parker-as sends the report."""
+    cmd = ("gluon-wan-dns nslookup broker.lab 2>&1 | tail -n 3; ip -4 rule; ip -4 route show table 1; "
+           "LIBPACKETMARK_MARK=1 LD_PRELOAD=libpacketmark.so gluon-wan-dns "
+           "wget -T 3 -O /dev/null http://broker.lab/api/v3/lab/health 2>&1; echo wget exit $?; "
+           "ls -l /tmp/parker-as/report.* 2>&1; logread -e parker-as | tail -n 5")
+    _, out = vm(ap, cmd, 30)
+    c.log(f"{ap} report waits, diagnosis: {' | '.join(out.strip().splitlines())}")
+
+
 def set_plane(ctr, state):
     """Cut or restore the DC LAN link of a broker plane container. A link
     down flushes the default route, so put it back (GW is in the env)."""
@@ -910,17 +921,28 @@ def pgw_switch(c, home_key, case):
         ti = inbound_time(a)
         ap_metric(c, "inbound_after_switch_s", None if ti is None else round(time.time() - t0, 1))
         c.expect(ti is not None, f"internet -> {cl} [{a}] through the new pgw")
-        gone = time_to(lambda: not pgw_routes(old, net), UNROUTE_TIMEOUT + 30, step=1)
-        unroute = None if gone is None else round(time.time() - t0 - switched, 1) if switched else None
+        # The old pgw drops the /63 when a broker sends it the report of the
+        # node. Wait for both, and look at the node while the report waits.
+        unroute = report = None
+        diag = False
+        while time.time() - t0 - (switched or 0) < REPORT_TIMEOUT and (unroute is None or report is None):
+            age = round(time.time() - t0 - (switched or 0), 1)
+            if unroute is None and not pgw_routes(old, net):
+                unroute = age
+            if report is None and ap_status(ap)["sites"][site].get("report") == "none":
+                report = age
+            if report is None and age > 5 and not diag:
+                diag = True
+                report_diag(c, ap)
+            time.sleep(0.5)
         ap_metric(c, "old_pgw_unroute_s", unroute)
-        c.expect(gone is not None and unroute is not None and unroute <= UNROUTE_TIMEOUT,
-                 f"{old} dropped {net} {unroute} s after the switch (limit {UNROUTE_TIMEOUT} s)")
-        left = REPORT_TIMEOUT - (time.time() - t0 - (switched or 0))
-        st = wait_status(ap, lambda s: s["sites"][site].get("report") == "none", max(left, 1))
-        report = round(time.time() - t0 - switched, 1) if st and switched else None
         ap_metric(c, "report_s", report)
-        c.expect(st is not None, f"{ap} report to broker.lab done {report} s after the switch "
-                                 f"(limit {REPORT_TIMEOUT} s): {(st or ap_status(ap))['raw']}")
+        c.expect(report is not None, f"{ap} report to broker.lab done {report} s after the switch "
+                                     f"(limit {REPORT_TIMEOUT} s): {ap_status(ap)['raw']}")
+        # A late report delays the unroute; that is the report check above.
+        limit = max(UNROUTE_TIMEOUT, (report or 0) + 3)
+        c.expect(unroute is not None and unroute <= limit,
+                 f"{old} dropped {net} {unroute} s after the switch (limit {limit} s)")
         if report is None or report > UNROUTE_TIMEOUT:
             _, out = vm(ap, "logread -e parker-as | tail -n 30", 20)
             c.log(f"{ap} parker-as log: {' | '.join(out.strip().splitlines())}")

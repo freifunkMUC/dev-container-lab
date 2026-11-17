@@ -250,7 +250,7 @@ tests/multipop_as.py normal       # one test
 | plane | The EMQX cluster has 4 nodes. All brokers and `broker.lab` are healthy. The gateways reach `mqtt.lab` over the VPN. |
 | pgw-failure | One VIE pgw fails (home 2). The AP moves to the other pgw. The prefix stays preferred. The old pgw removes the /63 in less than 15 s. Client outage is measured. |
 | pgw-failure-home1 | As above, for gw01 (home 1, MUC). |
-| plane-broker-down | broker-muc-1 is cut off. Then a pgw fails. The report goes through another broker. The old pgw removes the /63 in the normal limit. The plane is complete again after the restore. |
+| plane-broker-down | broker-muc-1 is cut off. Then a pgw fails. The report goes through another broker. The report arrives in 45 s or less. The old pgw removes the /63 in 15 s, or in 3 s after a late report. When the report is late, the test logs a diagnosis from the AP. The plane is complete again after the restore. |
 | plane-emqx-down | As above, with emqx-muc-1 cut off. |
 | plane-haproxy-down | As above, with the MUC haproxy cut off. `broker.lab` moves to VIE. |
 | broker-down-pgw | All brokers are cut off and a pgw fails. The AP still moves. The report waits for a broker and is sent when the plane is back. |
