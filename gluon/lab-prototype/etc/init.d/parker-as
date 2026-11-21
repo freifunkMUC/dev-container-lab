@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# LAB PROTOTYPE: multi-PoP active/standby. Not upstream firmware.
+# shellcheck disable=SC2034
+START=99
+USE_PROCD=1
+
+start_service() {
+  procd_open_instance
+  procd_set_param command /bin/sh /usr/sbin/parker-as.sh
+  procd_set_param respawn
+  procd_close_instance
+}

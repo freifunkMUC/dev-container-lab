@@ -1,3 +1,6 @@
 [submodule "gateway/packer/ffbs-ansible"]
 	path = gateway/packer/ffbs-ansible
 	url = https://github.com/freifunkMUC/ffbs-ansible.git
+[submodule "gateway/packer/wgkex"]
+	path = gateway/packer/wgkex
+	url = https://github.com/freifunkMUC/wgkex.git

@@ -1,7 +1,6 @@
 FROM debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG DISK_SIZE=10G
 
 RUN apt-get update -qy \
    && apt-get install -y \
@@ -20,11 +19,10 @@ RUN apt-get update -qy \
    sshpass \
    && rm -rf /var/lib/apt/lists/*
 
-ARG IMAGE
-COPY $IMAGE* /
+# The gateway disk (qcow2) is not in the image. containerlab binds it
+# read-only to /<name>.qcow2, and qemu writes to an overlay in the container.
+# A copy in the image costs about 3 times the disk size during the build.
 COPY *.py /
-
-RUN qemu-img resize /${IMAGE} ${DISK_SIZE}
 
 EXPOSE 22 5000 10000-10099
 HEALTHCHECK CMD ["/healthcheck.py"]

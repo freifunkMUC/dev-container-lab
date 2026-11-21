@@ -1,9 +1,16 @@
-name: ffmuc
+# Multi-PoP active/standby lab. Its own name, management network and host
+# bridges (prefix "as-"), so it can run next to the active/active lab.
+name: ffmuc-mp-as
+
+mgmt:
+  network: ffmuc-mp-as
+  ipv4-subnet: 172.20.40.0/24
+  ipv6-subnet: 3fff:172:20:40::/64
 
 topology:
   nodes:
     # Represents the public internet.
-    # Establishes BGP peering with gateways and has static /30s to CPEs.
+    # Establishes BGP peering with gateways and has a static /30 to the CPE.
     internet:
       kind: linux
       network-mode: none
@@ -15,20 +22,26 @@ topology:
         - internet/frr.conf:/etc/frr/frr.conf
 
     # First AP.
-    # Gets its hostname, SSH access key and Parker config server configured
-    # via Python through its serial console. Connects to the gateways via
-    # its uplink to the CPE.
+    # Gets its hostname, SSH access key, Parker config server and the key it
+    # verifies its configuration with set via Python through its serial
+    # console. Reaches the gateways through the CPE of home 1 and meshes with
+    # AP-3 over the home 1 LAN. Primary site MUC.
     ap-1:
       kind: generic_vm
       network-mode: none
       image: ffmuc-lab:gluon
       env:
-        SSHKEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
-        CONFIGSERVER: 198.51.100.1
-    ap-1-lan:
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: broker.lab   # haproxy anycast, see multipop/brokers/
+        MESHONWAN: "1"   # meshes with AP-3 over the home 1 LAN
+        # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
+        # replacing the production key the image was built with.
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+    as-ap1-lan:
       kind: bridge
-      network-mode: none
-    # Two clients connected to the AP. They just run DHCP.
+    # Two clients connected to the AP. One uses kernel SLAAC, one dhcpcd.
     client-1:
       kind: linux
       network-mode: none
@@ -41,9 +54,11 @@ topology:
       network-mode: none
       image: ffmuc-lab:toolbox
       cmd: /entrypoint.sh
+      env:
+        IPV6_CLIENT: dhcpcd   # dhcpcd does IPv6 here; the others use the kernel
       binds:
         - client/entrypoint.sh:/entrypoint.sh
-    # The CPE ("home router") that the AP is connected to.
+    # The CPE ("home router") of home 1.
     # Has a IPv4-only connection to the internet, and provides the usual
     # home network connectivity (DHCP server, NAT to public IP) to the AP.
     cpe-1:
@@ -56,18 +71,37 @@ topology:
         WAN_GW4: 203.0.113.2
       binds:
         - cpe/entrypoint.sh:/entrypoint.sh
+    as-home1:
+      kind: bridge
 
-    # Same as above, for a second home and AP
+    # The CPE of home 2. A second public IPv4 lets the broker give AP-2 a
+    # different primary site (VIE).
+    cpe-2:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      env:
+        WAN_IP4: 203.0.113.5/30
+        WAN_GW4: 203.0.113.6
+      binds:
+        - cpe/entrypoint.sh:/entrypoint.sh
+    as-home2:
+      kind: bridge
+
+    # The second AP, in home 2, with its own clients. Primary site VIE.
     ap-2:
       kind: generic_vm
       network-mode: none
       image: ffmuc-lab:gluon
       env:
-        SSHKEY: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
-        CONFIGSERVER: 198.51.100.1
-    ap-2-lan:
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: broker.lab   # haproxy anycast, see multipop/brokers/
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+    as-ap2-lan:
       kind: bridge
-      network-mode: none
     client-3:
       kind: linux
       network-mode: none
@@ -80,60 +114,330 @@ topology:
       network-mode: none
       image: ffmuc-lab:toolbox
       cmd: /entrypoint.sh
+      env:
+        IPV6_CLIENT: dhcpcd   # dhcpcd does IPv6 here; the others use the kernel
       binds:
         - client/entrypoint.sh:/entrypoint.sh
-    cpe-2:
+
+    # AP-3: new firmware in home 1. Meshes with AP-1 over the home 1 LAN, so a
+    # client can roam between the two nodes. Primary site MUC.
+    ap-3:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gluon
+      env:
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: broker.lab   # haproxy anycast, see multipop/brokers/
+        MESHONWAN: "1"   # meshes with AP-1 over the home 1 LAN
+        # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
+        # replacing the production key the image was built with.
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+    as-ap3-lan:
+      kind: bridge
+    client-5:
       kind: linux
       network-mode: none
       image: ffmuc-lab:toolbox
       cmd: /entrypoint.sh
-      env:
-        WAN_IP4: 203.0.113.5/30
-        WAN_GW4: 203.0.113.6
       binds:
-        - cpe/entrypoint.sh:/entrypoint.sh
+        - client/entrypoint.sh:/entrypoint.sh
 
-    # The four gateways. Announce their public IPv4 and the IPv6 prefix
-    # to the internet, provide config to the APs and terminate WireGuard.
-    # Performs NAT44 for IPv4 access, routes IPv6 directly and offers NAT64.
+    # AP-4: old firmware in home 2. No lab prototype and no caps=multiprefix,
+    # so the broker gives it one site (VIE) and a stock config.
+    ap-4:
+      kind: generic_vm
+      network-mode: none
+      image: ffmuc-lab:gluon
+      env:
+        SSHKEY: |-
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5jOIOnppeVasDZBPF8JIHHyzKz9hxglB2fqH4337zs grische
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJ2N8svtgE/yeRAE305ePJlVkpiFvgFkI+MLcq1PutICLh+VcgBWhyUicAamlCrfRNXVYcYuEHowqxDpX4BkugzjNkYwBUqL8XDEnXdG68D3S2h5uxqGimTO4HaEdExvC5YUcoF5lOVVxcITHymvOUq4RTFuorPbqr8iwQB5BCnvgeomTBu/VJYvgXesUAsIks33Q2/ZMaPinsothTrNFE1I+3eP52VlcN/EJRd3vTmtuFa8oUpWJjs/3cXAn3dUG2k1o94Pi7jExb0cuCr2vmgn6eblJ6DiSfqUvyueyuKKW7UyfB+ZWjIHPH5prFURwIjkj2BQ/+uBMjoqyEq0Pb lukas.stockner@freenet.de
+        CONFIGSERVER: broker.lab   # haproxy anycast, see multipop/brokers/
+        LAB_FIRMWARE: old
+        # Second line of gateway/packer/ffbs-ansible/files/lab-node-config.pub,
+        # replacing the production key the image was built with.
+        CONFIGPUBKEY: RWQubIE8+Ib2pbE2iXnNfahjtt4z5OMmXwfEKvN8hwMB8pABXfVpYnga
+    as-ap4-lan:
+      kind: bridge
+    client-6:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - client/entrypoint.sh:/entrypoint.sh
+
+
+    # The four gateways in two sites: gw01/gw02 = MUC (2001:db8:100::/48),
+    # gw03/gw04 = VIE (2001:db8:200::/48). Each announces its site /48, its
+    # public IPv4 and its NAT64 IPv4 to the internet and terminates WireGuard.
+    # Every gateway runs the DNS64 of its site (one anycast address per site).
+    # The brokers and MQTT are in the broker plane below, not on a gateway.
     gateway-gw01:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw01
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw01.qcow2:/parker-gw01.qcow2:ro
     gateway-gw02:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw02
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw02.qcow2:/parker-gw02.qcow2:ro
     gateway-gw03:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw03
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw03.qcow2:/parker-gw03.qcow2:ro
     gateway-gw04:
       kind: generic_vm
       network-mode: none
-      image: ffmuc-lab:gateway-parker-gw04
-    gateway-vpn:
+      image: ffmuc-lab:gateway
+      binds:
+        - gateway/parker-gw04.qcow2:/parker-gw04.qcow2:ro
+    as-gw-vpn:
       kind: bridge
+
+    # --- Broker plane, as wgkex in production (ffmuc-salt-public) ---
+    # Per site: a DC router, one haproxy, two stateless wgkex brokers and two
+    # EMQX nodes. All four EMQX nodes form one cluster. The nodes reach the
+    # brokers by one name, broker.lab = 198.51.100.100: each site DC announces
+    # it by BGP while its haproxy is healthy (anycast, ECMP at the internet).
+    # The workers reach MQTT by one name, mqtt.lab = 198.51.100.101: each site
+    # DC announces it while one of its EMQX nodes is healthy. Each broker uses
+    # the EMQX node next to it. The DC routers announce mqtt.lab also to the
+    # gateways over the gateway VPN. See multipop/brokers/ and MULTIPOP-AS.md.
+    dc-muc:
+      kind: linux
       network-mode: none
+      image: quay.io/frrouting/frr:10.1.1
+      cmd: /dc.sh
+      env:
+        ASN: "65201"
+        VPN_ADDR: 172.16.0.65
+        NET: 198.51.100
+        BASE: "64"
+      binds:
+        - multipop/brokers/dc.sh:/dc.sh
+        - internet/daemons:/etc/frr/daemons
+    lb-muc:
+      kind: linux
+      network-mode: none
+      user: root
+      image: haproxy:3.0-alpine
+      entrypoint: /lab/net.sh
+      cmd: haproxy -f /lab/haproxy.cfg
+      env:
+        ADDR: 198.51.100.66/28
+        GW: 198.51.100.65
+        ANYCAST: 198.51.100.100
+      binds:
+        - multipop/brokers:/lab:ro
+    broker-muc-1:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:broker
+      entrypoint: /lab/net.sh
+      cmd: /lab/broker.sh
+      env:
+        ADDR: 198.51.100.67/28
+        GW: 198.51.100.65
+        MQTT: 198.51.100.69
+      binds:
+        - multipop/brokers:/lab:ro
+        - gateway/packer/ffbs-ansible/files/lab-node-config.sec:/sec/lab-node-config.sec:ro
+    broker-muc-2:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:broker
+      entrypoint: /lab/net.sh
+      cmd: /lab/broker.sh
+      env:
+        ADDR: 198.51.100.68/28
+        GW: 198.51.100.65
+        MQTT: 198.51.100.70
+      binds:
+        - multipop/brokers:/lab:ro
+        - gateway/packer/ffbs-ansible/files/lab-node-config.sec:/sec/lab-node-config.sec:ro
+    emqx-muc-1:
+      kind: linux
+      network-mode: none
+      user: root
+      image: ffmuc-lab:emqx
+      entrypoint: /lab/net.sh
+      cmd: /usr/bin/docker-entrypoint.sh /opt/emqx/bin/emqx foreground
+      env:
+        ADDR: 198.51.100.69/28
+        GW: 198.51.100.65
+        ANYCAST: 198.51.100.101
+        RUN_AS: emqx
+        EMQX_NODE__NAME: emqx@198.51.100.69
+        EMQX_NODE__COOKIE: ffmuc-lab-cookie
+        EMQX_NODE__DIST_NET_TICKTIME: 10s   # default 2m: a dead node blocks session takeover
+        EMQX_CLUSTER__DISCOVERY_STRATEGY: static
+        EMQX_CLUSTER__STATIC__SEEDS: "[emqx@198.51.100.69,emqx@198.51.100.70,emqx@198.51.100.85,emqx@198.51.100.86]"
+      binds:
+        - multipop/brokers:/lab:ro
+    emqx-muc-2:
+      kind: linux
+      network-mode: none
+      user: root
+      image: ffmuc-lab:emqx
+      entrypoint: /lab/net.sh
+      cmd: /usr/bin/docker-entrypoint.sh /opt/emqx/bin/emqx foreground
+      env:
+        ADDR: 198.51.100.70/28
+        GW: 198.51.100.65
+        ANYCAST: 198.51.100.101
+        RUN_AS: emqx
+        EMQX_NODE__NAME: emqx@198.51.100.70
+        EMQX_NODE__COOKIE: ffmuc-lab-cookie
+        EMQX_NODE__DIST_NET_TICKTIME: 10s   # default 2m: a dead node blocks session takeover
+        EMQX_CLUSTER__DISCOVERY_STRATEGY: static
+        EMQX_CLUSTER__STATIC__SEEDS: "[emqx@198.51.100.69,emqx@198.51.100.70,emqx@198.51.100.85,emqx@198.51.100.86]"
+      binds:
+        - multipop/brokers:/lab:ro
+    dc-vie:
+      kind: linux
+      network-mode: none
+      image: quay.io/frrouting/frr:10.1.1
+      cmd: /dc.sh
+      env:
+        ASN: "65202"
+        VPN_ADDR: 172.16.0.81
+        NET: 198.51.100
+        BASE: "80"
+      binds:
+        - multipop/brokers/dc.sh:/dc.sh
+        - internet/daemons:/etc/frr/daemons
+    lb-vie:
+      kind: linux
+      network-mode: none
+      user: root
+      image: haproxy:3.0-alpine
+      entrypoint: /lab/net.sh
+      cmd: haproxy -f /lab/haproxy.cfg
+      env:
+        ADDR: 198.51.100.82/28
+        GW: 198.51.100.81
+        ANYCAST: 198.51.100.100
+      binds:
+        - multipop/brokers:/lab:ro
+    broker-vie-1:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:broker
+      entrypoint: /lab/net.sh
+      cmd: /lab/broker.sh
+      env:
+        ADDR: 198.51.100.83/28
+        GW: 198.51.100.81
+        MQTT: 198.51.100.85
+      binds:
+        - multipop/brokers:/lab:ro
+        - gateway/packer/ffbs-ansible/files/lab-node-config.sec:/sec/lab-node-config.sec:ro
+    broker-vie-2:
+      kind: linux
+      network-mode: none
+      image: ffmuc-lab:broker
+      entrypoint: /lab/net.sh
+      cmd: /lab/broker.sh
+      env:
+        ADDR: 198.51.100.84/28
+        GW: 198.51.100.81
+        MQTT: 198.51.100.86
+      binds:
+        - multipop/brokers:/lab:ro
+        - gateway/packer/ffbs-ansible/files/lab-node-config.sec:/sec/lab-node-config.sec:ro
+    emqx-vie-1:
+      kind: linux
+      network-mode: none
+      user: root
+      image: ffmuc-lab:emqx
+      entrypoint: /lab/net.sh
+      cmd: /usr/bin/docker-entrypoint.sh /opt/emqx/bin/emqx foreground
+      env:
+        ADDR: 198.51.100.85/28
+        GW: 198.51.100.81
+        ANYCAST: 198.51.100.101
+        RUN_AS: emqx
+        EMQX_NODE__NAME: emqx@198.51.100.85
+        EMQX_NODE__COOKIE: ffmuc-lab-cookie
+        EMQX_NODE__DIST_NET_TICKTIME: 10s   # default 2m: a dead node blocks session takeover
+        EMQX_CLUSTER__DISCOVERY_STRATEGY: static
+        EMQX_CLUSTER__STATIC__SEEDS: "[emqx@198.51.100.69,emqx@198.51.100.70,emqx@198.51.100.85,emqx@198.51.100.86]"
+      binds:
+        - multipop/brokers:/lab:ro
+    emqx-vie-2:
+      kind: linux
+      network-mode: none
+      user: root
+      image: ffmuc-lab:emqx
+      entrypoint: /lab/net.sh
+      cmd: /usr/bin/docker-entrypoint.sh /opt/emqx/bin/emqx foreground
+      env:
+        ADDR: 198.51.100.86/28
+        GW: 198.51.100.81
+        ANYCAST: 198.51.100.101
+        RUN_AS: emqx
+        EMQX_NODE__NAME: emqx@198.51.100.86
+        EMQX_NODE__COOKIE: ffmuc-lab-cookie
+        EMQX_NODE__DIST_NET_TICKTIME: 10s   # default 2m: a dead node blocks session takeover
+        EMQX_CLUSTER__DISCOVERY_STRATEGY: static
+        EMQX_CLUSTER__STATIC__SEEDS: "[emqx@198.51.100.69,emqx@198.51.100.70,emqx@198.51.100.85,emqx@198.51.100.86]"
+      binds:
+        - multipop/brokers:/lab:ro
 
   links:
-    - endpoints: ["ap-1:eth1", "ap-1-lan:ap-1"]         # AP-1 LAN interface, goes to AP-1-LAN bridge
-    - endpoints: ["ap-1:eth2", "cpe-1:lan"]             # AP-1 WAN interface, goes to CPE-1
-    - endpoints: ["client-1:lan", "ap-1-lan:client1"]   # Client-1 interface, goes to AP-1-LAN bridge
-    - endpoints: ["client-2:lan", "ap-1-lan:client2"]   # Client-2 interface, goes to AP-1-LAN bridge
+    - endpoints: ["ap-1:eth1", "as-ap1-lan:ap-1"]       # AP-1 LAN interface
+    - endpoints: ["ap-1:eth2", "as-home1:ap-1-wan"]     # AP-1 WAN interface, goes to home 1
+    - endpoints: ["client-1:lan", "as-ap1-lan:client1"]
+    - endpoints: ["client-2:lan", "as-ap1-lan:client2"]
+    - endpoints: ["cpe-1:lan", "as-home1:cpe-1-lan"]
     - endpoints: ["cpe-1:wan", "internet:cpe1"]         # CPE-1 internet uplink
 
-    - endpoints: ["ap-2:eth1", "ap-2-lan:ap-2"]         # AP-2 LAN interface, goes to AP-2-LAN bridge
-    - endpoints: ["ap-2:eth2", "cpe-2:lan"]             # AP-2 WAN interface, goes to CPE-2
-    - endpoints: ["client-3:lan", "ap-2-lan:client3"]   # Client-3 interface, goes to AP-2-LAN bridge
-    - endpoints: ["client-4:lan", "ap-2-lan:client4"]   # Client-4 interface, goes to AP-2-LAN bridge
+    - endpoints: ["ap-2:eth1", "as-ap2-lan:ap-2"]       # AP-2 LAN interface
+    - endpoints: ["ap-2:eth2", "as-home2:ap-2-wan"]     # AP-2 WAN interface, goes to home 2
+    - endpoints: ["client-3:lan", "as-ap2-lan:client3"]
+    - endpoints: ["client-4:lan", "as-ap2-lan:client4"]
+    - endpoints: ["cpe-2:lan", "as-home2:cpe-2-lan"]
     - endpoints: ["cpe-2:wan", "internet:cpe2"]         # CPE-2 internet uplink
+
+    - endpoints: ["ap-3:eth1", "as-ap3-lan:ap-3"]       # AP-3 LAN interface
+    - endpoints: ["ap-3:eth2", "as-home1:ap-3-wan"]     # AP-3 WAN interface, home 1
+    - endpoints: ["client-5:lan", "as-ap3-lan:client5"]
+
+    - endpoints: ["ap-4:eth1", "as-ap4-lan:ap-4"]       # AP-4 LAN interface
+    - endpoints: ["ap-4:eth2", "as-home2:ap-4-wan"]     # AP-4 WAN interface, home 2
+    - endpoints: ["client-6:lan", "as-ap4-lan:client6"]
 
     - endpoints: ["gateway-gw01:eth1", "internet:gw01"] # GW-01 internet uplink
     - endpoints: ["gateway-gw02:eth1", "internet:gw02"] # GW-02 internet uplink
     - endpoints: ["gateway-gw03:eth1", "internet:gw03"] # GW-03 internet uplink
     - endpoints: ["gateway-gw04:eth1", "internet:gw04"] # GW-04 internet uplink
-    - endpoints: ["gateway-gw01:eth2", "gateway-vpn:gw01"] # GW-01 VPN
-    - endpoints: ["gateway-gw02:eth2", "gateway-vpn:gw02"] # GW-02 VPN
-    - endpoints: ["gateway-gw03:eth2", "gateway-vpn:gw03"] # GW-03 VPN
-    - endpoints: ["gateway-gw04:eth2", "gateway-vpn:gw04"] # GW-04 VPN
+    # The gateway VPN (ov.ffmuc.net in production). The workers reach the
+    # EMQX cluster (mqtt.lab) over it, also when their uplink is cut.
+    - endpoints: ["gateway-gw01:eth2", "as-gw-vpn:gw01"] # GW-01 VPN
+    - endpoints: ["gateway-gw02:eth2", "as-gw-vpn:gw02"]
+    - endpoints: ["gateway-gw03:eth2", "as-gw-vpn:gw03"]
+    - endpoints: ["gateway-gw04:eth2", "as-gw-vpn:gw04"]
+
+    - endpoints: ["dc-muc:wan", "internet:dcmuc"]       # MUC DC uplink (BGP)
+    - endpoints: ["dc-muc:vpn", "as-gw-vpn:as-dcmuc"]  # mqtt.lab for the workers
+    - endpoints: ["lb-muc:eth1", "dc-muc:lb"]
+    - endpoints: ["broker-muc-1:eth1", "dc-muc:b1"]
+    - endpoints: ["broker-muc-2:eth1", "dc-muc:b2"]
+    - endpoints: ["emqx-muc-1:eth1", "dc-muc:m1"]
+    - endpoints: ["emqx-muc-2:eth1", "dc-muc:m2"]
+
+    - endpoints: ["dc-vie:wan", "internet:dcvie"]       # VIE DC uplink (BGP)
+    - endpoints: ["dc-vie:vpn", "as-gw-vpn:as-dcvie"]  # mqtt.lab for the workers
+    - endpoints: ["lb-vie:eth1", "dc-vie:lb"]
+    - endpoints: ["broker-vie-1:eth1", "dc-vie:b1"]
+    - endpoints: ["broker-vie-2:eth1", "dc-vie:b2"]
+    - endpoints: ["emqx-vie-1:eth1", "dc-vie:m1"]
+    - endpoints: ["emqx-vie-2:eth1", "dc-vie:m2"]

@@ -1,0 +1,386 @@
+LAB PATCH for freifunkMUC/uradvd main-parker-new
+(9c44a2cae9e3573047f152c716950807767a8da3). Not upstream yet.
+
+One uradvd instance announces all prefixes of a node in one RA, each with
+its own lifetimes:
+  -a/-p <prefix>[,<preferred>[,<valid>]]
+  --state-file <file>   lines "<prefix>[,<preferred>[,<valid>]]" or
+                        "rdnss <ip>". Read at start and on SIGHUP; after
+                        SIGHUP three RAs go out, 3 s apart, the first at once.
+                        A bad file is ignored.
+
+Why: two instances on one link send from the same link-local address, and
+each RA leaves out the prefix of the other one. dhcpcd (and other clients
+that track the prefixes of a router) then deprecate the missing prefix.
+
+Apply with: patch -p1 < uradvd.patch
+Test with:  multipop/tests/uradvd-smoke.sh (needs docker)
+
+diff --git a/uradvd.c b/uradvd.c
+index b7f0993..3791054 100644
+--- a/uradvd.c
++++ b/uradvd.c
+@@ -13,6 +13,7 @@
+ #include <getopt.h>
+ #include <limits.h>
+ #include <poll.h>
++#include <signal.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -40,6 +41,7 @@
+ 
+ #define MAX_PREFIXES 8
+ #define MAX_RDNSS 3
++#define LIFETIME_DEFAULT UINT32_MAX
+ 
+ /* This is in bytes */
+ #define AdvLinkMTU 0u
+@@ -71,6 +73,7 @@ enum {
+ 	OPT_MIN_ROUTER_ADV_INTERVAL,
+ 	OPT_ADV_LINK_MTU,
+ 	OPT_PREF64,
++	OPT_STATE_FILE,
+ 	OPT_VERSION,
+ };
+ 
+@@ -126,6 +129,13 @@ static struct global {
+ 	size_t n_prefixes;
+ 	struct in6_addr prefixes[MAX_PREFIXES];
+ 	bool prefixes_onlink[MAX_PREFIXES];
++	/* Per-prefix lifetimes. LIFETIME_DEFAULT means: use the global value. */
++	uint32_t prefixes_valid[MAX_PREFIXES];
++	uint32_t prefixes_preferred[MAX_PREFIXES];
++
++	/* With --state-file, the prefixes and RDNSS come from this file. It is
++	   read at start and again on SIGHUP. */
++	const char *state_file;
+ 
+ 	size_t n_rdnss;
+ 	struct in6_addr rdnss[MAX_RDNSS];
+@@ -170,6 +180,15 @@ static inline void warn_errno(const char *message) {
+ }
+ 
+ 
++static volatile sig_atomic_t reload_requested;
++#define RELOAD_BURST 3
++static int burst_left;
++
++static void handle_sighup(int sig) {
++	(void)sig;
++	reload_requested = 1;
++}
++
+ static inline void update_time(void) {
+ 	clock_gettime(CLOCK_MONOTONIC, &G.time);
+ }
+@@ -520,6 +539,14 @@ static void handle_solicit(void) {
+ 	schedule_advert(true);
+ }
+ 
++static uint32_t prefix_valid(size_t i) {
++	return G.prefixes_valid[i] == LIFETIME_DEFAULT ? G.adv_valid_lifetime : G.prefixes_valid[i];
++}
++
++static uint32_t prefix_preferred(size_t i) {
++	return G.prefixes_preferred[i] == LIFETIME_DEFAULT ? G.adv_preferred_lifetime : G.prefixes_preferred[i];
++}
++
+ static void send_advert(void) {
+ 	if (!G.iface.ok)
+ 		return;
+@@ -536,7 +563,7 @@ static void send_advert(void) {
+ 
+ 	struct nd_opt_mtu mtu = {ND_OPT_MTU, 1, 0, htonl(G.adv_link_mtu)};
+ 
+-	struct nd_opt_prefix_info prefixes[G.n_prefixes];
++	struct nd_opt_prefix_info prefixes[MAX_PREFIXES];
+ 
+ 	size_t i;
+ 	for (i = 0; i < G.n_prefixes; i++) {
+@@ -550,8 +577,8 @@ static void send_advert(void) {
+ 			.nd_opt_pi_len = 4,
+ 			.nd_opt_pi_prefix_len = 64,
+ 			.nd_opt_pi_flags_reserved = flags,
+-			.nd_opt_pi_valid_time = htonl(G.adv_valid_lifetime),
+-			.nd_opt_pi_preferred_time = htonl(G.adv_preferred_lifetime),
++			.nd_opt_pi_valid_time = htonl(prefix_valid(i)),
++			.nd_opt_pi_preferred_time = htonl(prefix_preferred(i)),
+ 			.nd_opt_pi_prefix = G.prefixes[i],
+ 		};
+ 	}
+@@ -586,7 +613,7 @@ static void send_advert(void) {
+ 	struct iovec vec[] = {
+ 		IOVEC(advert),
+ 		IOVEC(lladdr),
+-		IOVEC(prefixes),
++		{ .iov_base = prefixes, .iov_len = G.n_prefixes * sizeof(prefixes[0]) },
+ 		IOVEC_IF(G.n_rdnss > 0, rdnss),
+ 		IOVEC_IF(G.n_rdnss > 0, rdnss_ips),
+ 		IOVEC_IF(G.adv_link_mtu > 0, mtu),
+@@ -630,16 +657,22 @@ static void send_advert(void) {
+ 	timespec_add(&G.next_advert_earliest, MIN_DELAY_BETWEEN_RAS);
+ 
+ 	schedule_advert(false);
++
++	/* After a reload, send RELOAD_BURST RAs MIN_DELAY_BETWEEN_RAS apart, so
++	   that a client which loses one RA still gets the new state soon. */
++	if (burst_left > 0 && --burst_left > 0)
++		G.next_advert = G.next_advert_earliest;
+ }
+ 
+ 
+ static void usage(void) {
+-	fprintf(stderr, "Usage: uradvd [-h] -i <interface> -a/-p <prefix> [ -a/-p <prefix> ... ]\n"
++	fprintf(stderr, "Usage: uradvd [-h] -i <interface> -a/-p <prefix>[,<preferred>[,<valid>]] [ -a/-p ... ]\n"
+ 			"[ --default-lifetime <seconds> ] [ --rdnss <ip> ... ]\n"
+ 			"[ --valid-lifetime <seconds> ] [ --preferred-lifetime <seconds> ]\n"
+ 			"[ --max-router-adv-interval <seconds> ] [ --min-router-adv-interval <seconds> ]\n"
+ 			"[ --adv-link-mtu <bytes> ]\n"
+ 			"[ --pref64 <prefix>/<len> ]\n"
++			"[ --state-file <file> ] (lines: \"<prefix>[,<preferred>[,<valid>]]\" or \"rdnss <ip>\"; re-read on SIGHUP)\n"
+ 			"[ --version ]\n");
+ }
+ 
+@@ -647,18 +680,19 @@ static void version(void) {
+ 	printf("uradvd %s\n", VERSION);
+ }
+ 
+-static void add_rdnss(const char *ip) {
++static bool add_rdnss(const char *ip) {
+ 	if (G.n_rdnss == MAX_RDNSS) {
+ 		fprintf(stderr, "uradvd: error: maximum number of RDNSS IPs is %i.\n", MAX_RDNSS);
+-		exit(1);
++		return false;
+ 	}
+ 
+ 	if (inet_pton(AF_INET6, ip, &G.rdnss[G.n_rdnss]) != 1) {
+ 		fprintf(stderr, "uradvd: error: invalid RDNSS IP address %s.\n", ip);
+-		exit(1);
++		return false;
+ 	}
+ 
+ 	G.n_rdnss++;
++	return true;
+ }
+ 
+ static void add_pref64(const char *prefix) {
+@@ -727,16 +761,42 @@ static void add_pref64(const char *prefix) {
+ 	return;
+ }
+ 
+-static void add_prefix(const char *prefix, bool adv_onlink) {
++static bool parse_lifetime(const char *str, uint32_t *out) {
++	char *endptr;
++	unsigned long val = strtoul(str, &endptr, 0);
++
++	if (!*str || *endptr || val > UINT32_MAX)
++		return false;
++
++	*out = val;
++	return true;
++}
++
++/* Parses "<prefix>[,<preferred>[,<valid>]]". */
++static bool add_prefix(const char *prefix, bool adv_onlink) {
+ 	if (G.n_prefixes == MAX_PREFIXES) {
+ 		fprintf(stderr, "uradvd: error: maximum number of prefixes is %i.\n", MAX_PREFIXES);
+-		exit(1);
++		return false;
+ 	}
+ 
+ 	const size_t len = strlen(prefix)+1;
+ 	char prefix2[len];
+ 	memcpy(prefix2, prefix, len);
+ 
++	uint32_t preferred = LIFETIME_DEFAULT, valid = LIFETIME_DEFAULT;
++	char *comma = strchr(prefix2, ',');
++	if (comma) {
++		*comma = 0;
++		char *comma2 = strchr(comma+1, ',');
++		if (comma2) {
++			*comma2 = 0;
++			if (!parse_lifetime(comma2+1, &valid))
++				goto error_lifetime;
++		}
++		if (!parse_lifetime(comma+1, &preferred))
++			goto error_lifetime;
++	}
++
+ 	char *slash = strchr(prefix2, '/');
+ 	if (slash) {
+ 		*slash = 0;
+@@ -752,13 +812,83 @@ static void add_prefix(const char *prefix, bool adv_onlink) {
+ 		goto error;
+ 
+ 	G.prefixes_onlink[G.n_prefixes] = adv_onlink;
++	G.prefixes_preferred[G.n_prefixes] = preferred;
++	G.prefixes_valid[G.n_prefixes] = valid;
+ 
+ 	G.n_prefixes++;
+-	return;
++	return true;
+ 
+ error:
+ 	fprintf(stderr, "uradvd: error: invalid prefix %s (only prefixes of length 64 are supported).\n", prefix);
+-	exit(1);
++	return false;
++
++error_lifetime:
++	fprintf(stderr, "uradvd: error: invalid lifetime in %s.\n", prefix);
++	return false;
++}
++
++static bool lifetimes_ok(void) {
++	for (size_t i = 0; i < G.n_prefixes; i++) {
++		if (prefix_preferred(i) > prefix_valid(i))
++			return false;
++	}
++	return true;
++}
++
++/* Reads the prefixes and RDNSS from G.state_file. On error, the old values stay. */
++static bool load_state(void) {
++	FILE *f = fopen(G.state_file, "r");
++	if (!f) {
++		warn_errno("unable to open state file");
++		return false;
++	}
++
++	size_t old_n_prefixes = G.n_prefixes, old_n_rdnss = G.n_rdnss;
++	struct in6_addr old_prefixes[MAX_PREFIXES], old_rdnss[MAX_RDNSS];
++	bool old_onlink[MAX_PREFIXES];
++	uint32_t old_valid[MAX_PREFIXES], old_preferred[MAX_PREFIXES];
++	memcpy(old_prefixes, G.prefixes, sizeof(old_prefixes));
++	memcpy(old_onlink, G.prefixes_onlink, sizeof(old_onlink));
++	memcpy(old_valid, G.prefixes_valid, sizeof(old_valid));
++	memcpy(old_preferred, G.prefixes_preferred, sizeof(old_preferred));
++	memcpy(old_rdnss, G.rdnss, sizeof(old_rdnss));
++
++	G.n_prefixes = 0;
++	G.n_rdnss = 0;
++
++	bool ok = true;
++	char line[256];
++	while (ok && fgets(line, sizeof(line), f)) {
++		line[strcspn(line, " \t\r\n")] = 0;
++		char *arg = line + strlen(line) + 1;
++		if (!line[0] || line[0] == '#')
++			continue;
++		if (strcmp(line, "rdnss") == 0) {
++			arg[strcspn(arg, " \t\r\n")] = 0;
++			ok = add_rdnss(arg);
++		} else {
++			ok = add_prefix(line, true);
++		}
++	}
++	fclose(f);
++
++	if (ok && !lifetimes_ok()) {
++		fprintf(stderr, "uradvd: error: a preferred lifetime is greater than its valid lifetime.\n");
++		ok = false;
++	}
++
++	if (!ok) {
++		fprintf(stderr, "uradvd: error: ignoring state file %s\n", G.state_file);
++		G.n_prefixes = old_n_prefixes;
++		G.n_rdnss = old_n_rdnss;
++		memcpy(G.prefixes, old_prefixes, sizeof(old_prefixes));
++		memcpy(G.prefixes_onlink, old_onlink, sizeof(old_onlink));
++		memcpy(G.prefixes_valid, old_valid, sizeof(old_valid));
++		memcpy(G.prefixes_preferred, old_preferred, sizeof(old_preferred));
++		memcpy(G.rdnss, old_rdnss, sizeof(old_rdnss));
++	}
++
++	return ok;
+ }
+ 
+ static void parse_cmdline(int argc, char *argv[]) {
+@@ -776,6 +906,7 @@ static void parse_cmdline(int argc, char *argv[]) {
+ 		[OPT_MIN_ROUTER_ADV_INTERVAL] = {"min-router-adv-interval", required_argument, 0, 0},
+ 		[OPT_ADV_LINK_MTU] = {"adv-link-mtu", required_argument, 0, 0},
+ 		[OPT_PREF64] = {"pref64", required_argument, 0, 0},
++		[OPT_STATE_FILE] = {"state-file", required_argument, 0, 0},
+ 		[OPT_VERSION] = {"version", 0, 0, 0},
+ 		{0, 0, 0, 0}
+ 	};
+@@ -797,7 +928,8 @@ static void parse_cmdline(int argc, char *argv[]) {
+ 				break;
+ 
+ 			case OPT_RDNSS:
+-				add_rdnss(optarg);
++				if (!add_rdnss(optarg))
++					exit(1);
+ 				break;
+ 
+ 			case OPT_VALID_LIFETIME:
+@@ -857,6 +989,10 @@ static void parse_cmdline(int argc, char *argv[]) {
+ 				add_pref64(optarg);
+ 				break;
+ 
++			case OPT_STATE_FILE:
++				G.state_file = optarg;
++				break;
++
+ 			case OPT_VERSION:
+ 				version();
+ 				exit(0);
+@@ -875,11 +1011,9 @@ static void parse_cmdline(int argc, char *argv[]) {
+ 			break;
+ 
+ 		case 'a':
+-			add_prefix(optarg, false);
+-			break;
+-
+ 		case 'p':
+-			add_prefix(optarg, true);
++			if (!add_prefix(optarg, c == 'p'))
++				exit(1);
+ 			break;
+ 
+ 		case 'h':
+@@ -896,12 +1030,20 @@ static void parse_cmdline(int argc, char *argv[]) {
+ int main(int argc, char *argv[]) {
+ 	parse_cmdline(argc, argv);
+ 
+-	if (!G.ifname || !G.n_prefixes)
++	if (G.state_file)
++		load_state();
++
++	if (!G.ifname || (!G.n_prefixes && !G.state_file))
+ 		exit_error("interface and prefix arguments are required.\n", 0);
+ 
+-	if (G.adv_preferred_lifetime > G.adv_valid_lifetime)
++	if (G.adv_preferred_lifetime > G.adv_valid_lifetime || !lifetimes_ok())
+ 		exit_error("The preferred lifetime must be less or equal than the valid lifetime.\n", 0);
+ 
++	/* No SA_RESTART: SIGHUP must wake up poll(). */
++	struct sigaction sa = { .sa_handler = handle_sighup };
++	sigemptyset(&sa.sa_mask);
++	sigaction(SIGHUP, &sa, NULL);
++
+ 	if (G.min_rtr_adv_interval > 0.75*G.max_rtr_adv_interval )
+ 		exit_error("The mininmal router advertisement interval must not be greater than 0.75 * max-rtr-adv-interval.\n", 0);
+ 
+@@ -930,11 +1072,20 @@ int main(int argc, char *argv[]) {
+ 		}
+ 
+ 		int ret = poll(fds, 2, timeout);
+-		if (ret < 0)
++		if (ret < 0 && errno != EINTR)
+ 			exit_errno("poll");
+ 
+ 		update_time();
+ 
++		if (reload_requested) {
++			reload_requested = 0;
++			/* Send the new state at once; do not wait for the next interval. */
++			if (G.state_file && load_state()) {
++				G.next_advert = G.time;
++				burst_left = RELOAD_BURST;
++			}
++		}
++
+ 		if (fds[0].revents & POLLIN)
+ 			handle_solicit();
+ 		if (fds[1].revents & POLLIN)

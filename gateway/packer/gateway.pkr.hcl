@@ -15,9 +15,15 @@ variable "hostname" {
   type = string
 }
 
+# Set to true on a machine without a display (for example the CI rig).
+variable "headless" {
+  type    = bool
+  default = false
+}
+
 source "qemu" "parker" {
-  iso_url           = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-  iso_checksum      = "file:https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+  iso_url           = "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+  iso_checksum      = "file:https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS"
   disk_image        = true
 
   output_directory  = "output-${var.hostname}"
@@ -38,7 +44,8 @@ source "qemu" "parker" {
 
   net_device        = "e1000"  # So that netplan doesn't match on it
   disk_interface    = "virtio"
-  use_default_display = "true"
+  use_default_display = !var.headless
+  headless          = var.headless
 }
 
 build {
@@ -47,10 +54,21 @@ build {
     playbook_file = "ffbs-ansible/playbook.yml"
     inventory_file = "ffbs-ansible/ffmuc-inventory"
     extra_arguments = [
-      "--vault-password-file=ffbs-ansible/.vault",
       # Hacky, but needed so we can reference the inventory from the Ansible roles
       "--limit", "${var.hostname}",
-      "--extra-vars", "ansible_host=${build.Host} ansible_port=${build.Port} ansible_user=${build.User} ansible_ssh_pass=${build.Password}"
+      "--extra-vars", "ansible_host=${build.Host} ansible_port=${build.Port} ansible_user=${build.User} ansible_ssh_pass=${build.Password}",
+      # Multi-PoP active/standby lab: per-site values, see multipop/vars.yml.
+      "--extra-vars", "@multipop/vars.yml"
+    ]
+  }
+  # Multi-PoP active/standby lab: DNS64 and broker settings per site.
+  provisioner "ansible" {
+    playbook_file = "multipop/overlay.yml"
+    inventory_file = "ffbs-ansible/ffmuc-inventory"
+    extra_arguments = [
+      "--limit", "${var.hostname}",
+      "--extra-vars", "ansible_host=${build.Host} ansible_port=${build.Port} ansible_user=${build.User} ansible_ssh_pass=${build.Password}",
+      "--extra-vars", "@multipop/vars.yml"
     ]
   }
 }

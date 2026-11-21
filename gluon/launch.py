@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 import time
-import textwrap
 
 import vrnetlab
 
@@ -38,6 +37,63 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
+def prototype_cmds(root):
+    """Shell commands that copy the files below root onto the node."""
+    cmds = []
+    for dirpath, _, files in sorted(os.walk(root)):
+        for name in sorted(files):
+            src = os.path.join(dirpath, name)
+            dst = "/" + os.path.relpath(src, root)
+            cmds.append(f"mkdir -p {os.path.dirname(dst)} && : > {dst}")
+            with open(src) as f:
+                for line in f.read().splitlines():
+                    # No tabs: the console shell would complete on them.
+                    line = line.replace("\t", "    ").replace("'", "'\\''")
+                    cmds.append(f"printf '%s\\n' '{line}' >> {dst}")
+            if os.access(src, os.X_OK) or dst.startswith("/etc/init.d/"):
+                cmds.append(f"chmod +x {dst}")
+    if os.path.exists(os.path.join(root, "etc/init.d/parker-as")):
+        cmds.append("/etc/init.d/parker-as enable")
+    return cmds
+
+
+# LAB PROTOTYPE: the patched uradvd (multipop/patches/uradvd.patch). The
+# node has no base64, so it goes over as hex lines, and lua turns them back
+# into bytes.
+URADVD_HEX_DECODE = (
+    "lua -e 'local d = io.open(\"/tmp/uradvd.hex\"):read(\"*a\"):gsub(\"%s\", \"\")"
+    ":gsub(\"%x%x\", function(h) return string.char(tonumber(h, 16)) end)"
+    " local f = io.open(\"/tmp/uradvd.gz\", \"wb\") f:write(d) f:close()'"
+)
+
+
+def uradvd_cmds(path="/uradvd.gz"):
+    if not os.path.isfile(path):
+        return []
+    with open(path, "rb") as f:
+        data = f.read().hex()
+    cmds = [": > /tmp/uradvd.hex"]
+    cmds += [f"echo {data[i:i + 400]} >> /tmp/uradvd.hex" for i in range(0, len(data), 400)]
+    cmds += [
+        URADVD_HEX_DECODE,
+        "gunzip -c /tmp/uradvd.gz > /usr/sbin/uradvd && chmod 755 /usr/sbin/uradvd",
+        "rm -f /tmp/uradvd.hex /tmp/uradvd.gz",
+    ]
+    return cmds
+
+
+# LAB PROTOTYPE: nodeconfig.sh tells the broker that the node can take
+# more than one site (caps=multiprefix), and puts the pgw in use back into
+# each fetched config before nodeconfig.lua applies it (parker-as.lua pin).
+NODECONFIG_HOOKS = [
+    "sed -i 's|version=${version}|version=${version}\\&caps=multiprefix|'"
+    " /usr/sbin/nodeconfig.sh",
+    "sed -i 's|^\\([[:space:]]*\\)if outp=$(lua /usr/share/lua/nodeconfig.lua|"
+    "\\1lua /usr/share/lua/parker-as.lua pin \"${tmpdir}config.json\"\\n&|'"
+    " /usr/sbin/nodeconfig.sh",
+]
+
+
 class Gluon_vm(vrnetlab.VM):
     def __init__(self, hostname):
         super().__init__('', '', disk_image='/gluon.qcow2', ram=512)
@@ -48,18 +104,57 @@ class Gluon_vm(vrnetlab.VM):
         self.conn_mode = "tc"
         self.nic_type = "virtio-net-pci"
 
-        self.wait_pattern = ':/# '  # Shell prompt on serial console
+        self.wait_pattern = ':/# '  # Shell prompt on serial console, adjusted after wake-up
 
     def configure(self):
-        cmds = f'''\
-            uci set gluon-setup-mode.@setup_mode[0].configured=1
-            uci set system.@system[0].hostname={self.hostname}
-            uci set parker.nodeconfig.config_server={os.environ.get('CONFIGSERVER', '')}
-            echo '{os.environ.get('SSHKEY', '')}' > /etc/dropbear/authorized_keys
-            uci commit
-            sync
-        '''
-        for line in textwrap.dedent(cmds).splitlines():
+        cmds = [
+            "uci set gluon-setup-mode.@setup_mode[0].configured=1",
+            f"uci set system.@system[0].hostname={self.hostname}",
+        ]
+
+        # SSHKEY may carry several authorized_keys lines; the serial console
+        # takes one command per line, so write them one echo at a time.
+        for n, key in enumerate(os.environ.get("SSHKEY", "").splitlines()):
+            redirect = ">" if n == 0 else ">>"
+            cmds.append(f"echo '{key}' {redirect} /etc/dropbear/authorized_keys")
+
+        if os.environ.get("MESHONWAN", "") == "1":
+            # Mesh with the other APs on the LAN our WAN port hangs off. The
+            # role only turns into a network configuration once the upgrade
+            # scripts below have run.
+            cmds += [
+                "uci -q del_list gluon.iface_wan.role='mesh'",
+                "uci add_list gluon.iface_wan.role='mesh'",
+            ]
+
+        # LAB PROTOTYPE: multi-PoP active/standby node code, see
+        # /lab-prototype. Written over the serial console one line at a time.
+        # LAB_FIRMWARE=old keeps the stock firmware: one site, no prototype.
+        if os.environ.get("LAB_FIRMWARE", "") != "old":
+            cmds += uradvd_cmds()
+            cmds += prototype_cmds("/lab-prototype")
+            cmds += NODECONFIG_HOOKS
+
+        # 906-parker-nodeconfig copies the config server and the key its
+        # answers are verified with out of site.conf and into uci every time
+        # the upgrade scripts run, so our overrides have to come after the last
+        # run of them. Nothing runs them again on the boots that follow.
+        cmds += [
+            "uci commit",
+            "gluon-reconfigure",
+            f"uci set parker.nodeconfig.config_server={os.environ.get('CONFIGSERVER', '')}",
+        ]
+
+        config_pubkey = os.environ.get("CONFIGPUBKEY", "")
+        if config_pubkey:
+            cmds.append(f"uci set parker.nodeconfig.config_pubkey={config_pubkey}")
+
+        cmds += [
+            "uci commit",
+            "sync",
+        ]
+
+        for line in cmds:
             self.wait_write(line)
         time.sleep(1)
         self.wait_write("reboot")
@@ -78,7 +173,26 @@ class Gluon_vm(vrnetlab.VM):
         if match:  # got a match!
             if ridx == 0:  # login
                 self.logger.info("setup is online")
-                self.wait_write("", wait=None)
+                # The console shell only spawns once Enter is pressed, and a
+                # single newline sent while getty is still starting up gets
+                # swallowed. Poke until the shell actually answers.
+                for attempt in range(60):
+                    self.tn.write(b"\r")
+                    res = self.tn.read_until(b"# ", 5)
+                    if b":/# " in res or b":~# " in res:
+                        break
+                    self.logger.trace(
+                        "no prompt yet (attempt %d): %r", attempt + 1, res
+                    )
+                else:
+                    self.logger.error("serial console never presented a prompt")
+                    return
+                # the shell's cwd (and thus the prompt) differs between
+                # images: FFBS prompts ':/# ', FFMUC ':~# ' -- match what
+                # this image actually presented
+                self.wait_pattern = ':~# ' if b":~# " in res else ':/# '
+                # queue a fresh prompt for configure()'s first wait_write
+                self.tn.write(b"\r")
 
                 self.configure()
 

@@ -1,0 +1,167 @@
+---
+# Multi-PoP active/standby lab overlay. Runs after ffbs-ansible/playbook.yml,
+# with the same inventory and with vars.yml as extra vars. All changes take
+# effect when the image boots in the lab.
+
+- hosts: all
+  become: true
+  vars:
+    dns64_addr: "{{ lab_sites[lab_site].dns64 }}"
+  tasks:
+    # --- DNS64: every gateway answers on the site DNS64 address (anycast) ---
+    - name: Install unbound
+      ansible.builtin.apt:
+        name: unbound
+        state: present
+
+    - name: Put the site DNS64 address on lo at boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-dns64-addr.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Lab DNS64 address on lo
+          Before=unbound.service frr.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/ip -6 addr replace {{ dns64_addr }}/128 dev lo
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable the DNS64 address unit
+      ansible.builtin.systemd_service:
+        name: lab-dns64-addr.service
+        enabled: true
+        daemon_reload: true
+
+    - name: Zone for the lab names
+      ansible.builtin.copy:
+        dest: /etc/unbound/lab.zone
+        mode: '0644'
+        content: |
+          $TTL 60
+          lab.          IN SOA ns.lab. hostmaster.lab. 1 3600 600 86400 60
+          lab.          IN NS   ns.lab.
+          ns.lab.       IN AAAA {{ dns64_addr }}
+          internet.lab. IN A    203.0.113.42
+          v6.lab.       IN AAAA 2001:db8:cafe::1
+
+    - name: Configure unbound as DNS64
+      ansible.builtin.copy:
+        dest: /etc/unbound/unbound.conf.d/lab-dns64.conf
+        mode: '0644'
+        content: |
+          server:
+            interface: {{ dns64_addr }}
+            ip-freebind: yes
+            do-ip4: no
+            access-control: ::/0 refuse
+          {% for site in lab_sites.values() %}
+            access-control: {{ site.prefix }}::/48 allow
+          {% endfor %}
+            module-config: "dns64 iterator"
+            dns64-prefix: 64:ff9b::/96
+          auth-zone:
+            name: "lab."
+            zonefile: "/etc/unbound/lab.zone"
+            for-upstream: yes
+            for-downstream: no
+            fallback-enabled: no
+
+    - name: Announce the DNS64 address by BGP
+      ansible.builtin.lineinfile:
+        path: /etc/frr/frr.conf
+        insertafter: '^\s+network {{ wg_gateway_v6 }}/128'
+        line: "    network {{ dns64_addr }}/128"
+
+    - name: Let DNS in through the gateway firewall
+      ansible.builtin.lineinfile:
+        path: /etc/nftables.conf
+        insertbefore: '^\s+tcp dport \{ 80, 443 \} counter accept'
+        firstmatch: true
+        line: "        meta l4proto {tcp, udp} th dport 53 counter accept"
+
+    # --- NAT64: fragment translated DF=0 packets only above the tunnel MTU.
+    # The node CLAT drops IPv6 fragments (Jool default: 1280). ---
+    - name: Set the Jool lowest-ipv6-mtu to the tunnel MTU
+      ansible.builtin.lineinfile:
+        path: /usr/local/sbin/setup-jool.sh
+        line: "ip netns exec jool jool global update lowest-ipv6-mtu {{ wg_mtu }}"
+        insertafter: EOF
+
+    # --- Broker plane: the brokers and EMQX run in multipop/brokers/ ---
+    # ffbs-ansible puts a broker and mosquitto on gw01 (groups Brokers and
+    # MQTT). This lab uses the stateless brokers behind haproxy instead.
+    - name: Disable the gateway broker and mosquitto
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: [wgkex-broker.service, mosquitto.service]
+      when: inventory_hostname in groups['Brokers'] or inventory_hostname in groups['MQTT']
+      failed_when: false
+
+    - name: Remove the gateway /config location
+      ansible.builtin.file:
+        path: /etc/nginx/site-default.d/50-wgkex.conf
+        state: absent
+
+    - name: Resolve the MQTT cluster name
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "198.51.100.101 mqtt.lab"
+
+    # The site DC routers announce mqtt.lab over the gateway VPN. Take only
+    # that route from them and give them nothing.
+    - name: BGP over the gateway VPN for mqtt.lab
+      ansible.builtin.blockinfile:
+        path: /etc/frr/frr.conf
+        marker: "! {mark} LAB PROTOTYPE broker plane"
+        block: |
+          ip prefix-list mqtt seq 5 permit 198.51.100.101/32
+          route-map from-dc permit 10
+            match ip address prefix-list mqtt
+          route-map to-dc deny 10
+          !
+          router bgp {{ asn }}
+            neighbor DC peer-group
+            neighbor DC remote-as external
+            neighbor 172.16.0.65 peer-group DC
+            neighbor 172.16.0.81 peer-group DC
+            address-family ipv4 unicast
+              neighbor DC activate
+              neighbor DC route-map from-dc in
+              neighbor DC route-map to-dc out
+            exit-address-family
+
+    - name: Add the lab_multipop block to the wgkex config (workers)
+      ansible.builtin.blockinfile:
+        path: "{{ wgkex_config }}"
+        marker: "# {mark} LAB PROTOTYPE multi-PoP active/standby"
+        block: |
+          lab_multipop:
+            home_site: {{ lab_default_primary }}
+            default_primary: {{ lab_default_primary }}
+            primary_site_by_source:
+          {% for ip, site in lab_primary_site_by_source.items() %}
+              {{ ip }}: {{ site }}
+          {% endfor %}
+            sites:
+          {% for name, site in lab_sites.items() %}
+              {{ name }}:
+                parker_prefix: {{ site.parker_prefix }}
+                dns64: {{ site.dns64 }}
+                tunnel_id: {{ site.tunnel_id }}
+          {% endfor %}
+            gate:
+              handshake_max_age: 180
+              interval: 1
+
+    # The broker adds a node to all pgws of a site. A pgw keeps the peer and
+    # the lab gate announces the /63 only while the handshake is fresh.
+    - name: Keep node peers on the worker
+      ansible.builtin.replace:
+        path: "{{ wgkex_config }}"
+        regexp: '^(\s+parker_stale_timeout:) \d+$'
+        replace: '\1 864000'
