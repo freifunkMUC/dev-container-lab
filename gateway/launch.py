@@ -44,7 +44,10 @@ class Gateway_vm(vrnetlab.VM):
 
         super().__init__('', '', disk_image=disk_image, ram=1024)
 
-        self.num_nics = 2
+        self.num_nics = int(os.environ.get("NUM_NICS", "2"))
+        # The QEMU user network for mgmt. Set MGMT_SUBNET when the lab uses
+        # 10.0.0.0/24 for something else. The guest gets the host address 15.
+        self.mgmt_subnet = os.environ.get("MGMT_SUBNET", self.mgmt_subnet)
         self.conn_mode = "tc"
         self.nic_type = "virtio-net-pci"
 

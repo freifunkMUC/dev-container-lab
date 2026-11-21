@@ -19,7 +19,7 @@ RUN apk add --no-cache build-base linux-headers curl patch
 COPY uradvd.patch /
 RUN mkdir /src && cd /src \
    && curl -sfL https://codeload.github.com/freifunkMUC/uradvd/tar.gz/${URADVD_COMMIT} | tar xz --strip-components 1 \
-   && patch -p1 < /uradvd.patch \
+   && { [ ! -s /uradvd.patch ] || patch -p1 < /uradvd.patch; } \
    && gcc -Wall -Wextra -Werror -Os -static -DVERSION='"multipop"' -o /uradvd uradvd.c \
    && strip /uradvd && gzip -9 /uradvd
 

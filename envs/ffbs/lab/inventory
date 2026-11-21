@@ -1,0 +1,25 @@
+# The lab inventory of the ffbs environment. The groups are the ones of the
+# upstream Vagrantfile, without the hosts that the lab does not have.
+# ansible_host is the lab WAN address. The Packer build connects with
+# ansible_ssh_host instead, see ../gateway.pkrvars.hcl.
+
+[Concentrators]
+concentrator1 ansible_host=198.51.100.1
+concentrator2 ansible_host=198.51.100.2
+concentrator3 ansible_host=198.51.100.3
+
+[Exits]
+exit1 ansible_host=198.51.100.11
+
+[Backbone:children]
+Concentrators
+Exits
+
+[etcd_cluster:children]
+Concentrators
+
+[etcd_clients]
+[WebServers]
+[Nodes]
+[UCI-Nodes]
+[client]

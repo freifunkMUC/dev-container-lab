@@ -1,0 +1,117 @@
+---
+# Runs after the upstream playbook.yml. Makes the image start in the lab:
+# lab network, a clean etcd, the missing rpz zone. All changes take effect
+# when the image boots in the lab.
+
+- hosts: all
+  become: true
+  tasks:
+    # vrnetlab gives the management NIC the first PCI slot and the WAN NIC
+    # (eth1 in ../ffbs.clab.yml) the third. The names do not depend on the
+    # driver this way.
+    - name: Name the WAN interface "uplink"
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/10-uplink.link
+        mode: '0644'
+        content: |
+          [Match]
+          Path=pci-0000:01:02.0
+
+          [Link]
+          Name=uplink
+
+    # The FFBS VRF puts 10.0.0.0/8 into the main table. The vrnetlab default
+    # management network is 10.0.0.0/24, so ../ffbs.clab.yml sets MGMT_SUBNET
+    # to 192.0.2.0/24.
+    - name: Configure the lab interfaces
+      ansible.builtin.copy:
+        dest: /etc/network/interfaces.d/10-lab
+        mode: '0644'
+        content: |
+          auto {{ lab_mgmt_interface }}
+          iface {{ lab_mgmt_interface }} inet static
+          	address {{ lab_mgmt_ipv4 }}
+
+          auto uplink
+          iface uplink inet static
+          	address {{ lab_uplink_ipv4 }}
+          	gateway {{ lab_uplink_gw4 }}
+          iface uplink inet6 static
+          	address {{ lab_uplink_ipv6 }}
+          	gateway {{ lab_uplink_gw6 }}
+          	accept_ra 0
+
+    # Only the configuration above applies in the lab, not the DHCP of the
+    # build.
+    - name: Remove the build network configuration
+      ansible.builtin.file:
+        path: /etc/network/interfaces.d/50-cloud-init
+        state: absent
+
+    - name: Disable cloud-init
+      ansible.builtin.file:
+        path: /etc/cloud/cloud-init.disabled
+        state: touch
+        mode: '0644'
+
+    # The upstream bind role refers to the zone "rpz", which only the
+    # bind-ffbs role makes. The playbook does not run bind-ffbs.
+    - name: Make an empty rpz zone
+      ansible.builtin.copy:
+        dest: /etc/bind/db.rpz
+        mode: '0644'
+        content: |
+          $TTL 60
+          @ IN SOA localhost. root.localhost. 1 3600 600 86400 60
+          @ IN NS localhost.
+      when: "'Concentrators' in group_names"
+
+    - name: Add the rpz zone
+      ansible.builtin.lineinfile:
+        path: /etc/bind/named.conf.local
+        regexp: '^zone "rpz"'
+        line: 'zone "rpz" { type master; file "/etc/bind/db.rpz"; };'
+      when: "'Concentrators' in group_names"
+
+    # Packer builds one gateway at a time, so the etcd cluster cannot form
+    # during the build. The cluster forms when all concentrators run in the
+    # lab. Start it with no data.
+    - name: Stop etcd
+      ansible.builtin.systemd_service:
+        name: etcd
+        state: stopped
+      when: "'etcd_cluster' in group_names"
+
+    - name: Remove the etcd data of the build
+      ansible.builtin.file:
+        path: /var/lib/etcd/ffbs-vagrant
+        state: absent
+      when: "'etcd_cluster' in group_names"
+
+    # etcd-init.sh skips when the cluster is not healthy. This unit runs it
+    # again until the default configuration is in etcd.
+    - name: Add a unit that puts the default configuration into etcd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-etcd-init.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Lab: put the default configuration into etcd
+          After=etcd.service
+          Wants=etcd.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/bash -c 'until source /etc/profile.d/etcd.sh && etcdctl endpoint health && /root/etcd-init.sh && test -n "$(etcdctl get initialized --print-value-only)"; do sleep 10; done'
+          TimeoutStartSec=infinity
+
+          [Install]
+          WantedBy=multi-user.target
+      when: inventory_hostname == groups['etcd_cluster'][0]
+
+    - name: Enable the etcd init unit
+      ansible.builtin.systemd_service:
+        name: lab-etcd-init.service
+        enabled: true
+        daemon_reload: true
+      when: inventory_hostname == groups['etcd_cluster'][0]

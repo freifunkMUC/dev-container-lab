@@ -4,3 +4,6 @@
 [submodule "gateway/packer/wgkex"]
 	path = gateway/packer/wgkex
 	url = https://github.com/freifunkMUC/wgkex.git
+[submodule "envs/ffbs/ffbs-ansible"]
+	path = envs/ffbs/ffbs-ansible
+	url = https://gitli.stratum0.org/ffbs/ffbs-ansible

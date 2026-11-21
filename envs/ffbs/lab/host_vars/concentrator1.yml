@@ -1,0 +1,14 @@
+router_id: '172.16.1.1'
+etcd_peer_ip: '172.16.1.1'
+# Lab keys, made with ../keygen.sh. They are not secret.
+wg_private_key: 'GBljJHNL8x3+MAam0f8AMBhxoOd12Iayp83qdkBAQ3E='
+wg_public_key: '+cOO5MvopDBLOnCwwK6N/RX8hhfRAGsZRgXsAsBdBGQ='
+wg_backbone_id: '1'
+wg_backbone_grp: '1'
+wg_hostname: '198.51.100.1'
+wg_peer_ifname: 'wg-c1'
+wg_peer_port: 2301
+lab_uplink_ipv4: '198.51.100.1/24'
+lab_uplink_ipv6: '2001:db8:100::1/64'
+wg_gateway_v4: '10.0.0.1'
+wg_gateway_v6: '2001:bf7:381::1'

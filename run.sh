@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # Redirects write user-owned result files on purpose (SC2024); AP commands run remotely (SC2016).
 # shellcheck disable=SC2024,SC2016,SC2012
-# Build, deploy and test the multi-PoP active/standby lab on one fresh
-# Ubuntu 24.04 x86-64 machine, then destroy it.
+# Build, deploy and test one lab environment on one fresh Ubuntu 24.04
+# x86-64 machine, then destroy it.
 #
+# Usage: ./run.sh [ENV]   (default: LAB_ENV, else ffmuc; see envs/)
 # Run it from the repository (or bundle) root as a normal user with sudo.
 # It writes results/summary.json and the raw logs to results/.
 # Exit code 0 only if all setup steps and all tests pass.
 #
 # Needs: nested KVM (/dev/kvm), about 8 vCPU, 16 GB RAM, a 128 GB disk,
-# outbound HTTPS. Gluon image: gluon/*.img, or artifacts/*.img.gz (unpacked
-# here), or GLUON_IMAGE_URL (downloaded over HTTPS).
+# outbound HTTPS. Gluon image: GLUON_IMAGE of the environment (a file in
+# gluon/), or artifacts/*.img.gz (unpacked here), or GLUON_IMAGE_URL
+# (downloaded over HTTPS).
 
 set -uo pipefail
 
 cd "$(dirname "$0")" || exit 1
 ROOT=$(pwd)
 RESULTS="${RESULTS:-${ROOT}/results}"
-LAB=ffmuc-mp-as
+# shellcheck source=lib/env.sh
+. lib/env.sh
+load_env "${1:-}" || exit 1
+export LAB_ENV="${ENV_NAME}"
 mkdir -p "${RESULTS}"
 STEPS="${RESULTS}/steps.tsv"
 : > "${STEPS}"
@@ -68,7 +73,7 @@ install_deps() {
 	sudo -E apt-get update -q
 	sudo -E apt-get install -yq ca-certificates curl gnupg lsb-release python3 \
 		qemu-system-x86 qemu-utils wireguard-tools sshpass signify-openbsd \
-		ansible docker.io docker-buildx bridge-utils iptables xorriso patch
+		ansible docker.io docker-buildx bridge-utils iptables xorriso patch rsync openssl
 	sudo systemctl enable --now docker
 	if ! command -v containerlab >/dev/null; then
 		curl -fsSL https://get.containerlab.dev | sudo -E bash
@@ -91,32 +96,21 @@ install_deps() {
 }
 
 gluon_image() {
-	if ls gluon/*.img >/dev/null 2>&1; then
-		ls -l gluon/*.img
-		return 0
-	fi
-	local gz
-	gz=$(ls artifacts/*x86-64*.img.gz 2>/dev/null | head -1)
-	if [ -z "${gz}" ] && [ -n "${GLUON_IMAGE_URL:-}" ]; then
-		gz="artifacts/$(basename "${GLUON_IMAGE_URL}")"
-		mkdir -p artifacts
-		curl -fsSL -o "${gz}" "${GLUON_IMAGE_URL}"
-	fi
-	[ -n "${gz}" ] || { echo "no Gluon image: put one in artifacts/ or set GLUON_IMAGE_URL"; return 1; }
-	# Gluon images have data after the gzip stream. gzip warns about
-	# "trailing garbage" and returns 2. -q drops the warning; the image is good.
-	gzip -dcq "${gz}" > "gluon/$(basename "${gz%.gz}")" || [ $? = 2 ]
-	ls -l gluon/*.img
+	local image
+	image=$(fetch_gluon) || return 1
+	ls -l "gluon/${image}"
 }
 
 build_images() {
 	# Headless packer, and no "reset" on a missing terminal.
 	sudo -E env TERM=dumb PACKER_ARGS="-var headless=true" PATH="${PATH}" \
-		./build.sh < /dev/null
-	# The gateways bind gateway/*.qcow2 at run time: keep them. Free the
+		./build.sh "${ENV_NAME}" < /dev/null
+	# The gateways bind their disks at run time: keep them. Free the
 	# packer download cache and the build cache.
-	ls -l gateway/*.qcow2
-	du -sh gateway/*.qcow2
+	local gw
+	for gw in ${GATEWAYS}; do
+		du -sh "${GATEWAY_DIR}/${gw}.qcow2"
+	done
 	sudo rm -rf gateway/packer/packer_cache
 	sudo docker builder prune -af >/dev/null
 	sudo docker images
@@ -124,45 +118,32 @@ build_images() {
 }
 
 deploy() {
-	sudo ./lab-bridges.sh
+	sudo ./lab-bridges.sh "${ENV_NAME}"
 	DEPLOYED=1
-	sudo containerlab deploy -t ffmuc.clab.yml --reconfigure
+	local vars
+	vars=$(env_deploy_vars) || return 1
+	# shellcheck disable=SC2086
+	sudo env ${vars} containerlab deploy -t "${TOPOLOGY}" --reconfigure
 }
 
 run_tests() {
-	python3 tests/multipop_as.py --results "${RESULTS}"
+	env_tests --results "${RESULTS}"
 }
 
 collect_logs() {
 	local d="${RESULTS}/logs"
 	mkdir -p "${d}"
-	sudo containerlab inspect -t ffmuc.clab.yml > "${d}/inspect.txt" 2>&1
+	sudo containerlab inspect -t "${TOPOLOGY}" > "${d}/inspect.txt" 2>&1
 	for c in $(sudo docker ps -a --format '{{.Names}}' | grep "^clab-${LAB}-"); do
 		sudo docker logs "${c}" > "${d}/${c#clab-"${LAB}"-}.docker.log" 2>&1
 	done
-	for ap in ap-1 ap-2 ap-3 ap-4; do
-		timeout 120 ./node-cmd.sh "${ap}" 'cat /tmp/parker-as/status; for f in /tmp/parker-as/ra-args /tmp/parker-as/ra-state; do echo "$f: $(cat $f)"; done; ip -6 rule; ip -6 route show table all | grep -v "^local\|^multicast\|fe80"; ip route; ip6tables -S parker_src; ip6tables -S FORWARD | head -5; ip6tables -S OUTPUT | head -5; cat /tmp/parker-as/dns-servers; wg show all; cat /tmp/ff-Ohb0ba0u/noderoute.json; ps w | grep -E "uradvd|clat|parker"; logread | tail -300' 60 \
-			> "${d}/${ap}.state.txt" 2>&1
-	done
-	for gw in gw01 gw02 gw03 gw04; do
-		timeout 120 ./node-cmd.sh "gateway-${gw}" 'sudo vtysh -c "show bgp summary" -c "show ip bgp" -c "show bgp ipv6"; sudo wg show all; ip route; ip -6 route | head -50; sudo jool session display --numeric 2>/dev/null | head -20; sudo journalctl -n 300 --no-pager -u "wgkex*" -u unbound -u frr' 60 \
-			> "${d}/gateway-${gw}.state.txt" 2>&1
-	done
-	sudo docker exec "clab-${LAB}-internet" vtysh -c 'show bgp summary' -c 'show ip bgp' -c 'show bgp ipv6' \
-		> "${d}/internet.bgp.txt" 2>&1
-	{
-		sudo docker exec "clab-${LAB}-emqx-muc-1" emqx ctl cluster status
-		for dc in dc-muc dc-vie; do
-			echo "== ${dc}"
-			sudo docker exec "clab-${LAB}-${dc}" sh -c 'ip route; vtysh -c "show bgp summary"'
-		done
-	} > "${d}/broker-plane.txt" 2>&1
+	env_collect_logs "${d}"
 }
 
 write_summary() {
-	python3 - "${RESULTS}" "${STEPS}" <<'EOF'
+	python3 - "${RESULTS}" "${STEPS}" "${ENV_NAME}" "${LAB}" <<'EOF'
 import glob, json, os, sys
-results, steps_file = sys.argv[1], sys.argv[2]
+results, steps_file, env, lab = sys.argv[1:5]
 steps = []
 for line in open(steps_file):
     name, status, secs = line.rstrip("\n").split("\t")
@@ -176,7 +157,8 @@ for f in sorted(glob.glob(os.path.join(results, "test-*.json"))):
 ok = bool(tests) and all(s["status"] in ("pass",) for s in steps if s["name"] != "collect-logs") \
     and all(t.get("pass") for t in tests)
 summary = {
-    "lab": "ffmuc-mp-as (multi-PoP active/standby)",
+    "lab": lab,
+    "env": env,
     "pass": ok,
     "steps": steps,
     "tests": [{"name": t.get("name"), "pass": t.get("pass"), "evidence": t.get("evidence"),
@@ -198,8 +180,8 @@ finish() {
 		FAILED=0
 		step collect-logs collect_logs || true
 		log "destroy"
-		sudo docker rm -f ffmuc-mp-as-monsrv > /dev/null 2>&1
-		sudo containerlab destroy -t ffmuc.clab.yml --cleanup > "${RESULTS}/destroy.log" 2>&1
+		sudo docker rm -f "${LAB}-monsrv" > /dev/null 2>&1
+		sudo containerlab destroy -t "${TOPOLOGY}" --cleanup > "${RESULTS}/destroy.log" 2>&1
 	fi
 	sudo chown -R "$(id -u):$(id -g)" "${RESULTS}" 2>/dev/null
 	write_summary

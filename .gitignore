@@ -17,3 +17,15 @@ results/
 artifacts/
 # Copy of multipop/patches/uradvd.patch for the gluon build context
 gluon/uradvd.patch
+# ffbs environment: the staged copy of ffbs-ansible, containerlab files
+gateway/packer/ffbs-stage/
+clab-ffbs-lab/
+envs/ffbs/.ffbs.clab.yml.bak
+# Android SDK from android/fetch-sdk.sh, containerlab files
+android/sdk/
+clab-android-e2e/
+android/.android.clab.yml.bak
+envs/ffbs/lab/files/etcd-ca.pem
+envs/ffbs/lab/files/concentrator*/
+envs/ffbs/lab/files/node-config.sec
+envs/ffbs/lab/files/node-config.pub
