@@ -1,0 +1,147 @@
+# ffbs environment: the Parker setup of Freifunk Braunschweig.
+# Deploy with ./lab.sh -e ffbs deploy. Paths are relative to this file.
+#
+#   client-1/2 - ap-1 - cpe-1 -+
+#   client-3   - ap-2 - cpe-2 -+- internet -- fb-wan -- concentrator1..3, exit1
+#
+# The APs get their configuration from etcd through concentrator1 and
+# connect to all concentrators with WireGuard. The concentrators and exit1
+# form the WireGuard backbone over fb-wan and route with OSPF (bird). exit1
+# sends the client traffic through its exit tunnel to the internet node.
+name: ffbs-lab
+
+mgmt:
+  network: ffbs-lab
+  ipv4-subnet: 172.20.41.0/24
+  ipv6-subnet: 3fff:172:20:41::/64
+
+topology:
+  nodes:
+    internet:
+      kind: linux
+      network-mode: none
+      image: ffbs-lab:internet
+
+    ap-1:
+      kind: generic_vm
+      network-mode: none
+      image: ffbs-lab:gluon
+      env:
+        LAB_FIRMWARE: old   # the stock firmware, no ffmuc prototype
+        CONFIGSERVER: 198.51.100.1   # concentrator1, nginx /config
+        # Second line of lab/files/node-config.pub (lab key, made at build
+        # time). ./lab.sh deploy sets it. Replaces the production key.
+        CONFIGPUBKEY: ${FFBS_CONFIGPUBKEY}
+    fb-ap1-lan:
+      kind: bridge
+    client-1:
+      kind: linux
+      network-mode: none
+      image: ffbs-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - ../../client/entrypoint.sh:/entrypoint.sh
+    client-2:
+      kind: linux
+      network-mode: none
+      image: ffbs-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - ../../client/entrypoint.sh:/entrypoint.sh
+    cpe-1:
+      kind: linux
+      network-mode: none
+      image: ffbs-lab:toolbox
+      cmd: /entrypoint.sh
+      env:
+        WAN_IP4: 203.0.113.1/30
+        WAN_GW4: 203.0.113.2
+      binds:
+        - ../../cpe/entrypoint.sh:/entrypoint.sh
+
+    ap-2:
+      kind: generic_vm
+      network-mode: none
+      image: ffbs-lab:gluon
+      env:
+        LAB_FIRMWARE: old   # the stock firmware, no ffmuc prototype
+        CONFIGSERVER: 198.51.100.1   # concentrator1, nginx /config
+        # Second line of lab/files/node-config.pub (lab key, made at build
+        # time). ./lab.sh deploy sets it. Replaces the production key.
+        CONFIGPUBKEY: ${FFBS_CONFIGPUBKEY}
+    fb-ap2-lan:
+      kind: bridge
+    client-3:
+      kind: linux
+      network-mode: none
+      image: ffbs-lab:toolbox
+      cmd: /entrypoint.sh
+      binds:
+        - ../../client/entrypoint.sh:/entrypoint.sh
+    cpe-2:
+      kind: linux
+      network-mode: none
+      image: ffbs-lab:toolbox
+      cmd: /entrypoint.sh
+      env:
+        WAN_IP4: 203.0.113.5/30
+        WAN_GW4: 203.0.113.6
+      binds:
+        - ../../cpe/entrypoint.sh:/entrypoint.sh
+
+    concentrator1:   # WAN 198.51.100.1
+      kind: generic_vm
+      network-mode: none
+      image: ffbs-lab:gateway
+      env:
+        NUM_NICS: "1"
+        MGMT_SUBNET: 192.0.2.0/24   # the FFBS VRF routes 10.0.0.0/8
+      binds:
+        - ../../gateway/concentrator1.qcow2:/concentrator1.qcow2:ro
+    concentrator2:   # WAN 198.51.100.2
+      kind: generic_vm
+      network-mode: none
+      image: ffbs-lab:gateway
+      env:
+        NUM_NICS: "1"
+        MGMT_SUBNET: 192.0.2.0/24   # the FFBS VRF routes 10.0.0.0/8
+      binds:
+        - ../../gateway/concentrator2.qcow2:/concentrator2.qcow2:ro
+    concentrator3:   # WAN 198.51.100.3
+      kind: generic_vm
+      network-mode: none
+      image: ffbs-lab:gateway
+      env:
+        NUM_NICS: "1"
+        MGMT_SUBNET: 192.0.2.0/24   # the FFBS VRF routes 10.0.0.0/8
+      binds:
+        - ../../gateway/concentrator3.qcow2:/concentrator3.qcow2:ro
+    exit1:   # WAN 198.51.100.11
+      kind: generic_vm
+      network-mode: none
+      image: ffbs-lab:gateway
+      env:
+        NUM_NICS: "1"
+        MGMT_SUBNET: 192.0.2.0/24   # the FFBS VRF routes 10.0.0.0/8
+      binds:
+        - ../../gateway/exit1.qcow2:/exit1.qcow2:ro
+    fb-wan:
+      kind: bridge
+
+  links:
+    - endpoints: ["ap-1:eth1", "fb-ap1-lan:ap-1"]     # AP-1 LAN
+    - endpoints: ["ap-1:eth2", "cpe-1:lan"]           # AP-1 WAN
+    - endpoints: ["client-1:lan", "fb-ap1-lan:client1"]
+    - endpoints: ["client-2:lan", "fb-ap1-lan:client2"]
+    - endpoints: ["cpe-1:wan", "internet:cpe1"]
+
+    - endpoints: ["ap-2:eth1", "fb-ap2-lan:ap-2"]     # AP-2 LAN
+    - endpoints: ["ap-2:eth2", "cpe-2:lan"]           # AP-2 WAN
+    - endpoints: ["client-3:lan", "fb-ap2-lan:client3"]
+    - endpoints: ["cpe-2:wan", "internet:cpe2"]
+
+    - endpoints: ["internet:wan", "fb-wan:internet"]
+    - endpoints: ["concentrator1:eth1", "fb-wan:c1"]
+    - endpoints: ["concentrator2:eth1", "fb-wan:c2"]
+    - endpoints: ["concentrator3:eth1", "fb-wan:c3"]
+    - endpoints: ["exit1:eth1", "fb-wan:e1"]

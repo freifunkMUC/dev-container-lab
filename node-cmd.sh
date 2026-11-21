@@ -3,6 +3,8 @@
 # Usage: ./node-cmd.sh <node> '<command>' [timeout-seconds]
 # e.g.:  ./node-cmd.sh ap-1 'wg show all'
 #        ./node-cmd.sh gateway-gw01 'ip -br addr'   (logs in as ubuntu/ffmuc)
+# LAB is the containerlab lab name (default ffmuc-mp-as). GATEWAY_USER and
+# GATEWAY_PASS are the gateway login. ./lab.sh -e ENV cmd ... sets all three.
 # Only one serial client can be attached at a time; the vrnetlab launcher
 # releases the console once bootstrap is done.
 set -eu
@@ -10,12 +12,13 @@ node="$1"
 cmd="$2"
 timeout="${3:-15}"
 
-sudo docker exec -i "clab-${LAB:-ffmuc-mp-as}-${node}" python3 -W ignore::DeprecationWarning - "$cmd" "$timeout" <<'EOF'
+sudo docker exec -i "clab-${LAB:-ffmuc-mp-as}-${node}" python3 -W ignore::DeprecationWarning - "$cmd" "$timeout" \
+	"${GATEWAY_USER:-ubuntu}" "${GATEWAY_PASS:-ffmuc}" <<'EOF'
 import re
 import sys
 import telnetlib  # removed in Python 3.13; fine on the lab node images
 
-cmd, timeout = sys.argv[1], int(sys.argv[2])
+cmd, timeout, user, password = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 tn = telnetlib.Telnet("127.0.0.1", 5000, 10)
 tn.write(b"\r")
 idx, _, res = tn.expect([b"login: ", b"# ", b"\\$ "], 10)
@@ -23,9 +26,9 @@ if idx < 0:
     sys.stderr.write("serial console did not answer: %r\n" % res)
     sys.exit(1)
 if idx == 0:
-    tn.write(b"ubuntu\r")
+    tn.write(user.encode() + b"\r")
     tn.expect([b"Password:"], 10)
-    tn.write(b"ffmuc\r")
+    tn.write(password.encode() + b"\r")
     idx2, _, res = tn.expect([b"\\$ ", b"Login incorrect"], 15)
     if idx2 != 0:
         sys.stderr.write("serial login failed: %r\n" % res)

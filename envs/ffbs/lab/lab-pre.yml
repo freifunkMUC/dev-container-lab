@@ -1,0 +1,53 @@
+---
+# Runs before the upstream playbook.yml. Prepares the Debian cloud image for
+# the upstream roles. No change here alters what the roles do.
+
+- hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Set the hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    # The common role adds testing and unstable to the apt sources, and some
+    # roles install from unstable. The lab stays on the stable release: the
+    # packages come from bookworm before the roles run, and apt does not take
+    # anything from testing or unstable.
+    - name: Do not take packages from testing or unstable
+      ansible.builtin.copy:
+        dest: /etc/apt/preferences.d/lab-stable-only
+        mode: '0644'
+        content: |
+          Package: *
+          Pin: release a=testing
+          Pin-Priority: -1
+
+          Package: *
+          Pin: release a=unstable
+          Pin-Priority: -1
+
+    # Packages do not start their services while they install. The common
+    # role installs the same file.
+    - name: Disable apt autostart
+      ansible.builtin.copy:
+        dest: /usr/sbin/policy-rc.d
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          exit 101
+
+    - name: Install the packages the roles need
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - ifupdown
+          - rsync
+          - wireguard-tools
+          - etcd-server
+          - etcd-client

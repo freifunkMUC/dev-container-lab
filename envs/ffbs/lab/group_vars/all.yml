@@ -1,0 +1,13 @@
+# Lab values for the variables of group_vars/all in the upstream repository.
+apt_default_release: bookworm
+apt_mirror: http://deb.debian.org/debian
+ffbs_admins: []
+prompt: LAB
+wg_mtu: '1375'
+dns_forwarders: []
+
+# The lab network, see ../ffbs.clab.yml. "uplink" is the WAN interface.
+lab_mgmt_interface: enp1s0
+lab_mgmt_ipv4: 192.0.2.15/24
+lab_uplink_gw4: 198.51.100.254
+lab_uplink_gw6: 2001:db8:100::254

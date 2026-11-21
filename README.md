@@ -3,6 +3,24 @@
 > [MULTIPOP-AS.md](MULTIPOP-AS.md) first. The text below is for the
 > single-site lab.
 
+## Environments
+
+The lab has more than one setup. Each setup is an environment in `envs/`:
+
+- `ffmuc` (default): FFMUC multi-PoP active/standby. The text below is about this setup.
+- `ffbs`: FFBS Parker as upstream, with the upstream FFBS Ansible.
+- `example`: a template for your own setup or your own Gluon image.
+
+```sh
+./lab.sh list
+./lab.sh -e ffbs build && ./lab.sh -e ffbs deploy && ./lab.sh -e ffbs test
+```
+
+To add an environment, or to use your own Gluon image or gateway
+provisioning, refer to [docs/environments.md](docs/environments.md).
+For end-to-end tests with an Android client, refer to
+[docs/android-e2e.md](docs/android-e2e.md).
+
 ## Overview
 
 This lab setup deploys a full Parker-style network, consisting of:

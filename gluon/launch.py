@@ -94,6 +94,23 @@ NODECONFIG_HOOKS = [
 ]
 
 
+def ap_setup_cmds():
+    """Changes of the lab environment for the stock firmware, see
+    docs/environments.md: text files below AP_FILES (default /ap-files) go
+    onto the node, then the shell commands in AP_SETUP_FILE and AP_SETUP run.
+    They run before gluon-reconfigure, one line at a time."""
+    cmds = []
+    files = os.environ.get("AP_FILES", "/ap-files")
+    if os.path.isdir(files):
+        cmds += prototype_cmds(files)
+    setup_file = os.environ.get("AP_SETUP_FILE", "")
+    if setup_file:
+        with open(setup_file) as f:
+            cmds += f.read().splitlines()
+    cmds += os.environ.get("AP_SETUP", "").splitlines()
+    return [c for c in cmds if c.strip() and not c.lstrip().startswith("#")]
+
+
 class Gluon_vm(vrnetlab.VM):
     def __init__(self, hostname):
         super().__init__('', '', disk_image='/gluon.qcow2', ram=512)
@@ -134,6 +151,8 @@ class Gluon_vm(vrnetlab.VM):
             cmds += uradvd_cmds()
             cmds += prototype_cmds("/lab-prototype")
             cmds += NODECONFIG_HOOKS
+
+        cmds += ap_setup_cmds()
 
         # 906-parker-nodeconfig copies the config server and the key its
         # answers are verified with out of site.conf and into uci every time

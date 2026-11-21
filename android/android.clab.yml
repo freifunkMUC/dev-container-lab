@@ -1,0 +1,28 @@
+# Android client for end-to-end tests. Deploy it next to a running lab with
+# ./lab.sh [-e ENV] android up. Refer to docs/android-e2e.md.
+# ANDROID_BRIDGE is an AP LAN bridge of the lab (it comes from env.conf).
+name: android-e2e
+
+mgmt:
+  network: android-e2e
+  ipv4-subnet: 172.20.49.0/24
+  ipv6-subnet: 3fff:172:20:49::/64
+
+topology:
+  nodes:
+    android:
+      kind: linux
+      network-mode: none   # lab LAN only
+      image: android-e2e:emulator
+      devices:
+        - /dev/kvm
+      env:
+        ANDROID_API: ${ANDROID_API:=35}
+        ANDROID_TAG: ${ANDROID_TAG:=default}
+      binds:
+        - ${ANDROID_SDK:=sdk}:/sdk
+    ${ANDROID_BRIDGE:=as-ap1-lan}:
+      kind: bridge
+
+  links:
+    - endpoints: ["android:lan", "${ANDROID_BRIDGE:=as-ap1-lan}:android"]

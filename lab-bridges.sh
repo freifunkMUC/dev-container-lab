@@ -10,10 +10,17 @@
 # as well, since the host has no routes to the lab subnets. ARP is not IP and
 # passes both, so the lab deploys and resolves addresses while not one packet
 # gets through.
+#
+# Usage: sudo ./lab-bridges.sh [ENV]   (default: LAB_ENV, else ffmuc)
+# The bridges are BRIDGES in envs/ENV/env.conf.
 
 set -eu
 
-bridges="as-ap1-lan as-ap2-lan as-ap3-lan as-ap4-lan as-home1 as-home2 as-gw-vpn"
+cd "$(dirname "$0")"
+# shellcheck source=lib/env.sh
+. lib/env.sh
+load_env "${1:-}"
+bridges="${BRIDGES}"
 
 if [ "$(id -u)" != 0 ]; then
 	echo "needs root: sudo $0" >&2

@@ -1,0 +1,23 @@
+router_id: '172.16.2.1'
+etcd_peer_ip: '172.16.2.1'
+# Lab keys, made with ../keygen.sh. They are not secret.
+wg_private_key: 'IMHeqo6UdvJmjRQgBhfoHQdAoeVW/S+HGRDBHyfe/Vo='
+wg_public_key: '7kyfZ+GucTN2BUebTFQwawjpHNicVadQwMwJqxI/zho='
+wg_backbone_id: '1'
+wg_backbone_grp: '2'
+wg_hostname: '198.51.100.11'
+wg_peer_ifname: 'wg-e1'
+wg_peer_port: 2401
+lab_uplink_ipv4: '198.51.100.11/24'
+lab_uplink_ipv6: '2001:db8:100::11/64'
+
+# The exit tunnel. In production it goes to a VPN provider; in the lab the
+# internet container is the other end, see ../internet/.
+wg_exit_ifname: 'wg-azire'   # the iptables role has this name built in
+wg_exit_address_v4: '100.64.0.2/30'
+wg_exit_gateway_v4: '100.64.0.1'
+wg_exit_address_v6: '2001:db8:ff::2/64'
+wg_exit_gateway_v6: '2001:db8:ff::1'
+wg_exit_private_key: '{{ wg_private_key }}'
+wg_exit_remote_publickey: 'DYL8fzh/6bPV+HHUCPLf4pMa97G2WejAj9+fVmVRMmc='
+wg_exit_remote_endpoint: '198.51.100.254:51820'
